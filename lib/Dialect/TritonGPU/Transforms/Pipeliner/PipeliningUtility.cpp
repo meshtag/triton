@@ -837,6 +837,8 @@ triton::getTopLevelUsersInLoop(Operation *op, scf::ForOp forOp,
       continue;
     Operation *topLevelUser =
         forOp.getBody()->findAncestorOpInBlock(*use->getOwner());
+    if (!topLevelUser)
+      continue;
     topLevelUsers.insert(topLevelUser);
   }
   return topLevelUsers;

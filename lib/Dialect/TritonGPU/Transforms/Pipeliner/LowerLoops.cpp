@@ -1052,12 +1052,60 @@ scf::ForOp lowerMMAs(scf::ForOp forOp, CoarseSchedule &schedule) {
 // LOWER LOOP
 /////////////////////////////
 
+static void ensureAllOpsScheduled(scf::ForOp forOp, CoarseSchedule &schedule) {
+  if (schedule.empty())
+    return;
+
+  Operation *fallbackOp = nullptr;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (schedule.count(&op)) {
+      fallbackOp = &op;
+      break;
+    }
+  }
+  std::optional<std::pair<int, CoarseSchedule::Cluster>> fallbackStageCluster;
+  if (fallbackOp)
+    fallbackStageCluster = schedule[fallbackOp];
+
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    if (schedule.count(&op))
+      continue;
+
+    Operation *prev = op.getPrevNode();
+    while (prev && !schedule.count(prev))
+      prev = prev->getPrevNode();
+    if (prev) {
+      schedule.insert(&op, schedule[prev].first, schedule[prev].second);
+      continue;
+    }
+
+    Operation *next = op.getNextNode();
+    while (next && !schedule.count(next))
+      next = next->getNextNode();
+    if (next) {
+      schedule.insert(&op, schedule[next].first, schedule[next].second);
+      continue;
+    }
+
+    if (fallbackStageCluster) {
+      schedule.insert(&op, fallbackStageCluster->first,
+                      fallbackStageCluster->second);
+    } else {
+      auto cluster = schedule.clusters.newAtBack();
+      schedule.insert(&op, 0, cluster);
+    }
+  }
+}
+
 void lowerLoop(scf::ForOp forOp,
                triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   CoarseSchedule schedule;
   if (failed(schedule.deSerialize(forOp))) {
     return;
   }
+  if (schedule.empty())
+    return;
+  ensureAllOpsScheduled(forOp, schedule);
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
   newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
   newForOp = lowerTMADescriptors(newForOp, schedule);

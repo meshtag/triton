@@ -371,7 +371,8 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
       triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
   auto lastOp =
       triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
-  assert(firstOp && lastOp);
+  if (!firstOp || !lastOp)
+    return std::make_pair(std::nullopt, std::nullopt);
 
   return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
 }
