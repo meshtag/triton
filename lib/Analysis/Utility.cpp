@@ -157,14 +157,62 @@ bool ReduceOpHelper::isAssociative() {
   return !hasNoAssociativeOp;
 }
 
+static SmallVector<unsigned> getRegisterContigPerThreadNoBroadcast(
+    LinearEncodingAttr encoding, ArrayRef<unsigned> order) {
+  auto ll = encoding.getLinearLayout();
+  auto kRegister = StringAttr::get(encoding.getContext(), "register");
+  auto it = ll.getBases().find(kRegister);
+  if (it == ll.getBases().end() || it->second.empty())
+    return SmallVector<unsigned>(order.size(), 1);
+  const auto &bases = it->second;
+  auto isZeroBasis = [](const std::vector<int32_t> &basis) {
+    for (int32_t v : basis) {
+      if (v != 0)
+        return false;
+    }
+    return true;
+  };
+
+  SmallVector<unsigned> contig(order.size(), 1);
+  auto basisIt = bases.begin();
+  for (unsigned dim : order) {
+    std::vector<int32_t> expected(order.size(), 0);
+    expected[dim] = contig[dim];
+    while (basisIt != bases.end()) {
+      if (isZeroBasis(*basisIt)) {
+        ++basisIt;
+        continue;
+      }
+      if (*basisIt == expected) {
+        contig[dim] *= 2;
+        expected[dim] *= 2;
+        ++basisIt;
+        continue;
+      }
+      break;
+    }
+  }
+  return contig;
+}
+
 unsigned ScanLoweringHelper::getAxisNumElementsPerThread() {
-  return getEncoding().getContigPerThread()[getAxis()];
+  auto contigPerThread =
+      getRegisterContigPerThreadNoBroadcast(getEncoding(), getOrder());
+  return contigPerThread[getAxis()];
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumElementsPerThread() {
-  auto contigPerThread = getEncoding().getContigPerThread();
-  contigPerThread[getAxis()] = 1;
-  return product<unsigned>(contigPerThread);
+  unsigned totalElemsPerThread = getEncoding().getTotalElemsPerThread(srcShape);
+  unsigned axisElemsPerThread = getAxisNumElementsPerThread();
+  unsigned numBlocks = getAxisNumBlocks() * getNonAxisNumBlocks();
+  assert(axisElemsPerThread > 0 && "invalid axis element count");
+  assert(numBlocks > 0 && "invalid block count");
+  assert(totalElemsPerThread % axisElemsPerThread == 0 &&
+         "unexpected element count for scan lowering");
+  unsigned elemsPerThread = totalElemsPerThread / axisElemsPerThread;
+  assert(elemsPerThread % numBlocks == 0 &&
+         "unexpected block tiling for scan lowering");
+  return elemsPerThread / numBlocks;
 }
 
 Region &ScanLoweringHelper::getCombineOp() { return scanOp.getCombineOp(); }
@@ -190,7 +238,8 @@ unsigned ScanLoweringHelper::getAxisNumWarpsWithUniqueData() {
 }
 
 unsigned ScanLoweringHelper::getAxisNumBlocks() {
-  auto contigPerThread = getEncoding().getContigPerThread();
+  auto contigPerThread =
+      getRegisterContigPerThreadNoBroadcast(getEncoding(), getOrder());
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   unsigned axis = getAxis();
@@ -200,7 +249,8 @@ unsigned ScanLoweringHelper::getAxisNumBlocks() {
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
-  auto contigPerThread = getEncoding().getContigPerThread();
+  auto contigPerThread =
+      getRegisterContigPerThreadNoBroadcast(getEncoding(), getOrder());
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   auto rank = contigPerThread.size();
@@ -735,10 +785,21 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape,
 unsigned ScanLoweringHelper::getAxisElementStride() {
   auto order = getOrder();
   unsigned stride = 1;
-  for (unsigned dim : order) {
-    if (dim == getAxis())
-      return stride;
-    stride *= getEncoding().getContigPerThread()[dim];
+  if (auto blockedEncoding = dyn_cast<BlockedEncodingAttr>(legacyEncoding)) {
+    auto sizePerThread = blockedEncoding.getSizePerThread();
+    for (unsigned dim : order) {
+      if (dim == getAxis())
+        return stride;
+      stride *= sizePerThread[dim];
+    }
+  } else {
+    auto contigPerThread =
+        getRegisterContigPerThreadNoBroadcast(getEncoding(), order);
+    for (unsigned dim : order) {
+      if (dim == getAxis())
+        return stride;
+      stride *= contigPerThread[dim];
+    }
   }
   llvm_unreachable("Axis not found in order");
 }
@@ -762,7 +823,8 @@ unsigned ScanLoweringHelper::getAxisThreadStride() {
 unsigned ScanLoweringHelper::getAxisBlockStride() {
   auto order = getOrder();
   unsigned stride = 1;
-  auto contigPerThread = getEncoding().getContigPerThread();
+  auto contigPerThread =
+      getRegisterContigPerThreadNoBroadcast(getEncoding(), getOrder());
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   for (unsigned dim : order) {

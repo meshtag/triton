@@ -3,6 +3,7 @@
 #layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [16], warpsPerCTA = [2], order = [0]}>
 #layout_adj = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [16], warpsPerCTA = [2], order = [0]}>
 #layout_2d = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 2], warpsPerCTA = [2, 1], order = [0,1]}>
+#layout_2d_bcast = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 8], warpsPerCTA = [2, 1], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 16 : i32} {
 
@@ -43,6 +44,17 @@ tt.func private @test_2d_grouped(%arg0: tensor<16x1xi32, #layout_2d>) -> tensor<
     tt.scan.return %1 : i32
   }) : (tensor<16x1xi32, #layout_2d>) -> tensor<16x1xi32, #layout_2d>
   tt.return %0 : tensor<16x1xi32, #layout_2d>
+}
+
+// CHECK-LABEL: @test_2d_broadcast_scan
+tt.func public @test_2d_broadcast_scan(%arg0: tensor<8x1xf32, #layout_2d_bcast>) -> tensor<8x1xf32, #layout_2d_bcast> {
+  // CHECK: @llvm.nvvm.read.ptx.sreg.tid.x
+  %0 = "tt.scan"(%arg0) <{axis = 0 : i32, reverse = false}> ({
+  ^bb0(%arg1: f32, %arg2: f32):
+    %1 = arith.addf %arg1, %arg2 : f32
+    tt.scan.return %1 : f32
+  }) : (tensor<8x1xf32, #layout_2d_bcast>) -> tensor<8x1xf32, #layout_2d_bcast>
+  tt.return %0 : tensor<8x1xf32, #layout_2d_bcast>
 }
 
 // This just prevents the test functions from being DCE'd.
