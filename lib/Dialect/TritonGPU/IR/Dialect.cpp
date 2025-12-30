@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 // Include TableGen'erated code
 #include "triton/Dialect/TritonGPU/IR/Dialect.cpp.inc"
@@ -1149,12 +1150,21 @@ LinearEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
 
 SmallVector<unsigned>
 LinearEncodingAttr::getContig(const char *inDim,
-                              SmallVector<unsigned int> lowerContig) const {
+                              SmallVector<unsigned int> lowerContig,
+                              const bool handleBroadcastDims) const {
   const auto &ll = getLinearLayout();
   const auto &bases =
       ll.getBases().find(StringAttr::get(getContext(), inDim))->second;
   auto order = getOrder();
   auto rank = order.size();
+
+  auto isZeroBasis = [](const std::vector<int32_t> &basis) {
+    for (int32_t v : basis) {
+      if (v != 0)
+        return false;
+    }
+    return true;
+  };
 
   SmallVector<unsigned> contig(lowerContig);
   auto basisIt = bases.begin();
@@ -1162,7 +1172,13 @@ LinearEncodingAttr::getContig(const char *inDim,
     std::vector<int32_t> basis(rank, 0);
     basis[dim] = contig[dim];
 
-    while (basisIt != bases.end() && *basisIt == basis) {
+    while (basisIt != bases.end()) {
+      if (handleBroadcastDims) {
+        while (basisIt != bases.end() && isZeroBasis(*basisIt))
+          ++basisIt;
+      }
+      if (basisIt == bases.end() || *basisIt != basis)
+        break;
       contig[dim] *= 2;
       basis[dim] *= 2;
       ++basisIt;
@@ -1171,13 +1187,15 @@ LinearEncodingAttr::getContig(const char *inDim,
   return contig;
 }
 
-SmallVector<unsigned> LinearEncodingAttr::getContigPerThread() const {
+SmallVector<unsigned>
+LinearEncodingAttr::getContigPerThread(const bool handleBroadcastDims) const {
   SmallVector<unsigned> contig(getOrder().size(), 1);
-  return getContig("register", contig);
+  return getContig("register", contig, handleBroadcastDims);
 }
 
-SmallVector<unsigned> LinearEncodingAttr::getContigPerWarp() const {
-  return getContig("lane", getContigPerThread());
+SmallVector<unsigned>
+LinearEncodingAttr::getContigPerWarp(const bool handleBroadcastDims) const {
+  return getContig("lane", getContigPerThread(), handleBroadcastDims);
 }
 
 unsigned

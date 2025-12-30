@@ -671,14 +671,14 @@ def LinearEncodingAttr : DistributedEncoding<"LinearEncoding", "linear_encoding"
 
   let parameters = (ins LinearLayoutParam:$linearLayout);
 
-  let extraClassDeclaration = extraDistributedDeclaration # [{
+  let extraClassDeclaration = extraDistributedDeclaration#[{
     // Generic distributed encoding methods
     unsigned getTotalElemsPerThread(ArrayRef<int64_t> shape) const;
     SmallVector<unsigned> getElemsPerThread(ArrayRef<int64_t> shape) const;
 
-    SmallVector<unsigned int> getContig(const char *, SmallVector<unsigned int>) const;
-    SmallVector<unsigned> getContigPerThread() const;
-    SmallVector<unsigned> getContigPerWarp() const;
+    SmallVector<unsigned int> getContig(const char *, SmallVector<unsigned int>, const bool handleBroadcastDims = false) const;
+    SmallVector<unsigned> getContigPerThread(const bool handleBroadcastDims = false) const;
+    SmallVector<unsigned> getContigPerWarp(const bool handleBroadcastDims = false) const;
     SmallVector<unsigned> getOrder() const;
     SmallVector<unsigned> getWarpOrder() const;
     SmallVector<unsigned> getThreadOrder() const;

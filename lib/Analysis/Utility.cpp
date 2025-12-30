@@ -158,13 +158,19 @@ bool ReduceOpHelper::isAssociative() {
 }
 
 unsigned ScanLoweringHelper::getAxisNumElementsPerThread() {
-  return getEncoding().getContigPerThread()[getAxis()];
+  return getEncoding().getContigPerThread(true)[getAxis()];
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumElementsPerThread() {
-  auto contigPerThread = getEncoding().getContigPerThread();
-  contigPerThread[getAxis()] = 1;
-  return product<unsigned>(contigPerThread);
+  unsigned totalElemsPerThread = getEncoding().getTotalElemsPerThread(srcShape);
+  unsigned axisElemsPerThread = getAxisNumElementsPerThread();
+  unsigned numBlocks = getAxisNumBlocks() * getNonAxisNumBlocks();
+
+  assert(axisElemsPerThread > 0 && "invalid axis element count");
+  assert(numBlocks > 0 && "invalid block count");
+
+  unsigned nonAxisElemsPerThread = totalElemsPerThread / axisElemsPerThread;
+  return ceil<unsigned>(nonAxisElemsPerThread, numBlocks);
 }
 
 Region &ScanLoweringHelper::getCombineOp() { return scanOp.getCombineOp(); }
@@ -190,7 +196,7 @@ unsigned ScanLoweringHelper::getAxisNumWarpsWithUniqueData() {
 }
 
 unsigned ScanLoweringHelper::getAxisNumBlocks() {
-  auto contigPerThread = getEncoding().getContigPerThread();
+  auto contigPerThread = getEncoding().getContigPerThread(true);
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   unsigned axis = getAxis();
@@ -200,7 +206,7 @@ unsigned ScanLoweringHelper::getAxisNumBlocks() {
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
-  auto contigPerThread = getEncoding().getContigPerThread();
+  auto contigPerThread = getEncoding().getContigPerThread(true);
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   auto rank = contigPerThread.size();

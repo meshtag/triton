@@ -153,6 +153,15 @@ static void AddPartialReduce(SmallVector<SmallVector<Value>> &srcValues,
   };
   unsigned numScanBlocks = helper.getAxisNumBlocks();
   unsigned numParallelBlocks = helper.getNonAxisNumBlocks();
+
+  llvm::outs() << "I can do this\n";
+  llvm::outs() << "numScanBlocks: " << numScanBlocks << "\n";
+  llvm::outs() << "numParallelBlocks: " << numParallelBlocks << "\n";
+  llvm::outs() << "parallelElementsPerThread: " << parallelElementsPerThread
+               << "\n";
+  llvm::outs() << "scanElementsPerThreads: " << scanElementsPerThreads << "\n";
+  llvm::outs() << "\n\n";
+
   assert(numScanBlocks * numParallelBlocks * parallelElementsPerThread *
              scanElementsPerThreads ==
          srcValues.size());

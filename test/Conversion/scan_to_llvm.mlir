@@ -3,6 +3,7 @@
 #layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [16], warpsPerCTA = [2], order = [0]}>
 #layout_adj = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [16], warpsPerCTA = [2], order = [0]}>
 #layout_2d = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 2], warpsPerCTA = [2, 1], order = [0,1]}>
+#layout_2d_bcast = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 8], warpsPerCTA = [2, 1], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 16 : i32} {
 
@@ -45,8 +46,19 @@ tt.func private @test_2d_grouped(%arg0: tensor<16x1xi32, #layout_2d>) -> tensor<
   tt.return %0 : tensor<16x1xi32, #layout_2d>
 }
 
+// CHECK-LABEL: @test_2d_broadcast_scan
+tt.func private @test_2d_broadcast_scan(%arg0: tensor<8x1xf32, #layout_2d_bcast>) -> tensor<8x1xf32, #layout_2d_bcast> {
+  // CHECK: @llvm.nvvm.read.ptx.sreg.tid.x
+  %0 = "tt.scan"(%arg0) <{axis = 0 : i32, reverse = false}> ({
+  ^bb0(%arg1: f32, %arg2: f32):
+    %1 = arith.addf %arg1, %arg2 : f32
+    tt.scan.return %1 : f32
+  }) : (tensor<8x1xf32, #layout_2d_bcast>) -> tensor<8x1xf32, #layout_2d_bcast>
+  tt.return %0 : tensor<8x1xf32, #layout_2d_bcast>
+}
+
 // This just prevents the test functions from being DCE'd.
-tt.func public @anchor(%ptr: !llvm.ptr, %arg0: !llvm.struct<(i32)>, %arg1: !llvm.struct<(i32, i32)>, %arg2: !llvm.struct<(i32)>) {
+tt.func public @anchor(%ptr: !llvm.ptr, %arg0: !llvm.struct<(i32)>, %arg1: !llvm.struct<(i32, i32)>, %arg2: !llvm.struct<(i32)>, %arg3: !llvm.struct<(f32, f32, f32, f32)>) {
   %0 = builtin.unrealized_conversion_cast %arg0 : !llvm.struct<(i32)> to tensor<8xi32, #layout>
   %1 = tt.call @test_1d_simple(%0) : (tensor<8xi32, #layout>) -> tensor<8xi32, #layout>
   %2 = builtin.unrealized_conversion_cast %1 : tensor<8xi32, #layout> to !llvm.struct<(i32)>
@@ -62,6 +74,10 @@ tt.func public @anchor(%ptr: !llvm.ptr, %arg0: !llvm.struct<(i32)>, %arg1: !llvm
   %8 = builtin.unrealized_conversion_cast %7 : tensor<16x1xi32, #layout_2d> to !llvm.struct<(i32)>
   llvm.store volatile %8, %ptr : !llvm.struct<(i32)>, !llvm.ptr
 
+  %9 = builtin.unrealized_conversion_cast %arg3 : !llvm.struct<(f32, f32, f32, f32)> to tensor<8x1xf32, #layout_2d_bcast>
+  %10 = tt.call @test_2d_broadcast_scan(%9) : (tensor<8x1xf32, #layout_2d_bcast>) -> tensor<8x1xf32, #layout_2d_bcast>
+  %11 = builtin.unrealized_conversion_cast %10 : tensor<8x1xf32, #layout_2d_bcast> to !llvm.struct<(f32, f32, f32, f32)>
+  llvm.store volatile %11, %ptr : !llvm.struct<(f32, f32, f32, f32)>, !llvm.ptr
   tt.return
 }
 
