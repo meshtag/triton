@@ -3,6 +3,7 @@
 #define DIALECT_NV_TRANSFORMS_PASSES_H_
 
 #include "mlir/Pass/Pass.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 
 namespace mlir {
 

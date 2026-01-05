@@ -196,6 +196,54 @@ static SmallVector<int64_t> getShape(Type type) {
 
 static SmallVector<int64_t> getShape(Value v) { return getShape(v.getType()); }
 
+static bool mapViewLikeReshapeDim(ArrayRef<int64_t> srcShape,
+                                  ArrayRef<int64_t> dstShape, unsigned dim,
+                                  bool srcToDst, unsigned &mappedDim) {
+  if (dim == DataPartitionScheme::noOpPartitionDim) {
+    mappedDim = dim;
+    return true;
+  }
+  if (srcToDst) {
+    if (dim >= srcShape.size())
+      return false;
+  } else {
+    if (dim >= dstShape.size())
+      return false;
+  }
+
+  auto stripOnes = [](ArrayRef<int64_t> shape) {
+    SmallVector<int64_t> out;
+    out.reserve(shape.size());
+    for (int64_t s : shape) {
+      if (s != 1)
+        out.push_back(s);
+    }
+    return out;
+  };
+  if (stripOnes(srcShape) != stripOnes(dstShape))
+    return false;
+
+  unsigned srcIdx = 0;
+  unsigned dstIdx = 0;
+  while (srcIdx < srcShape.size() && dstIdx < dstShape.size()) {
+    if (srcShape[srcIdx] == 1) {
+      srcIdx++;
+      continue;
+    }
+    if (dstShape[dstIdx] == 1) {
+      dstIdx++;
+      continue;
+    }
+    if (srcToDst ? srcIdx == dim : dstIdx == dim) {
+      mappedDim = srcToDst ? dstIdx : srcIdx;
+      return true;
+    }
+    srcIdx++;
+    dstIdx++;
+  }
+  return false;
+}
+
 static bool needToSlice(Value v, unsigned dim, int size) {
   if (dim == DataPartitionScheme::noOpPartitionDim)
     return true;
@@ -267,14 +315,32 @@ static bool getBackwardSliceToPartition(Value v,
       if (expandDimsOp.getAxis() < currentDim)
         currentDim--;
     }
+    if (auto reshapeOp = dyn_cast<ReshapeOp>(op)) {
+      if (reshapeOp.getAllowReorder())
+        return false;
+      unsigned mappedDim = currentDim;
+      if (!mapViewLikeReshapeDim(getShape(reshapeOp.getSrc()),
+                                 getShape(reshapeOp.getResult()), currentDim,
+                                 /*srcToDst=*/false, mappedDim))
+        return false;
+      currentDim = mappedDim;
+    } else if (auto reshapeOp = dyn_cast<MemDescReshapeOp>(op)) {
+      unsigned mappedDim = currentDim;
+      if (!mapViewLikeReshapeDim(getShape(reshapeOp.getSrc()),
+                                 getShape(reshapeOp.getResult()), currentDim,
+                                 /*srcToDst=*/false, mappedDim))
+        return false;
+      currentDim = mappedDim;
+    }
 
     // Recusively process operands backwards.
     if (op->hasTrait<OpTrait::Elementwise>() ||
         isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
-            BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
-            triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
-            AtomicRMWOp, triton::AddPtrOp, DescriptorLoadOp,
-            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp, FpToFpOp>(op)) {
+            BroadcastOp, ExpandDimsOp, ReshapeOp, MemDescReshapeOp, MakeRangeOp,
+            SplatOp, ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
+            TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
+            DescriptorLoadOp, nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
+            FpToFpOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
@@ -360,6 +426,25 @@ static bool getForwardSliceToPartition(Value v,
     // Flip dim when op is trans
     if (isa<TransOp, MemDescTransOp>(depOp))
       currentDim = partitionScheme.flipPartitionDim(currentDim);
+    if (isa<DescriptorStoreOp, DescriptorReduceOp>(depOp))
+      return false;
+    if (auto reshapeOp = dyn_cast<ReshapeOp>(depOp)) {
+      if (reshapeOp.getAllowReorder())
+        return false;
+      unsigned mappedDim = currentDim;
+      if (!mapViewLikeReshapeDim(getShape(reshapeOp.getSrc()),
+                                 getShape(reshapeOp.getResult()), currentDim,
+                                 /*srcToDst=*/true, mappedDim))
+        return false;
+      currentDim = mappedDim;
+    } else if (auto reshapeOp = dyn_cast<MemDescReshapeOp>(depOp)) {
+      unsigned mappedDim = currentDim;
+      if (!mapViewLikeReshapeDim(getShape(reshapeOp.getSrc()),
+                                 getShape(reshapeOp.getResult()), currentDim,
+                                 /*srcToDst=*/true, mappedDim))
+        return false;
+      currentDim = mappedDim;
+    }
 
     // Check dim compatibility
     if (!partitionScheme.ops.insert(depOp)) {
@@ -844,8 +929,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   Operation *newOp;
   if ((dim == DataPartitionScheme::noOpPartitionDim) ||
       op->hasTrait<OpTrait::Elementwise>() ||
-      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, FpToFpOp,
-          AtomicRMWOp, LocalAllocOp>(op)) {
+      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, ReshapeOp,
+          MemDescReshapeOp, FpToFpOp, AtomicRMWOp, LocalAllocOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
