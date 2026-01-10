@@ -16,6 +16,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -28,6 +29,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
+#include <optional>
+
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONAMDGPUTOLLVM
 #include "TritonAMDGPUToLLVM/Passes.h.inc"
@@ -36,6 +39,61 @@ namespace mlir::triton {
 using namespace mlir;
 
 namespace {
+
+struct InvalidTensorEncoding {
+  RankedTensorType type;
+  Attribute encoding;
+  bool missing;
+};
+
+std::optional<InvalidTensorEncoding> findInvalidTensorEncoding(ModuleOp mod) {
+  std::optional<InvalidTensorEncoding> invalid;
+
+  auto checkTensor = [&](RankedTensorType tensorTy) -> bool {
+    Attribute encoding = tensorTy.getEncoding();
+    if (!encoding) {
+      invalid = InvalidTensorEncoding{tensorTy, Attribute(), true};
+      return true;
+    }
+    if (!isa<triton::gpu::DistributedEncodingTrait>(encoding)) {
+      invalid = InvalidTensorEncoding{tensorTy, encoding, false};
+      return true;
+    }
+    return false;
+  };
+
+  auto checkType = [&](Type ty) -> bool {
+    if (auto tensorTy = dyn_cast<RankedTensorType>(ty))
+      return checkTensor(tensorTy);
+    if (auto ptrTy = dyn_cast<triton::PointerType>(ty)) {
+      if (auto pointeeTy = dyn_cast<RankedTensorType>(ptrTy.getPointeeType()))
+        return checkTensor(pointeeTy);
+    }
+    return false;
+  };
+
+  mod.walk([&](Operation *op) {
+    if (invalid)
+      return WalkResult::interrupt();
+    if (auto funcOp = dyn_cast<FunctionOpInterface>(op)) {
+      for (Type ty : funcOp.getArgumentTypes())
+        if (checkType(ty))
+          return WalkResult::interrupt();
+      for (Type ty : funcOp.getResultTypes())
+        if (checkType(ty))
+          return WalkResult::interrupt();
+    }
+    for (Type ty : op->getOperandTypes())
+      if (checkType(ty))
+        return WalkResult::interrupt();
+    for (Type ty : op->getResultTypes())
+      if (checkType(ty))
+        return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+
+  return invalid;
+}
 
 class TritonLLVMFunctionConversionTarget : public ConversionTarget {
 public:
@@ -90,6 +148,18 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::TargetInfo targetInfo(this->arch.getValue());
     if (targetInfo.getISAFamily() == AMD::ISAFamily::Unknown) {
       mod.emitError("unsupported target: '") << this->arch.getValue() << "'";
+      return signalPassFailure();
+    }
+    if (auto invalid = findInvalidTensorEncoding(mod)) {
+      if (invalid->missing) {
+        mod.emitError("missing TritonGPU layout encoding on tensor type '")
+            << invalid->type << "'; run convert-triton-to-tritongpu first";
+      } else {
+        mod.emitError(
+            "expected TritonGPU distributed layout encoding on tensor "
+            "type ")
+            << invalid->type << ", got " << invalid->encoding;
+      }
       return signalPassFailure();
     }
 

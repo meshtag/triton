@@ -7,6 +7,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::triton;
 
@@ -22,8 +24,8 @@ public:
                                const TargetInfoBase &targetInfo,
                                const DataLayoutAnalysis *analysis = nullptr);
 
-  Type convertTritonTensorType(RankedTensorType type,
-                               const TargetInfoBase &targetInfo);
+  std::optional<Type> convertTritonTensorType(RankedTensorType type,
+                                              const TargetInfoBase &targetInfo);
   Type convertMemDescType(triton::gpu::MemDescType type,
                           const TargetInfoBase &targetInfo);
   Type convertAsyncTokenType(triton::gpu::AsyncTokenType type);

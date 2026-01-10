@@ -1,5 +1,6 @@
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -39,11 +40,26 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
                  mlir::Float8E5M2Type, mlir::Float8E5M2FNUZType>();
 }
 
-Type TritonGPUToLLVMTypeConverter::convertTritonTensorType(
+std::optional<Type> TritonGPUToLLVMTypeConverter::convertTritonTensorType(
     RankedTensorType type, const TargetInfoBase &targetInfo) {
   auto ctx = type.getContext();
+  auto encoding = type.getEncoding();
+  if (!encoding) {
+    emitError(UnknownLoc::get(ctx))
+        << "missing TritonGPU layout encoding on tensor type " << type
+        << "; run convert-triton-to-tritongpu first";
+    return std::nullopt;
+  }
+  if (!isa<triton::gpu::DistributedEncodingTrait>(encoding)) {
+    emitError(UnknownLoc::get(ctx))
+        << "expected TritonGPU distributed layout encoding on tensor type "
+        << type << ", got " << encoding;
+    return std::nullopt;
+  }
   Type eltType = convertType(type.getElementType());
-  unsigned numElementsPerThread = getTotalElemsPerThread(type);
+  auto distEncoding = cast<triton::gpu::DistributedEncodingTrait>(encoding);
+  unsigned numElementsPerThread =
+      distEncoding.getTotalElemsPerThread(type.getShape());
   SmallVector<Type, 4> types(numElementsPerThread, eltType);
   return LLVM::LLVMStructType::getLiteral(ctx, types);
 }

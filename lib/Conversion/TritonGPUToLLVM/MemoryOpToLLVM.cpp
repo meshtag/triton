@@ -66,7 +66,11 @@ struct GlobalScratchAllocOpConversion
 
     auto opOffsetAttr = op->getAttrOfType<mlir::IntegerAttr>(
         "ttg.global_scratch_memory_offset");
-    assert(opOffsetAttr);
+    if (!opOffsetAttr) {
+      return op.emitOpError()
+             << "missing 'ttg.global_scratch_memory_offset' attribute; run "
+                "tritongpu-global-scratch-memory-allocation first";
+    }
     auto opOffset = opOffsetAttr.getValue().getZExtValue();
 
     auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
