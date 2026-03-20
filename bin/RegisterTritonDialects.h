@@ -31,6 +31,7 @@
 #include "nvidia/include/NVGPUToLLVM/Passes.h"
 #include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonIMToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
 
@@ -142,6 +143,10 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();
+
+  // IM passes
+  mlir::triton::im::registerConvertTritonIMToLLVMPass();
+
   mlir::triton::proton::registerConvertProtonToProtonGPU();
   mlir::triton::proton::gpu::registerConvertProtonNvidiaGPUToLLVM();
   mlir::triton::proton::gpu::registerConvertProtonAMDGPUToLLVM();
