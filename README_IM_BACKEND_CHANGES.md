@@ -142,9 +142,12 @@ CLI pass name:
 
 - In-tree backend discovery for IM requires:
   - `TRITON_BACKENDS_IN_TREE=1`
-- The current TTGIR generation still uses a CUDA target string (`"cuda:80"`) in IM compiler flow,
-  so output LLVM may include CUDA/NVVM-style attributes/address-space artifacts.
-- Despite that, LLVM IR generation path is functional for PIM-trace downstream usage.
+- The IM backend now uses its own target string (`"im:hbm-pim"`) instead of the
+  previous `"cuda:80"` hack.  The shared `FuncOpConversion` still sets `nvvm.kernel`
+  attributes, which are stripped in the Python `make_llir` step.
+- HBM-PIM bank-level parallelism is modeled via `threads_per_warp = 16` (one
+  "thread" per PIM bank).  The bank index is provided at runtime by the extern
+  function `__pim_get_bank_id()`.
 
 ---
 

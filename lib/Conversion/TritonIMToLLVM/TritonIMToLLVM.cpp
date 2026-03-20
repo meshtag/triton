@@ -2,7 +2,10 @@
 ///
 /// This pass reuses the shared TritonGPUToLLVM lowering patterns
 /// (elementwise, memory, SPMD, control-flow, …) with an IM-specific
-/// TargetInfo that models a single-threaded, flat-memory PIM unit.
+/// TargetInfo that models an HBM-PIM architecture with bank-level
+/// SIMD parallelism.  Each PIM bank is mapped to one Triton "thread"
+/// (threads_per_warp = numBanks).  The bank index is provided at
+/// runtime via the extern function __pim_get_bank_id().
 
 #include "TargetInfo.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
@@ -11,6 +14,7 @@
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -43,11 +47,13 @@ namespace {
 namespace ttg = mlir::triton::gpu;
 
 // --------------------------------------------------------------------------
-// gpu::ThreadIdOp → constant 0  (IM is single-threaded)
+// gpu::ThreadIdOp → PIM bank index
 // --------------------------------------------------------------------------
 
-/// Replace `gpu.thread_id` with a constant zero index.  The PIM execution
-/// model has exactly one thread, so the thread ID is always 0.
+/// Replace `gpu.thread_id` with a call to the extern runtime function
+/// `__pim_get_bank_id() -> i32`.  On HBM-PIM each bank executes the
+/// kernel in lock-step; the bank index is the analogue of a GPU
+/// thread ID.  The runtime / trace harness provides the implementation.
 struct IMThreadIdOpConversion : public RewritePattern {
   IMThreadIdOpConversion(MLIRContext *ctx, PatternBenefit benefit)
       : RewritePattern(::mlir::gpu::ThreadIdOp::getOperationName(), benefit,
@@ -55,7 +61,27 @@ struct IMThreadIdOpConversion : public RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(op, 0);
+    auto loc = op->getLoc();
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    auto *ctx = rewriter.getContext();
+    Type i32 = IntegerType::get(ctx, 32);
+
+    // Declare __pim_get_bank_id() if not yet present.
+    auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_get_bank_id");
+    if (!funcOp) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      auto fnType = LLVM::LLVMFunctionType::get(i32, {});
+      funcOp =
+          LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_get_bank_id", fnType);
+    }
+
+    // Call and wrap in index_cast (gpu.thread_id returns IndexType;
+    // the arith→LLVM patterns lower the cast in the same step).
+    auto callOp = LLVM::CallOp::create(rewriter, loc, funcOp, ValueRange{});
+    Value bankIdx = arith::IndexCastOp::create(
+        rewriter, loc, rewriter.getIndexType(), callOp.getResult());
+    rewriter.replaceOp(op, bankIdx);
     return success();
   }
 };
@@ -232,7 +258,14 @@ struct ConvertTritonIMToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    triton::im::TargetInfo targetInfo;
+    // Read the number of PIM banks from the module attribute
+    // (threads-per-warp models bank-level parallelism on HBM-PIM).
+    unsigned numBanks = 1;
+    if (auto attr =
+            mod->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumThreadsPerWarp))
+      numBanks = attr.getInt();
+
+    triton::im::TargetInfo targetInfo(numBanks);
 
     // -- Allocation & membar (kept for compatibility with shared patterns,
     //    but no shared memory is actually used on IM targets) --
@@ -289,7 +322,7 @@ struct ConvertTritonIMToLLVM
     triton::populateAssertOpToLLVMPattern(typeConverter, patterns, targetInfo,
                                           benefit);
 
-    // IM-specific: lower gpu::ThreadIdOp → constant 0.
+    // IM-specific: lower gpu::ThreadIdOp → __pim_get_bank_id().
     patterns.insert<IMThreadIdOpConversion>(context, PatternBenefit(benefit));
     // IM-specific: lower tt.load / tt.store → scalar LLVM ops.
     patterns.add<IMLoadOpConversion>(typeConverter, benefit);

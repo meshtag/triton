@@ -13,11 +13,12 @@ def ConvertTritonIMToLLVM
   let summary = "Convert TritonGPU IR to LLVM for In-Memory processing";
   let description = [{
     Lowers Triton GPU dialect operations to the LLVM dialect targeting
-    generic In-Memory processing architectures.  The pass reuses the
-    shared TritonGPUToLLVM lowering patterns (elementwise, memory,
-    control-flow, SPMD, etc.) with an IM-specific TargetInfo that
-    maps the execution model to a single-threaded, flat-memory PIM
-    unit.
+    In-Memory processing architectures such as HBM-PIM.  The pass
+    reuses the shared TritonGPUToLLVM lowering patterns (elementwise,
+    memory, control-flow, SPMD, etc.) with an IM-specific TargetInfo
+    that models bank-level SIMD parallelism: each PIM bank is one
+    Triton "thread" (threads_per_warp = numBanks).  The bank index is
+    obtained at runtime via the extern function __pim_get_bank_id().
   }];
 
   let dependentDialects = ["mlir::arith::ArithDialect",

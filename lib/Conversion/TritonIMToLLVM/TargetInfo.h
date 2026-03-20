@@ -5,15 +5,22 @@
 
 namespace mlir::triton::im {
 
-/// TargetInfo for generic In-Memory (IM) processing architectures.
+/// TargetInfo for In-Memory (IM) processing architectures (e.g. HBM-PIM).
 ///
-/// The execution model is single-threaded with a flat global address space.
-/// There is no shared memory, no warp-level communication, and no GPU
-/// barriers.  Operations that require those features will assert-fail so
-/// that unsupported Triton patterns surface immediately during lowering.
+/// HBM-PIM executes the same instruction across multiple PIM banks in a
+/// SIMD-like fashion.  Each bank is modeled as one Triton "thread"
+/// (threads_per_warp = numBanks, num_warps = 1).  Banks share no memory
+/// and need no barriers — they are lock-step.
+///
+/// The flat global address space (addrspace 0) is used throughout.
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
-  TargetInfo() = default;
+  explicit TargetInfo(unsigned numBanks = 1) : numBanks(numBanks) {}
+
+  unsigned getNumBanks() const { return numBanks; }
+
+private:
+  unsigned numBanks;
 
   bool supportMaximumMinimum() const override;
 
