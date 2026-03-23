@@ -1,4 +1,5 @@
 add_triton_library(TritonIMToLLVM
+    RewriteIMLayout.cpp
     TargetInfo.cpp
     TritonIMToLLVM.cpp
 
@@ -12,4 +13,5 @@ add_triton_library(TritonIMToLLVM
     TritonIR
     TritonGPUIR
     TritonGPUToLLVM
+    TritonGPUTransforms
 )

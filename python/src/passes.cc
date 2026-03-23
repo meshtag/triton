@@ -138,6 +138,8 @@ void init_triton_passes_convert(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_nvvm_to_llvm", createConvertNVVMToLLVMPass);
   ADD_PASS_WRAPPER_0("add_convert_triton_im_to_llvm",
                      triton::im::createConvertTritonIMToLLVMPass);
+  ADD_PASS_WRAPPER_0("add_rewrite_im_layout",
+                     triton::im::createRewriteIMLayoutPass);
 }
 
 void init_triton_passes_llvmir(py::module &&m) {

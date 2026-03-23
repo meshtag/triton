@@ -28,4 +28,32 @@ def ConvertTritonIMToLLVM
                            "mlir::triton::gpu::TritonGPUDialect"];
 }
 
+// Layout rewrite pass: changes the BlockedEncodingAttr so that each PIM
+// bank owns a *consecutive* chunk of elements (register-innermost
+// layout) instead of the default GPU-style interleaved layout
+// (lane-innermost / coalesced).
+//
+// GPU default (sizePerThread=1):
+//   bank 0 → {0, 16, 32, 48}  (stride = threadsPerWarp)
+// IM layout (sizePerThread = shape / threadsPerWarp):
+//   bank 0 → {0, 1, 2, 3}     (consecutive)
+//
+// This pass replaces tritongpu-coalesce in the IM pipeline.
+def RewriteIMLayout : Pass<"rewrite-im-layout", "mlir::ModuleOp"> {
+  let summary = "Rewrite tensor layout for bank-consecutive PIM access";
+  let description = [{
+    Rewrites BlockedEncodingAttr on tensor-typed memory operations so
+    that each PIM bank (= one TritonGPU "lane") owns a consecutive
+    slice of elements rather than an interleaved slice.  The pass
+    reads im.num-banks and ttg.num-warps from the module and computes
+    sizePerThread = tensorShape / (threadsPerWarp × warpsPerCTA) for
+    each dimension.  ConvertLayoutOps are inserted around load/store
+    operations; the downstream tritongpu-remove-layout-conversions
+    pass propagates the new encoding through the rest of the IR.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES
