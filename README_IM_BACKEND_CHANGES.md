@@ -2,15 +2,78 @@
 
 This document explains the Triton-side changes made to enable lowering Triton kernels
 for a generic **In-Memory (IM)** backend and producing LLVM IR suitable for downstream
-PIM tracing/simulation.
+PIM tracing/simulation and CPU-based functional verification.
 
 ## Goals
 
 - Add a new Triton conversion pass: `convert-triton-im-to-llvm`
-- Reuse Triton's shared GPU->LLVM lowering infrastructure where possible
-- Model IM execution as single-threaded, flat-memory (no warp/shared-memory primitives)
+- Reuse Triton's shared GPU→LLVM lowering infrastructure where possible
+- Model HBM-PIM two-level parallelism: bank-level SIMT + intra-bank SIMD
+- Provide a CPU launcher that executes compiled kernels for functional verification
 - Expose the pass through Python bindings and `triton-opt`
-- Fix legalization blockers encountered during real kernel compilation (`make_range`, `load`, `store`)
+
+---
+
+## Two-Level Parallelism Model
+
+HBM-PIM has two levels of parallelism, analogous to GPU SIMT+SIMD:
+
+| Level | GPU analogy | HBM-PIM mechanism | Triton mapping |
+|-------|-------------|--------------------|----------------|
+| **Level 1** — inter-bank (SIMT-like) | Threads in a warp | 16 banks execute the same instruction in lock-step on different data | `threads_per_warp = num_banks` in `BlockedEncodingAttr` |
+| **Level 2** — intra-bank (SIMD-like) | Elements per thread | Each bank's PE processes multiple elements from its row buffer | `sizePerThread = BLOCK / num_banks` |
+
+With `BLOCK=64` and `num_banks=16`:
+- `sizePerThread = 64 / 16 = 4` → each bank handles 4 elements
+- Elements are interleaved: bank 0 gets `{0, 16, 32, 48}`, bank 1 gets `{1, 17, 33, 49}`, etc.
+- This interleaving maps naturally to HBM physical address interleaving across banks
+
+The generated LLVM IR for one bank shows 4 unrolled load/compute/store sequences —
+that is the Level 2 vectorization.
+
+---
+
+## Module Attributes
+
+The IM compiler sets these attributes on the MLIR module:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `im.num-banks` | `i32` | Canonical IM bank count (read by `ConvertTritonIMToLLVM`) |
+| `im.arch` | `string` | Architecture identifier (e.g. `"hbm-pim"`) |
+| `ttg.threads-per-warp` | `i32` | Set to `num_banks` — internal plumbing for `BlockedEncodingAttr` |
+| `ttg.num-warps` | `i32` | Always 1 (no warp hierarchy on PIM) |
+
+`ConvertTritonIMToLLVM` reads `im.num-banks` (not `ttg.threads-per-warp`).
+
+---
+
+## Runtime Functions
+
+The compiled kernel calls two extern functions:
+
+| Function | Returns | Set by |
+|----------|---------|--------|
+| `__pim_get_bank_id()` | `i32` bank index | `__pim_set_bank_id()` (host driver) |
+| `__pim_get_program_id()` | `i32` tile index | `__pim_set_program_id()` (host driver) |
+
+These are defined in `im_runtime.c` (in `ramulator2/llvm-tracer/runtime/`).
+On real HBM-PIM hardware, these would map to hardware registers.
+
+---
+
+## CPU Launcher
+
+The `triton.backends.im.launcher` module provides:
+
+- `compile_im_kernel(llir)` — post-processes IR (strips addrspace, target triple) +
+  compiles with `clang -shared` alongside `im_runtime.c` → returns `ctypes.CDLL`
+- `launch_im_kernel(lib, num_banks, num_programs, ...)` — iterates over
+  `(program_id, bank_id)` setting the runtime state before each kernel call
+
+This is the **main execution path** for CPU-based verification and trace generation.
+On real hardware the bank loop is hardware-parallel; the CPU emulation is sequential
+but produces identical results.
 
 ---
 
@@ -41,13 +104,13 @@ PIM tracing/simulation.
 
 `mlir::triton::im::TargetInfo` implements `TargetInfoBase` with IM semantics:
 
-- **Single program id:** `programId(...) -> 0`
-- **No barriers / sync:** barrier methods are no-ops
+- **Program ID:** `programId()` calls extern `__pim_get_program_id()` (host driver sets it per tile)
+- **Bank ID:** `IMThreadIdOpConversion` rewrites `gpu.thread_id` → call `__pim_get_bank_id()`
+- **No barriers / sync:** barrier methods are no-ops (banks execute in lock-step)
 - **No shared memory:** `storeDShared` / `loadDShared` are unsupported (`llvm_unreachable`)
 - **No warp data movement:** shuffle/permute act as identity
 - **Flat memory model:** address spaces map to `0`
 - **No warp-level reduction hardware:** returns `false` and falls back to generic lowering
-- **Host-like runtime helpers:** `printf` and `abort` declarations emitted in LLVM dialect
 
 This lets shared conversion patterns run while enforcing IM constraints.
 
@@ -83,7 +146,8 @@ Marking `mlir::gpu` illegal is crucial because shared utilities create `gpu.thre
 
 ### Fix
 
-- Added `IMThreadIdOpConversion` that rewrites `gpu.thread_id` to constant `0` (`index`)
+- Added `IMThreadIdOpConversion` that rewrites `gpu.thread_id` to a call to
+  `__pim_get_bank_id()` — returns the current bank index as `i32`
 - Marked `mlir::gpu::GPUDialect` illegal so conversions are explicit and complete
 
 This unblocks `tt.make_range` lowering under single-thread IM assumptions.
@@ -142,27 +206,55 @@ CLI pass name:
 
 - In-tree backend discovery for IM requires:
   - `TRITON_BACKENDS_IN_TREE=1`
-- The IM backend now uses its own target string (`"im:hbm-pim"`) instead of the
-  previous `"cuda:80"` hack.  The shared `FuncOpConversion` still sets `nvvm.kernel`
-  attributes, which are stripped in the Python `make_llir` step.
-- HBM-PIM bank-level parallelism is modeled via `threads_per_warp = 16` (one
-  "thread" per PIM bank).  The bank index is provided at runtime by the extern
+- The IM backend uses its own target string (`"im:hbm-pim"`) and target factory:
+  ```python
+  from triton.backends.im import IMTarget
+  target = IMTarget("hbm-pim", 16)   # arch, num_banks
+  ```
+- The shared `FuncOpConversion` still sets `nvvm.kernel` attributes, which are
+  stripped in the Python `make_llir` step (regex removal of attribute groups and refs).
+- HBM-PIM bank-level parallelism is modeled via `threads_per_warp = num_banks`
+  (one "thread" per PIM bank).  The bank index is provided at runtime by the extern
   function `__pim_get_bank_id()`.
+- With `BLOCK > num_banks`, each bank processes `sizePerThread = BLOCK / num_banks`
+  elements — this is the intra-bank SIMD-like vectorization.
 
 ---
 
 ## Validation commands
 
-From repo root (`/Users/meshtag/TritonPIM`):
+### Quick compilation check
 
 ```bash
+cd /Users/meshtag/TritonPIM
 source third_party/triton/.venv/bin/activate
 TRITON_BACKENDS_IN_TREE=1 python test_im_debug.py
 ```
 
-Expected: prints LLVM IR preview and `[OK] ... bytes of LLVM IR generated`.
+Expected: prints LLVM IR preview with `__pim_get_bank_id()` and
+`__pim_get_program_id()` calls, ends with `[OK] ... bytes of LLVM IR generated`.
 
-Direct pass check (optional):
+### Functional verification (CPU)
+
+```bash
+cd /Users/meshtag/TritonPIM
+source third_party/triton/.venv/bin/activate
+TRITON_BACKENDS_IN_TREE=1 python scripts/verify_im_cpu.py
+```
+
+Expected: compiles AXPY (BLOCK=64, 16 banks, sizePerThread=4), executes across
+4 programs × 16 banks, compares against NumPy reference → `[PASS]`.
+
+### Inspect intermediate IR stages
+
+```bash
+cd /Users/meshtag/TritonPIM
+source third_party/triton/.venv/bin/activate
+TRITON_BACKENDS_IN_TREE=1 python examples/axpy_im.py --out artifacts/axpy.ll
+cat artifacts/axpy.ll
+```
+
+### Direct pass check (optional)
 
 ```bash
 third_party/triton/build/cmake.macosx-12.1-arm64-cpython-3.13/bin/triton-opt \
@@ -174,5 +266,8 @@ third_party/triton/build/cmake.macosx-12.1-arm64-cpython-3.13/bin/triton-opt \
 ## Known follow-up work
 
 - Replace/abstract CUDA-specific target metadata in IM frontend path
-- Add direct Triton-kernel-LLVM-to-tracer bridge helper for one-command flow
-- Expand IM lowering coverage for more Triton ops (atomics/special ops as needed)
+  (FuncOpConversion still injects `nvvm.kernel` — need IM-specific version)
+- Add direct Triton-kernel-LLVM-to-tracer bridge for one-command trace generation
+- Expand IM lowering coverage for more Triton ops (atomics, special ops)
+- Row-buffer-aware data placement: ensure sizePerThread elements per bank
+  map to contiguous physical row-buffer addresses (currently interleaved)

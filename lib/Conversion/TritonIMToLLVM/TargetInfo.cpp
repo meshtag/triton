@@ -99,10 +99,23 @@ Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
 // ---------------------------------------------------------------------------
 
 Value TargetInfo::programId(RewriterBase &rewriter, Location loc,
-                            ModuleOp /*moduleOp*/,
-                            ProgramIDDim /*axis*/) const {
-  // Single PIM unit – program id is always 0.
-  return LLVM::createConstantI32(loc, rewriter, 0);
+                            ModuleOp moduleOp, ProgramIDDim /*axis*/) const {
+  // On HBM-PIM the "program id" identifies which tile of the input arrays
+  // this invocation processes.  The host driver iterates over tiles and
+  // sets the id via the IM runtime before each call.
+  auto *ctx = rewriter.getContext();
+  Type i32 = IntegerType::get(ctx, 32);
+
+  auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_get_program_id");
+  if (!funcOp) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+    auto fnType = LLVM::LLVMFunctionType::get(i32, {});
+    funcOp =
+        LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_get_program_id", fnType);
+  }
+
+  return LLVM::CallOp::create(rewriter, loc, funcOp, ValueRange{}).getResult();
 }
 
 // ---------------------------------------------------------------------------

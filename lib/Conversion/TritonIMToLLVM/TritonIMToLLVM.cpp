@@ -258,11 +258,12 @@ struct ConvertTritonIMToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    // Read the number of PIM banks from the module attribute
-    // (threads-per-warp models bank-level parallelism on HBM-PIM).
+    // Read the number of PIM banks from the IM-specific module attribute.
+    // (The compiler also sets ttg.threads-per-warp = num_banks so that
+    // TritonGPU's BlockedEncodingAttr distributes elements across banks,
+    // but our code reads the canonical "im.num-banks" attribute directly.)
     unsigned numBanks = 1;
-    if (auto attr =
-            mod->getAttrOfType<IntegerAttr>(triton::gpu::AttrNumThreadsPerWarp))
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("im.num-banks"))
       numBanks = attr.getInt();
 
     triton::im::TargetInfo targetInfo(numBanks);
