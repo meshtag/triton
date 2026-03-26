@@ -6,6 +6,43 @@
 /// SIMD parallelism.  Each PIM bank is mapped to one Triton "thread"
 /// (threads_per_warp = numBanks).  The bank index is provided at
 /// runtime via the extern function __pim_get_bank_id().
+///
+/// ---------- Vectorization strategy ----------
+///
+/// Each PIM bank owns `sizePerThread` consecutive elements (set by the
+/// RewriteIMLayout pass).  Because those elements are contiguous in
+/// memory, we can load/store them as a single LLVM vector operation
+/// instead of N scalar operations.
+///
+/// The vector width is derived from `contigPerThread` — the number of
+/// consecutive elements per thread (bank) as specified by the layout's
+/// LinearEncodingAttr:
+///
+///     vec = min(128 / pointeeBitWidth, contigPerThread)
+///
+/// NOTE: We intentionally bypass Triton's AxisInfo dataflow analysis
+/// (used by NVIDIA/AMD backends) because the `unrealized_conversion_cast`
+/// ops inserted during Phase-1 function-signature lowering break the
+/// AxisInfo divisibility chain, yielding contiguity=1.  Using
+/// contigPerThread directly is safe because the IM layout guarantees
+/// that each thread's elements are contiguous in memory.
+///
+/// For a typical AXPY kernel with i32 and sizePerThread=4:
+///
+///     vec = min(128/32, 4) = min(4, 4) = 4
+///
+/// Mask handling:
+///   - Loads: branch on mask[vecStart] (group predicate), then
+///     per-element `llvm.select` to handle partial masks at the
+///     boundary.  The group predicate is safe because the IM offset
+///     pattern (offs < N) produces a monotonically non-increasing mask
+///     within each thread's elements.
+///   - Stores: AND all mask bits in the group.  If all-true, emit a
+///     single vector store.  Otherwise, fall back to per-element
+///     scalar stores with individual mask checks.
+///
+/// When vec==1 (e.g. non-contiguous layout or sub-byte elements),
+/// this gracefully degrades to scalar behavior.
 
 #include "TargetInfo.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
@@ -18,6 +55,7 @@
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -26,6 +64,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 // --------------------------------------------------------------------------
@@ -87,11 +126,179 @@ struct IMThreadIdOpConversion : public RewritePattern {
 };
 
 // --------------------------------------------------------------------------
-// tt.load → scalar LLVM loads  (IM single-threaded flat memory)
+// Base class for vectorized load/store conversions
 // --------------------------------------------------------------------------
 
-struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+/// Shared helper for IMLoadOpConversion and IMStoreOpConversion.
+///
+/// Holds a reference to ModuleAxisInfoAnalysis and provides methods to
+/// compute the vector width for memory operations.  This follows the
+/// same pattern used by the AMD and NVIDIA backends
+/// (LoadStoreConversionBase in their LoadStoreOpToLLVM.cpp files).
+///
+/// The vector width formula is:
+///
+///     vec = min(128 / pointeeBitWidth, contiguity)
+///
+/// - 128 bits is the maximum LLVM vector width we emit (matches GPU
+///   backends; yields <4 x i32>, <8 x i16>, <16 x i8>, etc.).
+/// - `contiguity` is the number of consecutive elements accessed per
+///   thread in the fastest-varying dimension, derived from Triton's
+///   AxisInfo dataflow analysis.  After RewriteIMLayout sets
+///   sizePerThread=[K], the contiguity for `pid*BLOCK + arange(0,BLOCK)`
+///   patterns is exactly K.
+///
+/// When a mask is present, the vector width is further clamped to the
+/// mask's alignment (the number of consecutive mask elements that share
+/// the same value):
+///
+///     vec = min(vec, maskAlignment)
+///
+/// This ensures that within each vector group, either all elements are
+/// active or all are inactive, so we can use a single predicate bit
+/// for the whole vector load/store.
+struct IMLoadStoreConversionBase {
+  explicit IMLoadStoreConversionBase() {}
+
+  /// Compute the vector width for a pointer-typed tensor operand.
+  ///
+  /// We derive vec from the layout's `contigPerThread` (the number of
+  /// register-level consecutive elements per thread), capped at 128
+  /// bits.  This is more reliable than using ModuleAxisInfoAnalysis
+  /// because the IM backend's Phase-1 function-signature lowering
+  /// introduces `unrealized_conversion_cast` ops that break the
+  /// AxisInfo divisibility chain — resulting in contiguity=1 even
+  /// when the layout guarantees contiguity=4.
+  ///
+  /// Using contigPerThread directly is safe because:
+  ///   (a) RewriteIMLayout already set sizePerThread so that each
+  ///       bank's elements are consecutive in memory;
+  ///   (b) the pointer pattern (splat + addptr with make_range)
+  ///       guarantees that ptrElems[0..vec-1] point to consecutive
+  ///       addresses.
+  ///
+  /// Formula:  vec = min(128 / pointeeBitWidth, contigPerThread)
+  ///
+  /// For i32 with sizePerThread=4:  vec = min(128/32, 4) = 4
+  /// For i16 with sizePerThread=8:  vec = min(128/16, 8) = 8
+  /// For f32 with sizePerThread=2:  vec = min(128/32, 2) = 2
+  static unsigned getVectorSize(Value ptr) {
+    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    if (!tensorTy)
+      return 1;
+
+    unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+    if (pointeeBitWidth == 0)
+      return 1;
+
+    // Get contigPerThread from the layout's LinearEncoding.
+    auto linAttr = ttg::toLinearEncoding(tensorTy);
+    auto order = linAttr.getOrder();
+    auto cpt = linAttr.getContigPerThread();
+    unsigned contigPerThread = cpt[order[0]];
+
+    return std::min<unsigned>(128 / pointeeBitWidth, contigPerThread);
+  }
+
+  /// Build a zero-valued LLVM vector constant.  Used as the `other`
+  /// (false-value) default when no explicit `other` operand is given
+  /// on a masked load.
+  static Value createZeroVector(OpBuilder &builder, Location loc,
+                                VectorType vecTy) {
+    auto zeroAttr = builder.getZeroAttr(vecTy.getElementType());
+    auto denseVal = DenseElementsAttr::get(cast<ShapedType>(vecTy), zeroAttr);
+    return LLVM::ConstantOp::create(builder, loc, vecTy, denseVal);
+  }
+
+  /// Pack `elems[start .. start+vec-1]` into an LLVM vector value.
+  /// Used to build the `other` vector for masked loads and the value
+  /// vector for stores.
+  ///
+  /// Example for vec=4, start=0, elems=[a, b, c, d, ...]:
+  ///   %v = undef : <4 x i32>
+  ///   %v = insertelement %v, a, 0
+  ///   %v = insertelement %v, b, 1
+  ///   %v = insertelement %v, c, 2
+  ///   %v = insertelement %v, d, 3
+  static Value packElementRange(RewriterBase &rewriter,
+                                const TypeConverter *typeConverter,
+                                Location loc, VectorType vecTy,
+                                ArrayRef<Value> elems, unsigned start) {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    unsigned vec = vecTy.getNumElements();
+    Value v = b.undef(vecTy);
+    for (unsigned s = 0; s < vec; ++s) {
+      Value idx = LLVM::createIndexConstant(rewriter, loc, typeConverter, s);
+      v = b.insert_element(vecTy, v, elems[start + s], idx);
+    }
+    return v;
+  }
+};
+
+// --------------------------------------------------------------------------
+// tt.load → vectorized LLVM loads  (IM flat memory)
+// --------------------------------------------------------------------------
+
+/// Lower `tt.load` to LLVM vector load operations.
+///
+/// For each group of `vec` contiguous elements assigned to this
+/// bank/thread, we emit a single `LLVM::LoadOp` of type `<vec x elemTy>`.
+/// Individual scalar values are then extracted via `llvm.extractelement`.
+///
+/// Vector width is derived from `contigPerThread` (see
+/// `IMLoadStoreConversionBase::getVectorSize`), NOT from AxisInfo.
+/// This bypasses the broken AxisInfo divisibility chain that results
+/// from `unrealized_conversion_cast` ops introduced during Phase-1
+/// function-signature lowering.
+///
+/// Mask handling:
+///   Unlike NVIDIA/AMD (which reduce vec to maskAlignment), we keep
+///   vec = contigPerThread and handle partial masks with per-element
+///   `llvm.select` after the vector load.  This enables vectorization
+///   even for masked loads at the cost of a few extra select ops.
+///
+///   The group predicate is `mask[vecStart]` — the first element of
+///   the vec-group.  This is safe because in the IM offset pattern
+///   (`offs = pid*BLOCK + bank*spt + [0..spt-1]`), the mask
+///   (`offs < N`) is monotonically non-increasing within a thread's
+///   elements: once an element is out-of-bounds, all subsequent
+///   elements are too.  Therefore mask[vecStart]=false implies
+///   mask[vecStart+j]=false for all j in [1, vec).
+///
+/// Unmasked loads (vec=4, i32):
+///
+///   %vec = load <4 x i32>, ptr %p       ; single 128-bit load
+///   %e0 = extractelement %vec, 0
+///   %e1 = extractelement %vec, 1
+///   %e2 = extractelement %vec, 2
+///   %e3 = extractelement %vec, 3
+///
+/// Masked loads (vec=4, i32) — branch + per-element select:
+///
+///   currentBlock:
+///     %pred = mask[0]                     ; group predicate
+///     cond_br %pred → loadBlock, afterBlock(other[0..3])
+///
+///   loadBlock:
+///     %vec = load <4 x i32>, ptr %p
+///     %e0 = extractelement %vec, 0
+///     %e1 = extractelement %vec, 1
+///     %e2 = extractelement %vec, 2
+///     %e3 = extractelement %vec, 3
+///     %r0 = select mask[0], %e0, other[0]
+///     %r1 = select mask[1], %e1, other[1]
+///     %r2 = select mask[2], %e2, other[2]
+///     %r3 = select mask[3], %e3, other[3]
+///     br afterBlock(%r0, %r1, %r2, %r3)
+///
+///   afterBlock(%a0, %a1, %a2, %a3 : i32):   ; per-element phi nodes
+///     ...
+///
+struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
+                            public IMLoadStoreConversionBase {
+  IMLoadOpConversion(LLVMTypeConverter &converter, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        IMLoadStoreConversionBase() {}
 
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
@@ -99,18 +306,25 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
     auto loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    Value ptr = op.getPtr();
-    Value mask = op.getMask();
+    // ---- Operands ----
+    Value ptr = op.getPtr();   // original Triton ptr (tensor of pointers)
+    Value mask = op.getMask(); // original Triton mask (or null)
 
-    Value llPtr = adaptor.getPtr();
-    Value llMask = adaptor.getMask();
-    Value llOther = adaptor.getOther();
+    Value llPtr = adaptor.getPtr();     // lowered LLVM struct of ptrs
+    Value llMask = adaptor.getMask();   // lowered LLVM struct of i1s
+    Value llOther = adaptor.getOther(); // lowered LLVM struct of elems
 
+    // ---- Types and element count ----
     Type valueTy = op.getType();
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
     unsigned numElems = ttg::getTotalElemsPerThread(ptr.getType());
 
+    // ---- Compute vector width from layout ----
+    // See IMLoadStoreConversionBase::getVectorSize doc.
+    unsigned vec = getVectorSize(ptr);
+
+    // ---- Unpack operand elements ----
     auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
     assert(ptrElems.size() == numElems);
 
@@ -122,40 +336,116 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
     if (llOther)
       otherElems = unpackLLElements(loc, llOther, rewriter);
 
+    // ---- Build the LLVM vector type ----
+    Type vecTy =
+        (vec > 1) ? LLVM::getVectorType(valueElemTy, vec) : valueElemTy;
+
+    // ---- Emit one (vector) load per group of `vec` elements ----
     SmallVector<Value> loadedVals;
-    for (unsigned i = 0; i < numElems; ++i) {
+    for (unsigned vecStart = 0; vecStart < numElems; vecStart += vec) {
+      Value basePtr = ptrElems[vecStart];
+
       if (!mask) {
-        // Unconditional scalar load.
-        auto loaded =
-            LLVM::LoadOp::create(rewriter, loc, valueElemTy, ptrElems[i]);
-        loadedVals.push_back(loaded);
-      } else {
-        // Masked load: branch on mask[i].
+        // ---- Unconditional vector load ----
+        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr);
+
+        if (vec > 1) {
+          for (unsigned j = 0; j < vec; ++j) {
+            Value idx = createIndexAttrConstant(
+                rewriter, loc, getTypeConverter()->getIndexType(), j);
+            loadedVals.push_back(b.extract_element(valueElemTy, loaded, idx));
+          }
+        } else {
+          loadedVals.push_back(loaded);
+        }
+
+      } else if (vec == 1) {
+        // ---- Scalar masked load (vec==1) ----
+        // Simple diamond: branch on mask, load or use other.
         Value falseVal =
-            i < otherElems.size() ? otherElems[i] : b.undef(valueElemTy);
+            !otherElems.empty() ? otherElems[vecStart] : b.undef(valueElemTy);
 
         Block *currentBlock = rewriter.getInsertionBlock();
-        auto ip = rewriter.getInsertionPoint();
-        Block *afterBlock = rewriter.splitBlock(currentBlock, ip);
+        Block *afterBlock =
+            rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
         afterBlock->addArgument(valueElemTy, loc);
         Block *loadBlock = rewriter.createBlock(afterBlock);
 
-        // currentBlock: cond_br mask → loadBlock, afterBlock(falseVal)
         rewriter.setInsertionPointToEnd(currentBlock);
-        LLVM::CondBrOp::create(rewriter, loc, maskElems[i], loadBlock,
+        LLVM::CondBrOp::create(rewriter, loc, maskElems[vecStart], loadBlock,
                                ValueRange{}, afterBlock, ValueRange{falseVal});
 
-        // loadBlock: %v = load ptr; br afterBlock(%v)
         rewriter.setInsertionPointToStart(loadBlock);
         Value loaded =
-            LLVM::LoadOp::create(rewriter, loc, valueElemTy, ptrElems[i]);
+            LLVM::LoadOp::create(rewriter, loc, valueElemTy, basePtr);
         LLVM::BrOp::create(rewriter, loc, ValueRange{loaded}, afterBlock);
 
         rewriter.setInsertionPointToStart(afterBlock);
         loadedVals.push_back(afterBlock->getArgument(0));
+
+      } else {
+        // ---- Masked vector load with per-element select (vec>1) ----
+        //
+        // Group predicate: mask[vecStart].
+        //   - If false, the IM monotonic-mask property guarantees all
+        //     mask[vecStart..vecStart+vec-1] are false → use `other`.
+        //   - If true, we load the full vector and use per-element
+        //     `llvm.select` to handle the (rare) case where trailing
+        //     elements in the group are masked out.
+        //
+        // CFG:
+        //   currentBlock: cond_br mask[vecStart] → loadBlock,
+        //                                          afterBlock(other[0..vec-1])
+        //   loadBlock: load <vec x T>, extract, select per elem, br afterBlock
+        //   afterBlock(phis): continue
+
+        // Prepare the per-element `other` values (false-path scalars).
+        SmallVector<Value> otherVals;
+        for (unsigned j = 0; j < vec; ++j) {
+          otherVals.push_back(!otherElems.empty() ? otherElems[vecStart + j]
+                                                  : b.undef(valueElemTy));
+        }
+
+        // Split: currentBlock → afterBlock (with vec scalar phi args).
+        Block *currentBlock = rewriter.getInsertionBlock();
+        Block *afterBlock =
+            rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+        for (unsigned j = 0; j < vec; ++j)
+          afterBlock->addArgument(valueElemTy, loc);
+        Block *loadBlock = rewriter.createBlock(afterBlock);
+
+        // currentBlock: branch on group predicate.
+        rewriter.setInsertionPointToEnd(currentBlock);
+        LLVM::CondBrOp::create(rewriter, loc, maskElems[vecStart], loadBlock,
+                               ValueRange{}, afterBlock, ValueRange(otherVals));
+
+        // loadBlock: vector load → extract → per-element select.
+        rewriter.setInsertionPointToStart(loadBlock);
+        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr);
+
+        SmallVector<Value> selectedVals;
+        for (unsigned j = 0; j < vec; ++j) {
+          Value idx = createIndexAttrConstant(
+              rewriter, loc, getTypeConverter()->getIndexType(), j);
+          Value elem = b.extract_element(valueElemTy, loaded, idx);
+          // Per-element select: use loaded value if mask is true,
+          // else use `other`.  For the common case (all masks true),
+          // LLVM will fold these selects away.
+          Value sel = LLVM::SelectOp::create(rewriter, loc, valueElemTy,
+                                             maskElems[vecStart + j], elem,
+                                             otherVals[j]);
+          selectedVals.push_back(sel);
+        }
+        LLVM::BrOp::create(rewriter, loc, ValueRange(selectedVals), afterBlock);
+
+        // afterBlock: collect phi results.
+        rewriter.setInsertionPointToStart(afterBlock);
+        for (unsigned j = 0; j < vec; ++j)
+          loadedVals.push_back(afterBlock->getArgument(j));
       }
     }
 
+    // ---- Pack all scalar values back into the LLVM struct ----
     Type llvmResultTy = getTypeConverter()->convertType(valueTy);
     Value result = packLLElements(loc, getTypeConverter(), loadedVals, rewriter,
                                   llvmResultTy);
@@ -165,23 +455,87 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp> {
 };
 
 // --------------------------------------------------------------------------
-// tt.store → scalar LLVM stores  (IM single-threaded flat memory)
+// tt.store → vectorized LLVM stores  (IM flat memory)
 // --------------------------------------------------------------------------
 
-struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+/// Lower `tt.store` to LLVM vector store operations.
+///
+/// For each group of `vec` contiguous elements assigned to this
+/// bank/thread, we pack the scalars into an LLVM vector via
+/// `llvm.insertelement`, then emit a single `LLVM::StoreOp`.
+///
+/// Mask handling (vec > 1):
+///   A vector store writes ALL elements atomically, so we can only
+///   use it when every element in the group should actually be stored.
+///   We AND all mask bits in the group; if the result is true, we emit
+///   a single vector store.  Otherwise, we fall back to per-element
+///   scalar stores guarded by individual mask checks.
+///
+///   The AND-all check is essentially free for the common case where
+///   all masks are true (every program except the boundary one).
+///   The scalar fallback only activates for the single boundary
+///   program where N falls within the thread's element range.
+///
+/// Unmasked stores (vec=4, i32):
+///
+///   %v = insertelement undef, val[0], 0
+///   %v = insertelement %v,   val[1], 1
+///   %v = insertelement %v,   val[2], 2
+///   %v = insertelement %v,   val[3], 3
+///   store <4 x i32> %v, ptr %p              ; single 128-bit store
+///
+/// Masked stores (vec=4, i32) — AND-predicated vector or scalar fallback:
+///
+///   currentBlock:
+///     %all = and mask[0], mask[1]
+///     %all = and %all, mask[2]
+///     %all = and %all, mask[3]
+///     %v = <pack 4 scalars into vector>
+///     cond_br %all → vecStoreBlock, scalarBlock
+///
+///   vecStoreBlock:
+///     store <4 x i32> %v, ptr %p
+///     br afterBlock
+///
+///   scalarBlock:                            ; per-element guarded stores
+///     cond_br mask[0] → s0, skip0
+///   s0: store i32 val[0], ptr[0]; br skip0
+///   skip0: cond_br mask[1] → s1, skip1
+///   ...
+///     br afterBlock
+///
+///   afterBlock:
+///     ...
+///
+struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
+                             public IMLoadStoreConversionBase {
+  IMStoreOpConversion(LLVMTypeConverter &converter, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        IMLoadStoreConversionBase() {}
 
   LogicalResult
   matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op->getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    // ---- Operands ----
+    Value ptr = op.getPtr();
+    Value mask = op.getMask();
 
     Value llPtr = adaptor.getPtr();
     Value llMask = adaptor.getMask();
     Value llValue = adaptor.getValue();
 
-    unsigned numElems = ttg::getTotalElemsPerThread(op.getPtr().getType());
+    // ---- Types and element count ----
+    Type valueElemTy = typeConverter->convertType(
+        getElementTypeOrSelf(op.getValue().getType()));
+    unsigned numElems = ttg::getTotalElemsPerThread(ptr.getType());
 
+    // ---- Compute vector width from layout ----
+    unsigned vec = getVectorSize(ptr);
+
+    // ---- Unpack operand elements ----
     auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
     auto valueElems = unpackLLElements(loc, llValue, rewriter);
     assert(ptrElems.size() == valueElems.size());
@@ -190,26 +544,95 @@ struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp> {
     if (llMask)
       maskElems = unpackLLElements(loc, llMask, rewriter);
 
-    for (unsigned i = 0; i < numElems; ++i) {
-      if (!op.getMask()) {
-        // Unconditional store.
-        LLVM::StoreOp::create(rewriter, loc, valueElems[i], ptrElems[i]);
-      } else {
-        // Masked store: branch on mask[i].
+    // ---- Emit one (vector) store per group of `vec` elements ----
+    for (unsigned vecStart = 0; vecStart < numElems; vecStart += vec) {
+      Value basePtr = ptrElems[vecStart];
+
+      if (!mask) {
+        // ---- Unconditional vector store ----
+        if (vec > 1) {
+          auto vecTy = cast<VectorType>(LLVM::getVectorType(valueElemTy, vec));
+          Value v = packElementRange(rewriter, getTypeConverter(), loc, vecTy,
+                                     valueElems, vecStart);
+          LLVM::StoreOp::create(rewriter, loc, v, basePtr);
+        } else {
+          LLVM::StoreOp::create(rewriter, loc, valueElems[vecStart], basePtr);
+        }
+
+      } else if (vec == 1) {
+        // ---- Scalar masked store (vec==1) ----
         Block *currentBlock = rewriter.getInsertionBlock();
-        auto ip = rewriter.getInsertionPoint();
-        Block *afterBlock = rewriter.splitBlock(currentBlock, ip);
+        Block *afterBlock =
+            rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
         Block *storeBlock = rewriter.createBlock(afterBlock);
 
         rewriter.setInsertionPointToEnd(currentBlock);
-        LLVM::CondBrOp::create(rewriter, loc, maskElems[i], storeBlock,
+        LLVM::CondBrOp::create(rewriter, loc, maskElems[vecStart], storeBlock,
                                afterBlock);
 
         rewriter.setInsertionPointToStart(storeBlock);
-        LLVM::StoreOp::create(rewriter, loc, valueElems[i], ptrElems[i]);
+        LLVM::StoreOp::create(rewriter, loc, valueElems[vecStart], basePtr);
         LLVM::BrOp::create(rewriter, loc, afterBlock);
 
         rewriter.setInsertionPointToStart(afterBlock);
+
+      } else {
+        // ---- Masked vector store with AND-all predicate (vec>1) ----
+        //
+        // Compute allTrue = AND of all mask elements in the group.
+        // If all true → single vector store (common case).
+        // Else → per-element scalar stores with individual guards.
+
+        // AND all mask elements together.
+        Value allTrue = maskElems[vecStart];
+        for (unsigned j = 1; j < vec; ++j) {
+          allTrue = LLVM::AndOp::create(rewriter, loc, allTrue,
+                                        maskElems[vecStart + j]);
+        }
+
+        // Pack the scalars into a vector for the fast path.
+        auto vecTy = cast<VectorType>(LLVM::getVectorType(valueElemTy, vec));
+        Value vecVal = packElementRange(rewriter, getTypeConverter(), loc,
+                                        vecTy, valueElems, vecStart);
+
+        // Split CFG: currentBlock → afterBlock.
+        Block *currentBlock = rewriter.getInsertionBlock();
+        Block *afterBlock =
+            rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+        Block *scalarBlock = rewriter.createBlock(afterBlock);
+        Block *vecStoreBlock = rewriter.createBlock(scalarBlock);
+
+        // currentBlock: branch on allTrue.
+        rewriter.setInsertionPointToEnd(currentBlock);
+        LLVM::CondBrOp::create(rewriter, loc, allTrue, vecStoreBlock,
+                               scalarBlock);
+
+        // vecStoreBlock: single vector store → afterBlock.
+        rewriter.setInsertionPointToStart(vecStoreBlock);
+        LLVM::StoreOp::create(rewriter, loc, vecVal, basePtr);
+        LLVM::BrOp::create(rewriter, loc, afterBlock);
+
+        // scalarBlock: per-element conditional stores.
+        // Each element gets its own diamond: cond_br → storeJ / skipJ.
+        rewriter.setInsertionPointToStart(scalarBlock);
+        for (unsigned j = 0; j < vec; ++j) {
+          Block *curBlk = rewriter.getInsertionBlock();
+          Block *nextBlk =
+              (j + 1 < vec) ? rewriter.createBlock(afterBlock) : afterBlock;
+          Block *storeJ = rewriter.createBlock(nextBlk);
+
+          rewriter.setInsertionPointToEnd(curBlk);
+          LLVM::CondBrOp::create(rewriter, loc, maskElems[vecStart + j], storeJ,
+                                 nextBlk);
+
+          rewriter.setInsertionPointToStart(storeJ);
+          LLVM::StoreOp::create(rewriter, loc, valueElems[vecStart + j],
+                                ptrElems[vecStart + j]);
+          LLVM::BrOp::create(rewriter, loc, nextBlk);
+
+          rewriter.setInsertionPointToStart(nextBlk);
+        }
+        // After the loop, insertion point is at the start of afterBlock.
       }
     }
 
@@ -291,8 +714,14 @@ struct ConvertTritonIMToLLVM
         return signalPassFailure();
     }
 
-    // ---- Phase 2: lower remaining TritonGPU ops ----
+    // -- AxisInfo analysis (after Phase 1) --
+    // The shared elementwise lowering patterns need AxisInfo.  Our
+    // IM-specific load/store patterns use contigPerThread from the
+    // layout instead, bypassing AxisInfo entirely (see
+    // IMLoadStoreConversionBase::getVectorSize doc).
     ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
+
+    // ---- Phase 2: lower remaining TritonGPU ops ----
 
     RewritePatternSet patterns(context);
     int benefit = triton::patternBenefitPrioritizeOverLLVMConversions;
@@ -325,7 +754,9 @@ struct ConvertTritonIMToLLVM
 
     // IM-specific: lower gpu::ThreadIdOp → __pim_get_bank_id().
     patterns.insert<IMThreadIdOpConversion>(context, PatternBenefit(benefit));
-    // IM-specific: lower tt.load / tt.store → scalar LLVM ops.
+    // IM-specific: lower tt.load / tt.store → vectorized LLVM ops.
+    // Vector width is derived from contigPerThread (layout-based), so
+    // no AxisInfo dependency is needed.
     patterns.add<IMLoadOpConversion>(typeConverter, benefit);
     patterns.add<IMStoreOpConversion>(typeConverter, benefit);
 
