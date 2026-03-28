@@ -99,20 +99,33 @@ Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
 // ---------------------------------------------------------------------------
 
 Value TargetInfo::programId(RewriterBase &rewriter, Location loc,
-                            ModuleOp moduleOp, ProgramIDDim /*axis*/) const {
+                            ModuleOp moduleOp, ProgramIDDim axis) const {
   // On HBM-PIM the "program id" identifies which tile of the input arrays
   // this invocation processes.  The host driver iterates over tiles and
   // sets the id via the IM runtime before each call.
+  // Multi-axis support: X (axis 0), Y (axis 1), Z (axis 2).
+  const char *fnName;
+  switch (axis) {
+  case ProgramIDDim::X:
+    fnName = "__pim_get_program_id";
+    break;
+  case ProgramIDDim::Y:
+    fnName = "__pim_get_program_id_y";
+    break;
+  case ProgramIDDim::Z:
+    fnName = "__pim_get_program_id_z";
+    break;
+  }
+
   auto *ctx = rewriter.getContext();
   Type i32 = IntegerType::get(ctx, 32);
 
-  auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_get_program_id");
+  auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(fnName);
   if (!funcOp) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(moduleOp.getBody());
     auto fnType = LLVM::LLVMFunctionType::get(i32, {});
-    funcOp =
-        LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_get_program_id", fnType);
+    funcOp = LLVM::LLVMFuncOp::create(rewriter, loc, fnName, fnType);
   }
 
   return LLVM::CallOp::create(rewriter, loc, funcOp, ValueRange{}).getResult();
