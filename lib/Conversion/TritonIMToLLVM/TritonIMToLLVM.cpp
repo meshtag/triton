@@ -10,38 +10,39 @@
 /// ---------- Vectorization strategy ----------
 ///
 /// Each PIM bank owns `sizePerThread` consecutive elements (set by the
-/// RewriteIMLayout pass).  Because those elements are contiguous in
+/// RewriteIMLayout pass).  When those elements are contiguous in
 /// memory, we can load/store them as a single LLVM vector operation
 /// instead of N scalar operations.
 ///
-/// The vector width is derived from `contigPerThread` — the number of
-/// consecutive elements per thread (bank) as specified by the layout's
-/// LinearEncodingAttr:
+/// Memory contiguity is determined by Triton's AxisInfo dataflow
+/// analysis — the same mechanism used by the NVIDIA and AMD backends.
+/// AxisInfo tracks pointer arithmetic (make_range, splat, addptr)
+/// and computes per-dimension contiguity, divisibility, and constancy.
+/// The vector width formula is:
 ///
-///     vec = min(128 / pointeeBitWidth, contigPerThread)
+///     contiguity = axisInfoAnalysis.getContiguity(ptr)
+///     vec = min(128 / pointeeBitWidth, contiguity)
 ///
-/// NOTE: We intentionally bypass Triton's AxisInfo dataflow analysis
-/// (used by NVIDIA/AMD backends) because the `unrealized_conversion_cast`
-/// ops inserted during Phase-1 function-signature lowering break the
-/// AxisInfo divisibility chain, yielding contiguity=1.  Using
-/// contigPerThread directly is safe because the IM layout guarantees
-/// that each thread's elements are contiguous in memory.
-///
-/// For a typical AXPY kernel with i32 and sizePerThread=4:
-///
-///     vec = min(128/32, 4) = min(4, 4) = 4
+/// For a simple AXPY kernel (`ptr = base + pid*BLOCK + arange(0,BLOCK)`)
+/// AxisInfo computes contiguity = sizePerThread, yielding full
+/// vectorization.  For indirect patterns like `A + offs * K + k`,
+/// AxisInfo correctly reports contiguity = 1, preventing incorrect
+/// vector loads.
 ///
 /// Mask handling:
+///   vec is further clamped by the mask's alignment (the number of
+///   consecutive mask elements that share the same truth value):
+///
+///       vec = min(vec, maskAlignment)
+///
 ///   - Loads: branch on mask[vecStart] (group predicate), then
 ///     per-element `llvm.select` to handle partial masks at the
-///     boundary.  The group predicate is safe because the IM offset
-///     pattern (offs < N) produces a monotonically non-increasing mask
-///     within each thread's elements.
+///     boundary.
 ///   - Stores: AND all mask bits in the group.  If all-true, emit a
 ///     single vector store.  Otherwise, fall back to per-element
 ///     scalar stores with individual mask checks.
 ///
-/// When vec==1 (e.g. non-contiguous layout or sub-byte elements),
+/// When vec==1 (e.g. non-contiguous access or sub-byte elements),
 /// this gracefully degrades to scalar behavior.
 
 #include "TargetInfo.h"
@@ -158,47 +159,44 @@ struct IMThreadIdOpConversion : public RewritePattern {
 /// active or all are inactive, so we can use a single predicate bit
 /// for the whole vector load/store.
 struct IMLoadStoreConversionBase {
-  explicit IMLoadStoreConversionBase() {}
+  explicit IMLoadStoreConversionBase(ModuleAxisInfoAnalysis &axisAnalysisPass)
+      : axisAnalysisPass(axisAnalysisPass) {}
+
+  /// Return the number of contiguous elements accessed per thread
+  /// along the fastest-varying dimension, as determined by AxisInfo
+  /// dataflow analysis on the pointer operand.
+  unsigned getContiguity(Value ptr) const {
+    return axisAnalysisPass.getContiguity(ptr);
+  }
 
   /// Compute the vector width for a pointer-typed tensor operand.
   ///
-  /// We derive vec from the layout's `contigPerThread` (the number of
-  /// register-level consecutive elements per thread), capped at 128
-  /// bits.  This is more reliable than using ModuleAxisInfoAnalysis
-  /// because the IM backend's Phase-1 function-signature lowering
-  /// introduces `unrealized_conversion_cast` ops that break the
-  /// AxisInfo divisibility chain — resulting in contiguity=1 even
-  /// when the layout guarantees contiguity=4.
+  /// vec = min(128 / pointeeBitWidth, contiguity)
   ///
-  /// Using contigPerThread directly is safe because:
-  ///   (a) RewriteIMLayout already set sizePerThread so that each
-  ///       bank's elements are consecutive in memory;
-  ///   (b) the pointer pattern (splat + addptr with make_range)
-  ///       guarantees that ptrElems[0..vec-1] point to consecutive
-  ///       addresses.
-  ///
-  /// Formula:  vec = min(128 / pointeeBitWidth, contigPerThread)
-  ///
-  /// For i32 with sizePerThread=4:  vec = min(128/32, 4) = 4
-  /// For i16 with sizePerThread=8:  vec = min(128/16, 8) = 8
-  /// For f32 with sizePerThread=2:  vec = min(128/32, 2) = 2
-  static unsigned getVectorSize(Value ptr) {
+  /// AxisInfo tracks pointer arithmetic (make_range, splat, addptr,
+  /// muli, etc.) and correctly reports contiguity=1 for non-contiguous
+  /// patterns like `A + offs * K + k`.
+  unsigned getVectorSize(Value ptr) const {
     auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
     if (!tensorTy)
       return 1;
-
-    unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+    auto contiguity = getContiguity(ptr);
+    auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     if (pointeeBitWidth == 0)
       return 1;
-
-    // Get contigPerThread from the layout's LinearEncoding.
-    auto linAttr = ttg::toLinearEncoding(tensorTy);
-    auto order = linAttr.getOrder();
-    auto cpt = linAttr.getContigPerThread();
-    unsigned contigPerThread = cpt[order[0]];
-
-    return std::min<unsigned>(128 / pointeeBitWidth, contigPerThread);
+    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   }
+
+  /// Return the mask alignment — the number of consecutive mask
+  /// elements guaranteed to share the same truth value.  Used to
+  /// clamp vec so that vector loads/stores don't straddle mask
+  /// boundaries.
+  unsigned getMaskAlignment(Value mask) const {
+    return axisAnalysisPass.getMaskAlignment(mask);
+  }
+
+protected:
+  ModuleAxisInfoAnalysis &axisAnalysisPass;
 
   /// Build a zero-valued LLVM vector constant.  Used as the `other`
   /// (false-value) default when no explicit `other` operand is given
@@ -245,27 +243,17 @@ struct IMLoadStoreConversionBase {
 /// bank/thread, we emit a single `LLVM::LoadOp` of type `<vec x elemTy>`.
 /// Individual scalar values are then extracted via `llvm.extractelement`.
 ///
-/// Vector width is derived from `contigPerThread` (see
-/// `IMLoadStoreConversionBase::getVectorSize`), NOT from AxisInfo.
-/// This bypasses the broken AxisInfo divisibility chain that results
-/// from `unrealized_conversion_cast` ops introduced during Phase-1
-/// function-signature lowering.
+/// Vector width is derived from AxisInfo dataflow analysis on the
+/// pointer operand (see `IMLoadStoreConversionBase::getVectorSize`).
+/// When a mask is present, vec is further clamped to `getMaskAlignment`
+/// so that within each vector group, all mask bits are uniform.
 ///
 /// Mask handling:
-///   Unlike NVIDIA/AMD (which reduce vec to maskAlignment), we keep
-///   vec = contigPerThread and handle partial masks with per-element
-///   `llvm.select` after the vector load.  This enables vectorization
-///   even for masked loads at the cost of a few extra select ops.
-///
 ///   The group predicate is `mask[vecStart]` — the first element of
-///   the vec-group.  This is safe because in the IM offset pattern
-///   (`offs = pid*BLOCK + bank*spt + [0..spt-1]`), the mask
-///   (`offs < N`) is monotonically non-increasing within a thread's
-///   elements: once an element is out-of-bounds, all subsequent
-///   elements are too.  Therefore mask[vecStart]=false implies
-///   mask[vecStart+j]=false for all j in [1, vec).
-///
-/// Unmasked loads (vec=4, i32):
+///   the vec-group.  After mask-alignment clamping, all elements in
+///   the group share the same mask value, so a single branch suffices.
+///   Per-element `llvm.select` after the load handles edge cases.
+////// Unmasked loads (vec=4, i32):
 ///
 ///   %vec = load <4 x i32>, ptr %p       ; single 128-bit load
 ///   %e0 = extractelement %vec, 0
@@ -296,9 +284,11 @@ struct IMLoadStoreConversionBase {
 ///
 struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                             public IMLoadStoreConversionBase {
-  IMLoadOpConversion(LLVMTypeConverter &converter, PatternBenefit benefit)
+  IMLoadOpConversion(LLVMTypeConverter &converter,
+                     ModuleAxisInfoAnalysis &axisAnalysisPass,
+                     PatternBenefit benefit)
       : ConvertOpToLLVMPattern(converter, benefit),
-        IMLoadStoreConversionBase() {}
+        IMLoadStoreConversionBase(axisAnalysisPass) {}
 
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
@@ -320,9 +310,10 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
     unsigned numElems = ttg::getTotalElemsPerThread(ptr.getType());
 
-    // ---- Compute vector width from layout ----
-    // See IMLoadStoreConversionBase::getVectorSize doc.
+    // ---- Compute vector width from AxisInfo ----
     unsigned vec = getVectorSize(ptr);
+    if (llMask)
+      vec = std::min<unsigned>(vec, getMaskAlignment(mask));
 
     // ---- Unpack operand elements ----
     auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
@@ -464,6 +455,10 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 /// bank/thread, we pack the scalars into an LLVM vector via
 /// `llvm.insertelement`, then emit a single `LLVM::StoreOp`.
 ///
+/// Vector width is derived from AxisInfo dataflow analysis on the
+/// pointer operand (see `IMLoadStoreConversionBase::getVectorSize`).
+/// When a mask is present, vec is further clamped to `getMaskAlignment`.
+///
 /// Mask handling (vec > 1):
 ///   A vector store writes ALL elements atomically, so we can only
 ///   use it when every element in the group should actually be stored.
@@ -509,9 +504,11 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 ///
 struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
                              public IMLoadStoreConversionBase {
-  IMStoreOpConversion(LLVMTypeConverter &converter, PatternBenefit benefit)
+  IMStoreOpConversion(LLVMTypeConverter &converter,
+                      ModuleAxisInfoAnalysis &axisAnalysisPass,
+                      PatternBenefit benefit)
       : ConvertOpToLLVMPattern(converter, benefit),
-        IMLoadStoreConversionBase() {}
+        IMLoadStoreConversionBase(axisAnalysisPass) {}
 
   LogicalResult
   matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
@@ -532,8 +529,10 @@ struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
         getElementTypeOrSelf(op.getValue().getType()));
     unsigned numElems = ttg::getTotalElemsPerThread(ptr.getType());
 
-    // ---- Compute vector width from layout ----
+    // ---- Compute vector width from AxisInfo ----
     unsigned vec = getVectorSize(ptr);
+    if (llMask)
+      vec = std::min<unsigned>(vec, getMaskAlignment(mask));
 
     // ---- Unpack operand elements ----
     auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
@@ -715,10 +714,10 @@ struct ConvertTritonIMToLLVM
     }
 
     // -- AxisInfo analysis (after Phase 1) --
-    // The shared elementwise lowering patterns need AxisInfo.  Our
-    // IM-specific load/store patterns use contigPerThread from the
-    // layout instead, bypassing AxisInfo entirely (see
-    // IMLoadStoreConversionBase::getVectorSize doc).
+    // AxisInfo tracks pointer arithmetic (make_range, splat, addptr)
+    // to compute per-dimension contiguity, divisibility, and constancy.
+    // Used by both the shared elementwise patterns and our IM-specific
+    // load/store patterns to determine safe vectorization widths.
     ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
 
     // ---- Phase 2: lower remaining TritonGPU ops ----
@@ -755,10 +754,10 @@ struct ConvertTritonIMToLLVM
     // IM-specific: lower gpu::ThreadIdOp → __pim_get_bank_id().
     patterns.insert<IMThreadIdOpConversion>(context, PatternBenefit(benefit));
     // IM-specific: lower tt.load / tt.store → vectorized LLVM ops.
-    // Vector width is derived from contigPerThread (layout-based), so
-    // no AxisInfo dependency is needed.
-    patterns.add<IMLoadOpConversion>(typeConverter, benefit);
-    patterns.add<IMStoreOpConversion>(typeConverter, benefit);
+    // Vector width is derived from AxisInfo dataflow analysis on the
+    // pointer operand, matching the NVIDIA/AMD backends.
+    patterns.add<IMLoadOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+    patterns.add<IMStoreOpConversion>(typeConverter, axisInfoAnalysis, benefit);
 
     // Standard MLIR conversion patterns (arith, math, cf, ub).
     mlir::arith::populateCeilFloorDivExpandOpsPatterns(patterns);
