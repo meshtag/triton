@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <numeric>
 
+#include "llvm/ADT/bit.h"
+
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
@@ -13,27 +15,90 @@
 using namespace mlir;
 using namespace mlir::triton::gpu;
 
+namespace {
+
+/// Compute an IM-optimal BlockedEncodingAttr: each thread (PIM bank)
+/// owns a consecutive chunk of the tensor along every dimension. Same
+/// formula as `RewriteIMLayout::buildIMEncoding`. Producing this
+/// encoding directly at convert-triton-to-tritongpu time avoids the
+/// downstream cross-lane convert_layout that the default
+/// `sizePerThread = 1` encoding induces.
+static triton::gpu::BlockedEncodingAttr
+getIMBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                     int numWarps, int threadsPerWarp, int numCTAs) {
+  int rank = shape.size();
+  // GPU-default order = reverse(arange(rank)).
+  llvm::SmallVector<unsigned> order(rank);
+  std::iota(order.begin(), order.end(), 0);
+  std::reverse(order.begin(), order.end());
+
+  // Total threads per dim: distribute `threadsPerWarp` across dims by
+  // putting all of it on the contiguous (innermost-by-order) axis,
+  // matching what the default encoding does. `warpsPerCTA` similarly
+  // collapses onto the innermost axis. In TritonGPU's `order`
+  // convention, `order[0]` is the most-changing (innermost) axis and
+  // `order[rank-1]` is the least-changing (outermost) — the opposite
+  // of the natural reading.
+  llvm::SmallVector<unsigned> tpw(rank, 1);
+  llvm::SmallVector<unsigned> wpc(rank, 1);
+  unsigned innermost = order.front();
+  tpw[innermost] = (unsigned)threadsPerWarp;
+  wpc[innermost] = (unsigned)numWarps;
+
+  // Per-axis sizePerThread = shape / (tpw * wpc), clamped >= 1, floored
+  // to power of 2.
+  llvm::SmallVector<unsigned> spt(rank);
+  for (int d = 0; d < rank; ++d) {
+    unsigned total = tpw[d] * wpc[d];
+    unsigned v = total ? (unsigned)(shape[d]) / total : (unsigned)shape[d];
+    if (v == 0)
+      v = 1;
+    spt[d] = llvm::bit_floor(v);
+    if (spt[d] == 0)
+      spt[d] = 1;
+  }
+
+  return triton::gpu::BlockedEncodingAttr::get(
+      context, shape, spt, order, numWarps, threadsPerWarp, numCTAs);
+}
+
+static bool targetIsIM(llvm::StringRef target) {
+  return target.starts_with("im:");
+}
+
+} // anonymous namespace
+
 //
 // TypeConverter
 //
 TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
                                                int numWarps, int threadsPerWarp,
                                                int numCTAs,
-                                               bool enableSourceRemat)
+                                               bool enableSourceRemat,
+                                               llvm::StringRef target)
     : context(context), numWarps(numWarps), threadsPerWarp(threadsPerWarp),
-      numCTAs(numCTAs) {
+      numCTAs(numCTAs), target(target.str()) {
   addConversion([](Type type) { return type; });
 
-  // Add encoding for tensor
-  addConversion([this](RankedTensorType tensorType) -> RankedTensorType {
-    // types with encoding are already in the right format
-    // TODO: check for layout encodings more specifically
+  // Add encoding for tensor.
+  // For IM targets, use the IM-optimal layout directly (sizePerThread =
+  // shape / (threadsPerWarp × warpsPerCTA)) so that downstream
+  // convert_layout ops produced by `rewrite-im-layout` are no-ops and
+  // get folded by `tritongpu-remove-layout-conversions`. This is what
+  // unblocks tile shapes like 32×64 on the IM target.
+  bool isIM = targetIsIM(this->target);
+  addConversion([this, isIM](RankedTensorType tensorType) -> RankedTensorType {
     if (tensorType.getEncoding())
       return tensorType;
     ArrayRef<int64_t> shape = tensorType.getShape();
-    triton::gpu::BlockedEncodingAttr encoding =
-        getDefaultBlockedEncoding(this->context, shape, this->numWarps,
-                                  this->threadsPerWarp, this->numCTAs);
+    triton::gpu::BlockedEncodingAttr encoding;
+    if (isIM) {
+      encoding = getIMBlockedEncoding(this->context, shape, this->numWarps,
+                                      this->threadsPerWarp, this->numCTAs);
+    } else {
+      encoding = getDefaultBlockedEncoding(this->context, shape, this->numWarps,
+                                           this->threadsPerWarp, this->numCTAs);
+    }
     return tensorType.cloneWithEncoding(encoding);
   });
 

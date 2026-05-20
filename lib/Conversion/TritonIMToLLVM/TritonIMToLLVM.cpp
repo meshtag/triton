@@ -61,6 +61,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -122,6 +123,29 @@ struct IMThreadIdOpConversion : public RewritePattern {
     Value bankIdx = arith::IndexCastOp::create(
         rewriter, loc, rewriter.getIndexType(), callOp.getResult());
     rewriter.replaceOp(op, bankIdx);
+    return success();
+  }
+};
+
+// --------------------------------------------------------------------------
+// ttg.barrier → erase (no shared memory on IM)
+// --------------------------------------------------------------------------
+
+/// IM has no shared memory and num_warps == 1, so cross-warp
+/// synchronization is meaningless. The membar pass still inserts
+/// `ttg.barrier` ops at convert_layout boundaries (it does so as a
+/// side effect that also updates allocation.offset attrs that
+/// downstream patterns require), but those barriers must be erased
+/// before final lowering. This pattern erases them.
+struct IMBarrierOpErase
+    : public ConvertOpToLLVMPattern<triton::gpu::BarrierOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::BarrierOp op,
+                  typename triton::gpu::BarrierOp::Adaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -690,9 +714,22 @@ struct ConvertTritonIMToLLVM
 
     triton::im::TargetInfo targetInfo(numBanks);
 
-    // -- Allocation & membar (kept for compatibility with shared patterns,
-    //    but no shared memory is actually used on IM targets) --
+    // -- Allocation: analyze shared-memory needs (which IM has none of,
+    //    but TritonGPU's shared lowering patterns invoke
+    //    `getSharedMemoryBase` for any convert_layout that crosses
+    //    warps — the cross-warp path materializes via shared memory,
+    //    and the lowering reads `allocation.offset` attrs from the
+    //    op). `attachAllocationSizeAndOffsetAttr` walks the module
+    //    and sets those attrs from the allocation analysis; without
+    //    it, lowering trips an assertion when emitting wider tile
+    //    shapes (e.g. BLOCK_M=32, sizePerThread=[32,2]).
+    //
+    //    Membar pass also runs because it inserts ttg.barrier ops
+    //    around shared-memory-reading layout conversions. IM has no
+    //    real shared memory so those barriers are no-ops — they're
+    //    erased by IMBarrierOpErase below. --
     ModuleAllocation allocation(mod);
+    triton::gpu::attachAllocationSizeAndOffsetAttr(mod, allocation);
     ModuleMembarAnalysis membarPass(&allocation);
     membarPass.run();
 
@@ -758,6 +795,11 @@ struct ConvertTritonIMToLLVM
     // pointer operand, matching the NVIDIA/AMD backends.
     patterns.add<IMLoadOpConversion>(typeConverter, axisInfoAnalysis, benefit);
     patterns.add<IMStoreOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+    // IM-specific: erase ttg.barrier (IM has no shared memory and
+    // num_warps == 1, so cross-warp barriers are no-ops). Higher
+    // priority than the shared-pattern BarrierOpConversion (which
+    // would lower to gpu.barrier).
+    patterns.add<IMBarrierOpErase>(typeConverter, PatternBenefit(benefit + 1));
 
     // Standard MLIR conversion patterns (arith, math, cf, ub).
     mlir::arith::populateCeilFloorDivExpandOpsPatterns(patterns);

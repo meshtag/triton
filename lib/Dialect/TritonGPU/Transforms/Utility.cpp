@@ -594,6 +594,16 @@ bool isExpensiveLoadOrStore(Operation *op) {
   // we can presume a high hit-rate that makes it cheap to load
   auto ptrType = cast<RankedTensorType>(op->getOperand(0).getType());
   auto mod = op->getParentOfType<ModuleOp>();
+  // IM target: PIM has no shared memory and shuffles reduce to identity,
+  // so cross-lane convert_layout cannot be lowered. Treat all loads/stores
+  // as cheap to rematerialise so RemoveLayoutConversions propagates the
+  // consumer's slice encoding back to the load and the convert is elided.
+  // Without this, BLOCK_M ≥ threadsPerWarp matmul tiles (numElements ≥
+  // numWarps × threadsPerWarp) trip the "expensive" path and leave a
+  // cross-lane convert that ConvertTritonIMToLLVM crashes on.
+  if (auto target = mod->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName))
+    if (target.getValue().starts_with("im:"))
+      return false;
   int numWarps = triton::gpu::lookupNumWarps(op);
   int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
   if (ptrType.getNumElements() < numWarps * threadsPerWarp)

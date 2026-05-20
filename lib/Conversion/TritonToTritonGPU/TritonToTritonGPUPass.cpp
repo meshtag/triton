@@ -795,9 +795,13 @@ public:
 
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
-    // type converter
+    // type converter — pass the target string so the IM-target path
+    // can produce IM-optimal blocked encodings directly (avoids the
+    // cross-lane convert_layout that the default sizePerThread=1
+    // encoding induces and that fails to lower for wider IM tiles).
+    llvm::StringRef targetStr = this->target.getValue();
     TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,
-                                         numCTAs, enableSourceRemat);
+                                         numCTAs, enableSourceRemat, targetStr);
     TritonGPUConversionTarget target(*context, typeConverter);
     // rewrite patterns
     RewritePatternSet patterns(context);

@@ -1033,8 +1033,22 @@ int64_t getConvertCost(Value convertSrc) {
 /// Determine whether rematerializing \p slice is beneficial given that it will
 /// eliminate \p convertOp and require creating new convert ops with cost \p
 /// newCvtCost.
+///
+/// IM target carve-out: PIM hardware has no shared memory and shuffles
+/// reduce to identity (single lane per warp), so cross-lane convert_layout
+/// ops cannot be lowered. The standard cost model trades convert vs.
+/// rematerialisation by SM-cycle estimate, which can decline remat for
+/// wider tiles (e.g. matmul BLOCK_M=32) and leave a cross-lane convert
+/// that ConvertTritonIMToLLVM then crashes on. For the IM target we must
+/// always rematerialise — correctness over cost.
 bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
                        int64_t newCvtCost) {
+  if (auto module = convertOp->getParentOfType<ModuleOp>()) {
+    if (auto target = module->getAttrOfType<StringAttr>(AttrTargetName)) {
+      if (target.getValue().starts_with("im:"))
+        return true;
+    }
+  }
   // Identify all operations in the slice
   SetVector<Operation *> sliceOps;
   for (Value v : slice) {
