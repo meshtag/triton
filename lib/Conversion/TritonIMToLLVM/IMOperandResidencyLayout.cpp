@@ -38,6 +38,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include <cstdlib>
+#include <string>
 
 // -----------------------------------------------------------------------
 // TableGen pass base class
@@ -152,6 +154,37 @@ struct IMOperandResidencyLayoutPass
     ModuleOp mod = getOperation();
     OpBuilder b(mod.getContext());
 
+    // Compiler-side ablation levers (docs/ablation-levers-plan.md).
+    // IM_LAYOUT_ABLATE is a comma/space list of lever names to DISABLE; a
+    // disabled lever makes the pass emit the naive (no-reuse) layout for that
+    // axis. Read here, inside the compiler pass, so ablation is a compiler-side
+    // control rather than a simulator knob. NOTE: Triton caches compiled
+    // kernels and does not key on env read inside a pass, so the ablation
+    // runner must use a fresh TRITON_CACHE_DIR per level.
+    const char *ablateEnv = std::getenv("IM_LAYOUT_ABLATE");
+    std::string ablate = ablateEnv ? ablateEnv : "";
+    auto disabled = [&](const char *lever) -> bool {
+      if (ablate.empty())
+        return false;
+      std::string needle(lever);
+      size_t pos = 0;
+      while ((pos = ablate.find(needle, pos)) != std::string::npos) {
+        bool lb = (pos == 0) || ablate[pos - 1] == ',' || ablate[pos - 1] == ' ';
+        size_t end = pos + needle.size();
+        bool rb = (end == ablate.size()) || ablate[end] == ',' ||
+                  ablate[end] == ' ';
+        if (lb && rb)
+          return true;
+        pos = end;
+      }
+      return false;
+    };
+    const bool dReductionCol = disabled("reduction-col");
+    const bool dBankSpread = disabled("bank-spread");
+    const bool dOperandScope = disabled("operand-scope");
+    const bool dBroadcast = disabled("broadcast");
+    const bool dAccResident = disabled("acc-resident");
+
     // Pass A — reduction-loop detection.  A reduction loop is an scf.for that
     // carries iter_args (the accumulator).  Record the count and which
     // functions contain one.
@@ -206,17 +239,26 @@ struct IMOperandResidencyLayoutPass
       bool funcReduction =
           fn && funcsWithReduction.contains(fn.getOperation());
 
+      // A scalar load splatted across the lanes is a bank-broadcast: the value
+      // is identical across all banks for a given access, exactly what per-BG
+      // replication models — independent of pid/reduction dependence. Covers
+      // matvec x (pid-invariant) and matmul row-tiled A (pid-dependent). The
+      // `broadcast` lever (when disabled) downgrades it to its plain class.
       StringRef cls;
-      if (!funcReduction)
+      if (scalarSplat && !dBroadcast)
+        cls = "BroadcastReplicate";
+      else if (!funcReduction)
         cls = "StreamedElementwise";
       else if (ivDep && pidMask != 0)
         cls = "ReductionStridedMatrix";
-      else if (ivDep && pidMask == 0)
+      else if (ivDep && pidMask == 0 && !dBroadcast)
         cls = "BroadcastReplicate";
       else if (!ivDep && pidMask != 0)
         cls = "ParallelSpread";
       else
         cls = "StreamedElementwise";
+
+      const bool isStore = isa<triton::StoreOp>(op);
 
       SmallVector<NamedAttribute> fields;
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
@@ -226,19 +268,33 @@ struct IMOperandResidencyLayoutPass
           b.getNamedAttr("axis_deps", b.getI64IntegerAttr((int64_t)pidMask)));
       if (ivDep)
         fields.push_back(b.getNamedAttr("reduction_dep", b.getUnitAttr()));
-      if (cls == "ReductionStridedMatrix")
+      // Lever: reduction-col — place the contraction axis on the column-low bits.
+      if (cls == "ReductionStridedMatrix" && !dReductionCol)
         fields.push_back(
             b.getNamedAttr("reduction_to_column", b.getUnitAttr()));
-      // Invariant in the output-tile (pid) axis => stationary / bank-resident.
-      if (pidMask == 0 && funcReduction)
+      // Lever: operand-scope — the pid axes the operand is INVARIANT in (the
+      // complement of axis_deps over x/y/z). This migrates MemTracePass's
+      // __pim_load_persistent{,_yz,_xz,_xy} scope decision into the layout pass;
+      // the simulator dedups at this scope. 0 when the lever is disabled.
+      int64_t scope = dOperandScope ? 0 : (int64_t)((~pidMask) & 0x7u);
+      fields.push_back(b.getNamedAttr("residency_scope",
+                                      b.getI64IntegerAttr(scope)));
+      if (pidMask == 0 && funcReduction && !dOperandScope)
         fields.push_back(b.getNamedAttr("resident", b.getUnitAttr()));
+      // Lever: broadcast — per-BG replication of a bank-broadcast operand.
       if (cls == "BroadcastReplicate") {
         fields.push_back(
             b.getNamedAttr("replicate_mode", b.getStringAttr("per_bg")));
         if (scalarSplat)
           fields.push_back(b.getNamedAttr("scalar_splat", b.getUnitAttr()));
       }
-      if (isTensorPtr) {
+      // Lever: acc-resident — keep the accumulated output psum in the PE across
+      // the reduction (the output store of a reduction kernel).
+      if (isStore && funcReduction && cls == "ParallelSpread" && !dAccResident)
+        fields.push_back(
+            b.getNamedAttr("accumulator_resident", b.getUnitAttr()));
+      // Lever: bank-spread — spread the parallel output dim across the banks.
+      if (isTensorPtr && !dBankSpread) {
         int64_t spreadAxis[] = {0};
         fields.push_back(b.getNamedAttr("bank_spread_axes",
                                         b.getDenseI64ArrayAttr(spreadAxis)));
