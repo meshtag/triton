@@ -140,6 +140,8 @@ void init_triton_passes_convert(py::module &&m) {
                      triton::im::createConvertTritonIMToLLVMPass);
   ADD_PASS_WRAPPER_0("add_rewrite_im_layout",
                      triton::im::createRewriteIMLayoutPass);
+  ADD_PASS_WRAPPER_0("add_im_operand_residency_layout",
+                     triton::im::createIMOperandResidencyLayoutPass);
 }
 
 void init_triton_passes_llvmir(py::module &&m) {

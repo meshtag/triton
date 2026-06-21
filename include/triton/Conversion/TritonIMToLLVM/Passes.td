@@ -56,4 +56,28 @@ def RewriteIMLayout : Pass<"rewrite-im-layout", "mlir::ModuleOp"> {
                            "mlir::triton::gpu::TritonGPUDialect"];
 }
 
+// Operand-residency layout pass: the explicit, compiler-side analog of
+// OptiPIM's DataLayout/DetailLayout MILP (heuristic, not a solver).  Decides a
+// per-operand physical layout + residency so that operand reuse is a property
+// of the chosen layout (operand laid out resident / replicated across the
+// spatial banks; reduction axis on the column-low bits) rather than something
+// recovered post-hoc by trace dedup.  Run over fused regions it can co-optimize
+// layout across operators — a capability per-operator MILP compilers lack.
+// See docs/reuse-as-layout-plan.md.
+def IMOperandResidencyLayout
+    : Pass<"im-operand-residency-layout", "mlir::ModuleOp"> {
+  let summary = "Assign per-operand physical layout/residency for PIM reuse";
+  let description = [{
+    Classifies each tensor operand's reuse axes and assigns a physical layout
+    (bank/bankgroup placement, reduction-axis column locality, residency,
+    per-BG replication for broadcasts) that realizes operand reuse in the
+    layout itself.  This is the explicit alternative to recovering reuse via
+    trace dedup, making the per-operator cost comparison fair by construction
+    and enabling cross-operator layout co-optimization over fused regions.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

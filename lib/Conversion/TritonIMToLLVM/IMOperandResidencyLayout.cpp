@@ -1,0 +1,276 @@
+/// IMOperandResidencyLayout.cpp — Decide per-operand physical layout / residency
+/// for In-Memory (PIM) targets.  This is the explicit, compiler-side analog of
+/// OptiPIM's DataLayout / DetailLayout MILP — heuristic rather than a solver
+/// (see docs/reuse-as-layout-plan.md).
+///
+/// The goal is to make operand reuse a property of the *chosen layout* (operand
+/// laid out resident / replicated across the spatial banks, reduction axis on
+/// the column-low bits) rather than something recovered post-hoc by trace
+/// dedup.  That makes the per-operator comparison against OptiPIM fair by
+/// construction, and — run over fused regions — lets the same decision
+/// co-optimize layout across operators, which a per-operator MILP cannot.
+///
+/// Phase 1 (classification): for each tensor-of-pointer load/store AND each
+/// scalar load that feeds a broadcast (the matvec `x[k]` operand), classify the
+/// operand's reuse axes and stamp an `im.residency` dictionary attribute that a
+/// later runtime increment will honor.  Classification is purely an IR analysis;
+/// it changes NO simulated behaviour until a consumer reads the attrs.
+///
+///   reuse_class is decided from two reachability facts about the address:
+///     pidMask  — does the address depend on tt.get_program_id (output tile)?
+///     ivDep    — does the address depend on the reduction loop induction var?
+///   In a function containing a reduction (accumulator-carrying scf.for):
+///     ivDep & pid   -> ReductionStridedMatrix  (reduction axis -> columns)
+///     ivDep & !pid  -> BroadcastReplicate      (invariant in output tile)
+///     !ivDep & pid  -> ParallelSpread          (output, spread over banks)
+///     otherwise     -> StreamedElementwise
+///   With no reduction loop (pure elementwise, e.g. axpy) every op is
+///   StreamedElementwise.
+
+#include "triton/Conversion/TritonIMToLLVM/Passes.h"
+
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+
+// -----------------------------------------------------------------------
+// TableGen pass base class
+// -----------------------------------------------------------------------
+namespace mlir {
+namespace triton {
+namespace im {
+#define GEN_PASS_DEF_IMOPERANDRESIDENCYLAYOUT
+#include "triton/Conversion/TritonIMToLLVM/Passes.h.inc"
+} // namespace im
+} // namespace triton
+} // namespace mlir
+
+using namespace mlir;
+
+namespace {
+
+namespace ttg = mlir::triton::gpu;
+
+// Backward def-chain reachability: bitmask over program-id axes the address
+// depends on (bit a set => address derives from tt.get_program_id with axis a).
+static unsigned reachesProgramId(Value v, llvm::DenseSet<Value> &visited) {
+  if (!v || !visited.insert(v).second)
+    return 0;
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return 0; // block argument (func arg, loop IV, iter arg) — not a pid source
+  if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
+    return 1u << pid.getAxisAsInt();
+  unsigned mask = 0;
+  for (Value operand : def->getOperands())
+    mask |= reachesProgramId(operand, visited);
+  return mask;
+}
+
+// Backward def-chain reachability: does the address derive from `target`
+// (used with a reduction loop's induction variable)?
+static bool reachesValue(Value v, Value target, llvm::DenseSet<Value> &visited) {
+  if (!v)
+    return false;
+  if (v == target)
+    return true;
+  if (!visited.insert(v).second)
+    return false;
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  for (Value operand : def->getOperands())
+    if (reachesValue(operand, target, visited))
+      return true;
+  return false;
+}
+
+// Follow the addptr/splat/broadcast chain of an address back to the kernel
+// !tt.ptr argument it bottoms out at; return its func-argument index, or -1.
+// This is the join key the runtime emitter maps to a registered tensor id.
+static int64_t resolveOperandArg(Value ptr) {
+  Value cur = ptr;
+  llvm::DenseSet<Value> guard;
+  while (cur && guard.insert(cur).second) {
+    if (auto barg = dyn_cast<BlockArgument>(cur)) {
+      Operation *parent = barg.getOwner()->getParentOp();
+      if (isa<triton::FuncOp>(parent))
+        return barg.getArgNumber();
+      return -1; // a loop/region block arg, not a kernel pointer argument
+    }
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      return -1;
+    if (auto addptr = dyn_cast<triton::AddPtrOp>(def)) {
+      cur = addptr.getPtr();
+      continue;
+    }
+    if (auto splat = dyn_cast<triton::SplatOp>(def)) {
+      cur = splat.getSrc();
+      continue;
+    }
+    if (auto bcast = dyn_cast<triton::BroadcastOp>(def)) {
+      cur = bcast.getSrc();
+      continue;
+    }
+    return -1; // unknown producer of a pointer value
+  }
+  return -1;
+}
+
+// Is `op` a scalar tt.load whose (scalar) result feeds a tt.splat?  This is the
+// matvec `x_val = tl.load(x + k)` operand — invisible to the tensor-pointer
+// walk because its pointer is a plain !tt.ptr, not a tensor of pointers.
+static bool isScalarSplatLoad(Operation *op) {
+  auto load = dyn_cast<triton::LoadOp>(op);
+  if (!load)
+    return false;
+  if (isa<RankedTensorType>(load.getType()))
+    return false; // tensor load handled by the tensor-pointer path
+  for (Operation *user : load->getUsers())
+    if (isa<triton::SplatOp>(user))
+      return true;
+  return false;
+}
+
+// -----------------------------------------------------------------------
+// Pass implementation
+// -----------------------------------------------------------------------
+
+struct IMOperandResidencyLayoutPass
+    : public triton::im::impl::IMOperandResidencyLayoutBase<
+          IMOperandResidencyLayoutPass> {
+  using IMOperandResidencyLayoutBase::IMOperandResidencyLayoutBase;
+
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    OpBuilder b(mod.getContext());
+
+    // Pass A — reduction-loop detection.  A reduction loop is an scf.for that
+    // carries iter_args (the accumulator).  Record the count and which
+    // functions contain one.
+    int64_t numReductionLoops = 0;
+    llvm::DenseSet<Operation *> funcsWithReduction;
+    mod.walk([&](scf::ForOp forOp) {
+      if (forOp.getNumRegionIterArgs() > 0) {
+        ++numReductionLoops;
+        if (auto fn = forOp->getParentOfType<triton::FuncOp>())
+          funcsWithReduction.insert(fn.getOperation());
+      }
+    });
+
+    // Pass B — classify each memory-access op and stamp im.residency.
+    int64_t numAnalyzed = 0, numClassified = 0;
+    mod.walk([&](Operation *op) {
+      Value ptr = getMemAccessPtr(op);
+      if (!ptr)
+        return;
+      auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+      bool isTensorPtr =
+          tensorTy && isa<triton::PointerType>(tensorTy.getElementType());
+      bool scalarSplat = !isTensorPtr && isScalarSplatLoad(op);
+      if (!isTensorPtr && !scalarSplat)
+        return;
+      ++numAnalyzed;
+
+      // Innermost enclosing reduction loop (for the induction-var test).
+      scf::ForOp redFor;
+      for (Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
+        if (auto f = dyn_cast<scf::ForOp>(p)) {
+          if (f.getNumRegionIterArgs() > 0) {
+            redFor = f;
+            break;
+          }
+        }
+      }
+
+      unsigned pidMask = 0;
+      {
+        llvm::DenseSet<Value> vis;
+        pidMask = reachesProgramId(ptr, vis);
+      }
+      bool ivDep = false;
+      if (redFor) {
+        llvm::DenseSet<Value> vis;
+        ivDep = reachesValue(ptr, redFor.getInductionVar(), vis);
+      }
+      int64_t operandArg = resolveOperandArg(ptr);
+
+      auto fn = op->getParentOfType<triton::FuncOp>();
+      bool funcReduction =
+          fn && funcsWithReduction.contains(fn.getOperation());
+
+      StringRef cls;
+      if (!funcReduction)
+        cls = "StreamedElementwise";
+      else if (ivDep && pidMask != 0)
+        cls = "ReductionStridedMatrix";
+      else if (ivDep && pidMask == 0)
+        cls = "BroadcastReplicate";
+      else if (!ivDep && pidMask != 0)
+        cls = "ParallelSpread";
+      else
+        cls = "StreamedElementwise";
+
+      SmallVector<NamedAttribute> fields;
+      fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
+      fields.push_back(
+          b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
+      fields.push_back(
+          b.getNamedAttr("axis_deps", b.getI64IntegerAttr((int64_t)pidMask)));
+      if (ivDep)
+        fields.push_back(b.getNamedAttr("reduction_dep", b.getUnitAttr()));
+      if (cls == "ReductionStridedMatrix")
+        fields.push_back(
+            b.getNamedAttr("reduction_to_column", b.getUnitAttr()));
+      // Invariant in the output-tile (pid) axis => stationary / bank-resident.
+      if (pidMask == 0 && funcReduction)
+        fields.push_back(b.getNamedAttr("resident", b.getUnitAttr()));
+      if (cls == "BroadcastReplicate") {
+        fields.push_back(
+            b.getNamedAttr("replicate_mode", b.getStringAttr("per_bg")));
+        if (scalarSplat)
+          fields.push_back(b.getNamedAttr("scalar_splat", b.getUnitAttr()));
+      }
+      if (isTensorPtr) {
+        int64_t spreadAxis[] = {0};
+        fields.push_back(b.getNamedAttr("bank_spread_axes",
+                                        b.getDenseI64ArrayAttr(spreadAxis)));
+      }
+
+      op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
+      ++numClassified;
+    });
+
+    mod->setAttr("im.residency-analyzed-mem-ops",
+                 b.getI64IntegerAttr(numAnalyzed));
+    mod->setAttr("im.residency-classified-mem-ops",
+                 b.getI64IntegerAttr(numClassified));
+    mod->setAttr("im.residency-reduction-loops",
+                 b.getI64IntegerAttr(numReductionLoops));
+  }
+};
+
+} // anonymous namespace
+
+// -----------------------------------------------------------------------
+// Public entry point
+// -----------------------------------------------------------------------
+
+namespace mlir {
+namespace triton {
+namespace im {
+
+std::unique_ptr<OperationPass<ModuleOp>> createIMOperandResidencyLayoutPass() {
+  return std::make_unique<IMOperandResidencyLayoutPass>();
+}
+
+} // namespace im
+} // namespace triton
+} // namespace mlir

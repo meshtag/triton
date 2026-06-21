@@ -18,6 +18,7 @@ namespace im {
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonIMToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createRewriteIMLayoutPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMOperandResidencyLayoutPass();
 
 #define GEN_PASS_REGISTRATION
 #include "triton/Conversion/TritonIMToLLVM/Passes.h.inc"
