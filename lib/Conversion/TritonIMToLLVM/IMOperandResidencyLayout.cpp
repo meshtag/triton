@@ -1,24 +1,25 @@
-/// IMOperandResidencyLayout.cpp — Decide per-operand physical layout / residency
-/// for In-Memory (PIM) targets.  This is the explicit, compiler-side analog of
-/// OptiPIM's DataLayout / DetailLayout MILP — heuristic rather than a solver
-/// (see docs/reuse-as-layout-plan.md).
+/// IMOperandResidencyLayout.cpp. Decide per-operand physical layout and residency
+/// for the in-memory (IM) backend. This is the explicit compiler-side analog of
+/// OptiPIM's DataLayout/DetailLayout MILP, heuristic rather than a solver.
 ///
-/// The goal is to make operand reuse a property of the *chosen layout* (operand
-/// laid out resident / replicated across the spatial banks, reduction axis on
-/// the column-low bits) rather than something recovered post-hoc by trace
-/// dedup.  That makes the per-operator comparison against OptiPIM fair by
-/// construction, and — run over fused regions — lets the same decision
-/// co-optimize layout across operators, which a per-operator MILP cannot.
+/// Target scope: this pass is substrate-agnostic. Its classification is a pure IR
+/// analysis of the kernel's SSA and loop structure with no architecture branch, so
+/// it runs for every IM target, both near-memory PIM (HBM-PIM) and
+/// processing-using-memory PUM (SIMDRAM). Today the stamped attributes are honored
+/// only by the HBM-PIM runtime. The SIMDRAM runtime has no residency-as-layout
+/// consumer, so on SIMDRAM the pass runs but is inert. A PUM backend could consume
+/// the same classification (bank and subarray parallelism and reduction-to-column
+/// are meaningful there too), it just does not yet.
 ///
-/// Phase 1 (classification): for each tensor-of-pointer load/store AND each
+/// Phase 1 (classification): for each tensor-of-pointer load or store, and each
 /// scalar load that feeds a broadcast (the matvec `x[k]` operand), classify the
 /// operand's reuse axes and stamp an `im.residency` dictionary attribute that a
-/// later runtime increment will honor.  Classification is purely an IR analysis;
-/// it changes NO simulated behaviour until a consumer reads the attrs.
+/// later runtime increment will honor. Classification is purely an IR analysis. It
+/// changes NO simulated behaviour until a consumer reads the attrs.
 ///
 ///   reuse_class is decided from two reachability facts about the address:
-///     pidMask  — does the address depend on tt.get_program_id (output tile)?
-///     ivDep    — does the address depend on the reduction loop induction var?
+///     pidMask: does the address depend on tt.get_program_id (output tile)?
+///     ivDep:   does the address depend on the reduction loop induction var?
 ///   In a function containing a reduction (accumulator-carrying scf.for):
 ///     ivDep & pid   -> ReductionStridedMatrix  (reduction axis -> columns)
 ///     ivDep & !pid  -> BroadcastReplicate      (invariant in output tile)
@@ -34,10 +35,8 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallVector.h"
 #include <cstdlib>
 #include <string>
 
@@ -56,9 +55,6 @@ namespace im {
 using namespace mlir;
 
 namespace {
-
-namespace ttg = mlir::triton::gpu;
-
 // Backward def-chain reachability: bitmask over program-id axes the address
 // depends on (bit a set => address derives from tt.get_program_id with axis a).
 static unsigned reachesProgramId(Value v, llvm::DenseSet<Value> &visited) {
@@ -66,7 +62,7 @@ static unsigned reachesProgramId(Value v, llvm::DenseSet<Value> &visited) {
     return 0;
   Operation *def = v.getDefiningOp();
   if (!def)
-    return 0; // block argument (func arg, loop IV, iter arg) — not a pid source
+    return 0; // block argument (func arg, loop IV, iter arg), not a pid source
   if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
     return 1u << pid.getAxisAsInt();
   unsigned mask = 0;
@@ -94,7 +90,7 @@ static bool reachesValue(Value v, Value target, llvm::DenseSet<Value> &visited) 
 }
 
 // Follow the addptr/splat/broadcast chain of an address back to the kernel
-// !tt.ptr argument it bottoms out at; return its func-argument index, or -1.
+// !tt.ptr argument it bottoms out at. Return its func-argument index, or -1.
 // This is the join key the runtime emitter maps to a registered tensor id.
 static int64_t resolveOperandArg(Value ptr) {
   Value cur = ptr;
@@ -127,7 +123,7 @@ static int64_t resolveOperandArg(Value ptr) {
 }
 
 // Is `op` a scalar tt.load whose (scalar) result feeds a tt.splat?  This is the
-// matvec `x_val = tl.load(x + k)` operand — invisible to the tensor-pointer
+// matvec `x_val = tl.load(x + k)` operand, invisible to the tensor-pointer
 // walk because its pointer is a plain !tt.ptr, not a tensor of pointers.
 static bool isScalarSplatLoad(Operation *op) {
   auto load = dyn_cast<triton::LoadOp>(op);
@@ -155,7 +151,7 @@ struct IMOperandResidencyLayoutPass
     OpBuilder b(mod.getContext());
 
     // Compiler-side ablation levers (docs/ablation-levers-plan.md).
-    // IM_LAYOUT_ABLATE is a comma/space list of lever names to DISABLE; a
+    // IM_LAYOUT_ABLATE is a comma/space list of lever names to DISABLE. A
     // disabled lever makes the pass emit the naive (no-reuse) layout for that
     // axis. Read here, inside the compiler pass, so ablation is a compiler-side
     // control rather than a simulator knob. NOTE: Triton caches compiled
@@ -185,7 +181,7 @@ struct IMOperandResidencyLayoutPass
     const bool dBroadcast = disabled("broadcast");
     const bool dAccResident = disabled("acc-resident");
 
-    // Pass A — reduction-loop detection.  A reduction loop is an scf.for that
+    // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
     // carries iter_args (the accumulator).  Record the count and which
     // functions contain one.
     int64_t numReductionLoops = 0;
@@ -198,7 +194,7 @@ struct IMOperandResidencyLayoutPass
       }
     });
 
-    // Pass B — classify each memory-access op and stamp im.residency.
+    // Pass B, classify each memory-access op and stamp im.residency.
     int64_t numAnalyzed = 0, numClassified = 0;
     mod.walk([&](Operation *op) {
       Value ptr = getMemAccessPtr(op);
@@ -241,7 +237,7 @@ struct IMOperandResidencyLayoutPass
 
       // A scalar load splatted across the lanes is a bank-broadcast: the value
       // is identical across all banks for a given access, exactly what per-BG
-      // replication models — independent of pid/reduction dependence. Covers
+      // replication models, independent of pid/reduction dependence. Covers
       // matvec x (pid-invariant) and matmul row-tiled A (pid-dependent). The
       // `broadcast` lever (when disabled) downgrades it to its plain class.
       StringRef cls;
@@ -268,32 +264,32 @@ struct IMOperandResidencyLayoutPass
           b.getNamedAttr("axis_deps", b.getI64IntegerAttr((int64_t)pidMask)));
       if (ivDep)
         fields.push_back(b.getNamedAttr("reduction_dep", b.getUnitAttr()));
-      // Lever: reduction-col — place the contraction axis on the column-low bits.
+      // reduction-col lever. Place the contraction axis on the column-low bits.
       if (cls == "ReductionStridedMatrix" && !dReductionCol)
         fields.push_back(
             b.getNamedAttr("reduction_to_column", b.getUnitAttr()));
-      // Lever: operand-scope — the pid axes the operand is INVARIANT in (the
+      // operand-scope lever. The pid axes the operand is INVARIANT in (the
       // complement of axis_deps over x/y/z). This migrates MemTracePass's
-      // __pim_load_persistent{,_yz,_xz,_xy} scope decision into the layout pass;
-      // the simulator dedups at this scope. 0 when the lever is disabled.
+      // __pim_load_persistent{,_yz,_xz,_xy} scope decision into the layout pass.
+      // The simulator dedups at this scope. 0 when the lever is disabled.
       int64_t scope = dOperandScope ? 0 : (int64_t)((~pidMask) & 0x7u);
       fields.push_back(b.getNamedAttr("residency_scope",
                                       b.getI64IntegerAttr(scope)));
       if (pidMask == 0 && funcReduction && !dOperandScope)
         fields.push_back(b.getNamedAttr("resident", b.getUnitAttr()));
-      // Lever: broadcast — per-BG replication of a bank-broadcast operand.
+      // broadcast lever. Per-BG replication of a bank-broadcast operand.
       if (cls == "BroadcastReplicate") {
         fields.push_back(
             b.getNamedAttr("replicate_mode", b.getStringAttr("per_bg")));
         if (scalarSplat)
           fields.push_back(b.getNamedAttr("scalar_splat", b.getUnitAttr()));
       }
-      // Lever: acc-resident — keep the accumulated output psum in the PE across
+      // acc-resident lever. Keep the accumulated output psum in the PE across
       // the reduction (the output store of a reduction kernel).
       if (isStore && funcReduction && cls == "ParallelSpread" && !dAccResident)
         fields.push_back(
             b.getNamedAttr("accumulator_resident", b.getUnitAttr()));
-      // Lever: bank-spread — spread the parallel output dim across the banks.
+      // bank-spread lever. Spread the parallel output dim across the banks.
       if (isTensorPtr && !dBankSpread) {
         int64_t spreadAxis[] = {0};
         fields.push_back(b.getNamedAttr("bank_spread_axes",
