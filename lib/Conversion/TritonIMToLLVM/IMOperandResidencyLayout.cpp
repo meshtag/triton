@@ -1,6 +1,5 @@
 /// IMOperandResidencyLayout.cpp. Decide per-operand physical layout and residency
-/// for the in-memory (IM) backend. This is the explicit compiler-side analog of
-/// OptiPIM's DataLayout/DetailLayout MILP, heuristic rather than a solver.
+/// for the in-memory (IM) backend.
 ///
 /// Target scope: this pass is substrate-agnostic. Its classification is a pure IR
 /// analysis of the kernel's SSA and loop structure with no architecture branch, so
@@ -72,7 +71,7 @@ static unsigned reachesProgramId(Value v, llvm::DenseSet<Value> &visited) {
 }
 
 // Backward def-chain reachability: does the address derive from `target`
-// (used with a reduction loop's induction variable)?
+// (used with a reduction loop's induction variable)
 static bool reachesValue(Value v, Value target, llvm::DenseSet<Value> &visited) {
   if (!v)
     return false;
@@ -237,9 +236,7 @@ struct IMOperandResidencyLayoutPass
 
       // A scalar load splatted across the lanes is a bank-broadcast: the value
       // is identical across all banks for a given access, exactly what per-BG
-      // replication models, independent of pid/reduction dependence. Covers
-      // matvec x (pid-invariant) and matmul row-tiled A (pid-dependent). The
-      // `broadcast` lever (when disabled) downgrades it to its plain class.
+      // replication models, independent of pid/reduction dependence.
       StringRef cls;
       if (scalarSplat && !dBroadcast)
         cls = "BroadcastReplicate";
@@ -299,6 +296,8 @@ struct IMOperandResidencyLayoutPass
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
       ++numClassified;
     });
+
+    // llvm::outs() << "\n\n\n I was here meshtag \n\n\n";
 
     mod->setAttr("im.residency-analyzed-mem-ops",
                  b.getI64IntegerAttr(numAnalyzed));
