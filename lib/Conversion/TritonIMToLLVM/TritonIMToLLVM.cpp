@@ -57,7 +57,9 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/MapVector.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
@@ -692,6 +694,93 @@ public:
 };
 
 // --------------------------------------------------------------------------
+// Reuse-as-layout: carry the residency descriptor INTO the artifact
+// --------------------------------------------------------------------------
+
+/// reuse_class -> pim_layout_kind_t. Keep in sync with pim_runtime.h.
+static int32_t reuseClassToLayoutKind(StringRef cls) {
+  if (cls == "BroadcastReplicate")
+    return 3; // PIM_LAYOUT_KIND_ROW_DUP
+  if (cls == "ReductionStridedMatrix" || cls == "ParallelSpread")
+    return 2; // PIM_LAYOUT_KIND_BANK_SPREAD
+  return 0;   // PIM_LAYOUT_KIND_UNSET, impose nothing
+}
+
+/// Emit the residency descriptor as module globals the PIM runtime reads at
+/// link time:
+///   @__pim_layout_count : i32           entry count N
+///   @__pim_layout_table : [4*N x i32]   { operand_arg, layout_kind,
+///                                         reduction_col_axis,
+///                                         resident_capacity }
+///
+/// Must run before the conversion below: `im.residency` is discardable and dies
+/// with the tt.load/tt.store ops that lowering replaces.
+///
+/// resident_capacity is 0 here. The pass cannot see a runtime-valued reduction
+/// extent, so the host sends it via pim_set_tensor_capacity().
+static void emitPimLayoutTable(ModuleOp mod) {
+  struct Entry {
+    int32_t kind = 0;
+    int32_t redcol = -1;
+    int32_t cap = 0;
+  };
+  llvm::MapVector<int64_t, Entry> byOperand;
+
+  mod.walk([&](Operation *op) {
+    Attribute raw = op->getDiscardableAttr("im.residency");
+    if (!raw)
+      return;
+    auto dict = dyn_cast<DictionaryAttr>(raw);
+    if (!dict)
+      return;
+    auto clsAttr = dict.getAs<StringAttr>("reuse_class");
+    auto oaAttr = dict.getAs<IntegerAttr>("operand_arg");
+    if (!clsAttr || !oaAttr)
+      return;
+    int64_t operandArg = oaAttr.getInt();
+    if (operandArg < 0)
+      return; // address did not resolve to a kernel pointer argument
+
+    Entry e;
+    e.kind = reuseClassToLayoutKind(clsAttr.getValue());
+    e.redcol = dict.get("reduction_to_column") ? 0 : -1;
+
+    // First wins, except a real class beats an earlier UNSET.
+    auto it = byOperand.find(operandArg);
+    if (it == byOperand.end())
+      byOperand.insert({operandArg, e});
+    else if (it->second.kind == 0 && e.kind != 0)
+      it->second = e;
+  });
+
+  if (byOperand.empty())
+    return;
+
+  SmallVector<int32_t> flat;
+  flat.reserve(byOperand.size() * 4);
+  for (const auto &kv : byOperand) {
+    flat.push_back((int32_t)kv.first);
+    flat.push_back(kv.second.kind);
+    flat.push_back(kv.second.redcol);
+    flat.push_back(kv.second.cap);
+  }
+
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+
+  auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+  auto init = DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat));
+  LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_layout_table", init);
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_layout_count",
+                         b.getI32IntegerAttr((int32_t)byOperand.size()));
+}
+
+// --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
 
@@ -711,6 +800,9 @@ struct ConvertTritonIMToLLVM
     unsigned numBanks = 1;
     if (auto attr = mod->getAttrOfType<IntegerAttr>("im.num-banks"))
       numBanks = attr.getInt();
+
+    // Before conversion: it drops the discardable im.residency attrs.
+    emitPimLayoutTable(mod);
 
     triton::im::TargetInfo targetInfo(numBanks);
 
