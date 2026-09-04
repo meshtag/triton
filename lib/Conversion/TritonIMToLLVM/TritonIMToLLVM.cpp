@@ -708,21 +708,29 @@ static int32_t reuseClassToLayoutKind(StringRef cls) {
 
 /// Emit the residency descriptor as module globals the PIM runtime reads at
 /// link time:
-///   @__pim_layout_count : i32           entry count N
-///   @__pim_layout_table : [4*N x i32]   { operand_arg, layout_kind,
-///                                         reduction_col_axis,
-///                                         resident_capacity }
+///   @__pim_layout_count : i32                entry count N
+///   @__pim_layout_table : [kRecWords*N x i32]
+///       { operand_arg, layout_kind, reduction_col_axis, num_axes,
+///         then kMaxAxes copies of
+///         { extent, stride factor, arg, arg, arg } }
+///
+/// The address footprint is logical on purpose. How many register slots it
+/// needs depends on the bank/row/column interleaving, which only the runtime
+/// knows, so it converts. A stride the pass could not fold to a number is left
+/// as a product of kernel argument indices, resolved against the values the
+/// host pushes with pim_set_kernel_scalars().
 ///
 /// Must run before the conversion below: `im.residency` is discardable and dies
 /// with the tt.load/tt.store ops that lowering replaces.
-///
-/// resident_capacity is 0 here. The pass cannot see a runtime-valued reduction
-/// extent, so the host sends it via pim_set_tensor_capacity().
+static constexpr int kMaxAxes = 3;
+static constexpr int kAxisWords = 5;
+static constexpr int kRecWords = 4 + kMaxAxes * kAxisWords;
+
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
     int32_t kind = 0;
     int32_t redcol = -1;
-    int32_t cap = 0;
+    SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
   llvm::MapVector<int64_t, Entry> byOperand;
 
@@ -744,6 +752,13 @@ static void emitPimLayoutTable(ModuleOp mod) {
     Entry e;
     e.kind = reuseClassToLayoutKind(clsAttr.getValue());
     e.redcol = dict.get("reduction_to_column") ? 0 : -1;
+    if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
+      ArrayRef<int64_t> v = fp.asArrayRef();
+      if (v.size() % kAxisWords == 0 &&
+          (int)(v.size() / kAxisWords) <= kMaxAxes)
+        for (int64_t x : v)
+          e.axes.push_back((int32_t)x);
+    }
 
     // First wins, except a real class beats an earlier UNSET.
     auto it = byOperand.find(operandArg);
@@ -757,12 +772,15 @@ static void emitPimLayoutTable(ModuleOp mod) {
     return;
 
   SmallVector<int32_t> flat;
-  flat.reserve(byOperand.size() * 4);
+  flat.reserve(byOperand.size() * kRecWords);
   for (const auto &kv : byOperand) {
     flat.push_back((int32_t)kv.first);
     flat.push_back(kv.second.kind);
     flat.push_back(kv.second.redcol);
-    flat.push_back(kv.second.cap);
+    flat.push_back((int32_t)(kv.second.axes.size() / kAxisWords));
+    flat.append(kv.second.axes.begin(), kv.second.axes.end());
+    flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
+                0);
   }
 
   OpBuilder b(mod.getBodyRegion());

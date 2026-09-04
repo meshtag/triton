@@ -26,16 +26,28 @@
 ///     otherwise     -> StreamedElementwise
 ///   With no reduction loop (pure elementwise, e.g. axpy) every op is
 ///   StreamedElementwise.
+///
+/// Phase 2 (footprint): the element offsets one program instance touches, as
+/// (extent, stride) axes over the tl.arange axes and the reduction induction
+/// variable. It stays logical. The register-slot count those offsets need
+/// depends on the bank/row/column interleaving, which lives in the runtime, and
+/// a stride the pass cannot fold (conv's CI*R*S weight pitch) travels as a
+/// product of kernel argument indices for the runtime to resolve. Resolving at
+/// all requires a constant trip count, so an untiled reduction gets no
+/// footprint and the host allocator still sizes it.
 
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include <cstdlib>
 #include <string>
 
@@ -54,6 +66,11 @@ namespace im {
 using namespace mlir;
 
 namespace {
+// Footprint descriptor limits. The layout table record is fixed width, so
+// these must match PIM_MAX_FP_AXES / PIM_MAX_STRIDE_ARGS in pim_runtime.c.
+static constexpr int64_t kMaxFpAxes = 3;
+static constexpr int64_t kMaxStrideArgs = 3;
+
 // Backward def-chain reachability: bitmask over program-id axes the address
 // depends on (bit a set => address derives from tt.get_program_id with axis a).
 static unsigned reachesProgramId(Value v, llvm::DenseSet<Value> &visited) {
@@ -124,6 +141,251 @@ static int64_t resolveOperandArg(Value ptr) {
 // Is `op` a scalar tt.load whose (scalar) result feeds a tt.splat?  This is the
 // matvec `x_val = tl.load(x + k)` operand, invisible to the tensor-pointer
 // walk because its pointer is a plain !tt.ptr, not a tensor of pointers.
+/// Constant integer behind a Value, or nullopt.
+static std::optional<int64_t> constIntOf(Value v) {
+  if (!v)
+    return std::nullopt;
+  if (auto c = v.getDefiningOp<arith::ConstantOp>())
+    if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+      return ia.getInt();
+  return std::nullopt;
+}
+
+/// Trip count of `f`, if all three bounds are compile-time constants.
+static std::optional<int64_t> constTripCount(scf::ForOp f) {
+  if (!f)
+    return std::nullopt;
+  auto lb = constIntOf(f.getLowerBound());
+  auto ub = constIntOf(f.getUpperBound());
+  auto st = constIntOf(f.getStep());
+  if (!lb || !ub || !st || *st <= 0 || *ub <= *lb)
+    return std::nullopt;
+  return (*ub - *lb + *st - 1) / *st;
+}
+
+/// Compile-time value of a scalar (or uniformly splatted) integer, or nullopt.
+static std::optional<int64_t> uniformIntOf(Value v) {
+  if (!v)
+    return std::nullopt;
+  if (auto c = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+      return ia.getInt();
+    if (auto de = dyn_cast<DenseElementsAttr>(c.getValue()))
+      if (de.isSplat())
+        return de.getSplatValue<APInt>().getSExtValue();
+  }
+  if (auto sp = v.getDefiningOp<triton::SplatOp>())
+    return uniformIntOf(sp.getSrc());
+  if (auto ext = v.getDefiningOp<arith::ExtSIOp>())
+    return uniformIntOf(ext.getIn());
+  if (auto trunc = v.getDefiningOp<arith::TruncIOp>())
+    return uniformIntOf(trunc.getIn());
+  return std::nullopt;
+}
+
+/// A stride the pass could not fold to a number: `factor` times the product of
+/// the kernel scalar arguments named in `args`. Conv needs this, its weight row
+/// pitch is CI*R*S and all three are kernel arguments.
+struct SymStride {
+  int64_t factor = 1;
+  SmallVector<int64_t, kMaxStrideArgs> args;
+  bool ok = true;
+};
+
+/// One footprint axis: the address takes `extent` positions `stride` apart.
+struct FpAxis {
+  int64_t extent = 0;
+  SymStride stride;
+};
+
+/// Fold `v` into a SymStride, or give up. Only products of constants and kernel
+/// scalar arguments are foldable, which is what index arithmetic on shapes
+/// looks like.
+static bool foldStride(Value v, SymStride &out, int depth = 0) {
+  if (!v || depth > 16)
+    return false;
+  if (auto k = uniformIntOf(v)) {
+    out.factor *= *k;
+    return true;
+  }
+  if (auto sp = v.getDefiningOp<triton::SplatOp>())
+    return foldStride(sp.getSrc(), out, depth + 1);
+  if (auto cvt = v.getDefiningOp<triton::gpu::ConvertLayoutOp>())
+    return foldStride(cvt.getSrc(), out, depth + 1);
+  if (auto ext = v.getDefiningOp<arith::ExtSIOp>())
+    return foldStride(ext.getIn(), out, depth + 1);
+  if (auto trunc = v.getDefiningOp<arith::TruncIOp>())
+    return foldStride(trunc.getIn(), out, depth + 1);
+  if (auto barg = dyn_cast<BlockArgument>(v)) {
+    if (!isa<triton::FuncOp>(barg.getOwner()->getParentOp()))
+      return false;
+    if ((int64_t)out.args.size() >= kMaxStrideArgs)
+      return false;
+    out.args.push_back(barg.getArgNumber());
+    return true;
+  }
+  if (auto mul = v.getDefiningOp<arith::MulIOp>())
+    return foldStride(mul.getLhs(), out, depth + 1) &&
+           foldStride(mul.getRhs(), out, depth + 1);
+  return false;
+}
+
+/// Accumulator keyed by the varying value (a tl.arange or the reduction IV) so
+/// a variable appearing twice in one address adds its strides instead of
+/// counting as two axes.
+using FpAcc = llvm::MapVector<Value, FpAxis>;
+
+/// Decompose an element offset into `const + sum stride_i * v_i` and record the
+/// varying part. `scale` carries the enclosing multiplications down.
+/// Report why an address was not modelled. Giving up here is silent otherwise:
+/// the operand just falls back to the host budget, which looks like success.
+/// IM_FP_DEBUG=1 to see it.
+static bool fpBail(Value v, const char *why) {
+  static int on = -1;
+  if (on < 0)
+    on = std::getenv("IM_FP_DEBUG") ? 1 : 0;
+  if (on) {
+    llvm::errs() << "[fp] bail " << why << " : ";
+    if (Operation *d = v ? v.getDefiningOp() : nullptr)
+      llvm::errs() << d->getName();
+    else
+      llvm::errs() << "<block arg>";
+    llvm::errs() << "\n";
+  }
+  return false;
+}
+/// `key` names the axis. It is the outermost layout-changing op the walk went
+/// through, because layout assignment CSEs one tl.arange into several tile
+/// dimensions and the range value alone cannot tell them apart. Null until the
+/// walk passes such an op, so a range used twice in one index expression still
+/// merges into a single axis.
+static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
+                        const SymStride &scale, FpAcc &acc, int depth,
+                        Value key) {
+  if (!v || depth > 32)
+    return fpBail(v, "depth");
+  if (uniformIntOf(v))
+    return true; // shifts the base, does not spread it
+  auto note = [&](Value var, int64_t extent, int64_t stepScale) {
+    SymStride s = scale;
+    s.factor *= stepScale;
+    if (key)
+      var = key;
+    auto it = acc.find(var);
+    if (it == acc.end()) {
+      acc.insert({var, FpAxis{extent, s}});
+      return;
+    }
+    // Same variable twice. Adding symbolic strides is not representable, so
+    // keep the axis and mark it unusable rather than silently under-counting.
+    if (it->second.stride.args == s.args && it->second.stride.args.empty())
+      it->second.stride.factor += s.factor;
+    else
+      it->second.stride.ok = false;
+  };
+  if (iv && v == iv) {
+    if (ivTrip <= 0)
+      return false;
+    note(v, ivTrip, ivStep);
+    return true;
+  }
+  if (auto barg = dyn_cast<BlockArgument>(v))
+    // A kernel scalar argument is fixed for the launch. Any other block arg is
+    // loop-carried, which this does not model.
+    return isa<triton::FuncOp>(barg.getOwner()->getParentOp());
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return fpBail(v, "no-def");
+  if (isa<triton::GetProgramIdOp>(def))
+    return true; // fixed within one program instance
+  if (auto mr = dyn_cast<triton::MakeRangeOp>(def)) {
+    int64_t n = (int64_t)mr.getEnd() - (int64_t)mr.getStart();
+    if (n <= 0)
+      return false;
+    note(v, n, 1);
+    return true;
+  }
+  // ttg.convert_layout only moves values between layouts, so it is a
+  // pass-through here. Missing it hid every 2D accumulator address.
+  if (isa<triton::BroadcastOp, triton::ExpandDimsOp,
+          triton::gpu::ConvertLayoutOp>(def))
+    return collectAxes(def->getOperand(0), iv, ivTrip, ivStep, scale, acc,
+                       depth + 1, key ? key : v);
+  if (isa<triton::SplatOp, arith::ExtSIOp, arith::TruncIOp,
+          arith::IndexCastOp>(def))
+    return collectAxes(def->getOperand(0), iv, ivTrip, ivStep, scale, acc,
+                       depth + 1, key);
+  if (isa<arith::AddIOp>(def))
+    return collectAxes(def->getOperand(0), iv, ivTrip, ivStep, scale, acc,
+                       depth + 1, key) &&
+           collectAxes(def->getOperand(1), iv, ivTrip, ivStep, scale, acc,
+                       depth + 1, key);
+  if (auto mul = dyn_cast<arith::MulIOp>(def)) {
+    for (int i = 0; i < 2; ++i) {
+      SymStride sub = scale;
+      if (foldStride(def->getOperand(i), sub))
+        return collectAxes(def->getOperand(1 - i), iv, ivTrip, ivStep, sub, acc,
+                           depth + 1, key);
+    }
+    return fpBail(v, "mul-nonconst-stride");
+  }
+  return fpBail(v, "unhandled-op");
+}
+
+/// Footprint of the whole address: walk the addptr chain back to the kernel
+/// pointer argument, summing every offset on the way.
+///
+/// The result is the set of element offsets one program instance touches, which
+/// is what the runtime turns into a register-slot count. The pass deliberately
+/// stops at the logical description: how many physical slots those offsets need
+/// depends on the bank/row/column interleaving, which lives in the runtime.
+static bool operandFootprint(Value ptr, scf::ForOp redFor,
+                             SmallVectorImpl<FpAxis> &out) {
+  Value iv = redFor ? redFor.getInductionVar() : Value();
+  int64_t ivTrip = 0, ivStep = 1;
+  if (redFor) {
+    auto t = constTripCount(redFor);
+    auto s = constIntOf(redFor.getStep());
+    if (!t || !s)
+      return fpBail(ptr, "runtime-trip-count");
+    ivTrip = *t;
+    ivStep = *s;
+  }
+  FpAcc acc;
+  Value cur = ptr;
+  llvm::DenseSet<Value> guard;
+  while (cur && guard.insert(cur).second) {
+    if (isa<BlockArgument>(cur))
+      break;
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto addptr = dyn_cast<triton::AddPtrOp>(def)) {
+      SymStride unit;
+      if (!collectAxes(addptr.getOffset(), iv, ivTrip, ivStep, unit, acc, 0,
+                       Value()))
+        return false;
+      cur = addptr.getPtr();
+      continue;
+    }
+    if (isa<triton::SplatOp, triton::BroadcastOp>(def)) {
+      cur = def->getOperand(0);
+      continue;
+    }
+    return fpBail(cur, "ptr-chain");
+  }
+  for (const auto &kv : acc) {
+    const FpAxis &ax = kv.second;
+    if (!ax.stride.ok)
+      return fpBail(kv.first, "stride-collision");
+    if (ax.extent > 1 && (ax.stride.factor != 0 || !ax.stride.args.empty()))
+      out.push_back(ax);
+  }
+  if ((int64_t)out.size() > kMaxFpAxes)
+    return fpBail(ptr, "too-many-axes");
+  return true;
+}
+
 static bool isScalarSplatLoad(Operation *op) {
   auto load = dyn_cast<triton::LoadOp>(op);
   if (!load)
@@ -291,6 +553,26 @@ struct IMOperandResidencyLayoutPass
         int64_t spreadAxis[] = {0};
         fields.push_back(b.getNamedAttr("bank_spread_axes",
                                         b.getDenseI64ArrayAttr(spreadAxis)));
+      }
+      // Address footprint of one program instance, flattened five words per
+      // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
+      // stride the pass cannot fold to a number is left as a product of kernel
+      // argument indices for the runtime to resolve, which is how conv's
+      // CI*R*S weight pitch survives. Absent when the address is not affine in
+      // the ranges and the reduction IV.
+      SmallVector<FpAxis> fp;
+      if (operandFootprint(ptr, redFor, fp) && !fp.empty()) {
+        SmallVector<int64_t> flat;
+        for (const FpAxis &ax : fp) {
+          flat.push_back(ax.extent);
+          flat.push_back(ax.stride.factor);
+          for (int64_t i = 0; i < kMaxStrideArgs; ++i)
+            flat.push_back(i < (int64_t)ax.stride.args.size()
+                               ? ax.stride.args[i]
+                               : -1);
+        }
+        fields.push_back(
+            b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
       }
 
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
