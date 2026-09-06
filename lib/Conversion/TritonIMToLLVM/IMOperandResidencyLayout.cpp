@@ -48,6 +48,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <string>
 
@@ -59,11 +60,78 @@ namespace triton {
 namespace im {
 #define GEN_PASS_DEF_IMOPERANDRESIDENCYLAYOUT
 #include "triton/Conversion/TritonIMToLLVM/Passes.h.inc"
+
 } // namespace im
 } // namespace triton
 } // namespace mlir
 
 using namespace mlir;
+
+namespace ttg_ = mlir::triton::gpu;
+
+/// Lane (bank) axis of the kernel's output tile, or -1.
+///
+/// The store's pointer type is the one 2-D encoding that is already canonical when
+/// this pass runs, so it is the reliable anchor for "which axis carries the banks".
+/// The per-operand expand_dims encodings are NOT: at this stage each still puts the
+/// lanes on its own axis ([32,1] for the M vector, [1,32] for the N vector), and
+/// they only agree on the common tile after later canonicalization.
+static int laneAxisOfOutputTile(Operation *memOp) {
+  auto fn = memOp->getParentOfType<triton::FuncOp>();
+  if (!fn)
+    return -1;
+  int lane = -1;
+  fn.walk([&](triton::StoreOp st) {
+    auto tt = dyn_cast<RankedTensorType>(st.getPtr().getType());
+    if (!tt || tt.getRank() != 2)
+      return;
+    auto blocked =
+        dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
+    if (!blocked)
+      return;
+    SmallVector<unsigned> tpw(blocked.getThreadsPerWarp());
+    if (tpw.size() == 2)
+      lane = tpw[0] > 1 ? 0 : 1;
+  });
+  return lane;
+}
+
+/// Does every bank see the SAME elements of this loaded operand?
+///
+/// Banks-as-threads means the lane axis of the output tile IS the bank axis. A
+/// rank-1 operand is expand_dims'd into that tile, so it is replicated across the
+/// banks exactly when its own axis is not the lane axis. For matmul with a
+/// [BLOCK_M, BLOCK_N] tile and lanes on N: A expands on axis 1, occupies dim 0, and
+/// every bank reads all of it; B expands on axis 0, occupies the lane dim, and is
+/// partitioned.
+///
+/// Deriving this instead of letting the host assert it is the whole point. The
+/// hard-coded role strings were written for one layout, so a layout change silently
+/// inverted the charge: a transposed matmul accumulator measured 31x too fast
+/// because the replicated operand landed in the role that is never charged for
+/// replication (2026-09-06).
+static bool isBankReplicated(Operation *memOp) {
+  if (memOp->getNumResults() == 0)
+    return false; // a store's role is what it is, not how it is spread
+  int lane = laneAxisOfOutputTile(memOp);
+  if (lane < 0)
+    return false;
+  SmallVector<Value, 8> work{memOp->getResult(0)};
+  llvm::DenseSet<Value> seen;
+  int hops = 0;
+  while (!work.empty() && hops++ < 128) {
+    Value v = work.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    for (Operation *u : v.getUsers()) {
+      if (auto ed = dyn_cast<triton::ExpandDimsOp>(u))
+        return (ed.getAxis() == 0 ? 1 : 0) != lane;
+      if (u->getNumResults() == 1)
+        work.push_back(u->getResult(0)); // walk convert_layout and friends
+    }
+  }
+  return false;
+}
 
 namespace {
 // Footprint descriptor limits. The layout table record is fixed width, so
@@ -515,8 +583,14 @@ struct IMOperandResidencyLayoutPass
 
       const bool isStore = isa<triton::StoreOp>(op);
 
+      // DERIVED ROLE. Replication is a property of the layout, so read it off the
+      // encoding rather than letting the host assert it.
+      const bool bankReplicated = scalarSplat || isBankReplicated(op);
+
       SmallVector<NamedAttribute> fields;
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
+      fields.push_back(b.getNamedAttr("bank_replicated",
+                                      b.getBoolAttr(bankReplicated)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
       fields.push_back(

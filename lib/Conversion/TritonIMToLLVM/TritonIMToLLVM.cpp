@@ -724,12 +724,18 @@ static int32_t reuseClassToLayoutKind(StringRef cls) {
 /// with the tt.load/tt.store ops that lowering replaces.
 static constexpr int kMaxAxes = 3;
 static constexpr int kAxisWords = 5;
-static constexpr int kRecWords = 4 + kMaxAxes * kAxisWords;
+/// { operand_arg, layout_kind, reduction_col_axis, bank_replicated, num_axes,
+///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg } }.
+/// bank_replicated is word 3 and is the compiler-DERIVED role: 1 when every bank
+/// sees the same elements (the value must be delivered to each PE), 0 when the
+/// tensor is bank-partitioned. Keep in sync with PIM_LAYOUT_REC_WORDS.
+static constexpr int kRecWords = 5 + kMaxAxes * kAxisWords;
 
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
     int32_t kind = 0;
     int32_t redcol = -1;
+    int32_t bankReplicated = -1;  // -1 = the pass said nothing
     SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
   llvm::MapVector<int64_t, Entry> byOperand;
@@ -752,6 +758,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
     Entry e;
     e.kind = reuseClassToLayoutKind(clsAttr.getValue());
     e.redcol = dict.get("reduction_to_column") ? 0 : -1;
+    if (auto br = dict.getAs<BoolAttr>("bank_replicated"))
+      e.bankReplicated = br.getValue() ? 1 : 0;
     if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
       ArrayRef<int64_t> v = fp.asArrayRef();
       if (v.size() % kAxisWords == 0 &&
@@ -766,6 +774,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
       byOperand.insert({operandArg, e});
     else if (it->second.kind == 0 && e.kind != 0)
       it->second = e;
+    else if (it->second.bankReplicated < 0 && e.bankReplicated >= 0)
+      it->second.bankReplicated = e.bankReplicated;
   });
 
   if (byOperand.empty())
@@ -777,6 +787,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     flat.push_back((int32_t)kv.first);
     flat.push_back(kv.second.kind);
     flat.push_back(kv.second.redcol);
+    flat.push_back(kv.second.bankReplicated);
     flat.push_back((int32_t)(kv.second.axes.size() / kAxisWords));
     flat.append(kv.second.axes.begin(), kv.second.axes.end());
     flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
