@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -892,6 +893,18 @@ void init_triton_ir(py::module &&m) {
       .def("get_string_attr",
            [](TritonOpBuilder &self, std::string value) -> Attribute {
              return self.getBuilder().getStringAttr(value);
+           })
+      // Parse any attribute from MLIR text. Lets a caller build the nested
+      // dictionaries the IM schedule channel takes without one binding per
+      // attribute kind.
+      .def("parse_attr",
+           [](TritonOpBuilder &self, const std::string &text) -> Attribute {
+             Attribute attr =
+                 mlir::parseAttribute(text, self.getBuilder().getContext());
+             if (!attr)
+               throw pybind11::value_error(
+                   "could not parse MLIR attribute: " + text);
+             return attr;
            })
       .def("get_disable_loop_licm_attr",
            [](TritonOpBuilder &self) -> Attribute {

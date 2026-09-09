@@ -201,6 +201,19 @@ static int64_t resolveOperandArg(Value ptr) {
       cur = bcast.getSrc();
       continue;
     }
+    // A layout conversion is pure relabelling, the pointer is the same tensor.
+    // Without this a 2-D operand tile resolves to -1 and drops out of the
+    // descriptor entirely: the k-packed matmul puts two ttg.convert_layout in the
+    // A chain, so the compiler classified the load correctly and then could not
+    // say which argument it belonged to.
+    if (auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(def)) {
+      cur = cvt.getSrc();
+      continue;
+    }
+    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def)) {
+      cur = expand.getSrc();
+      continue;
+    }
     return -1; // unknown producer of a pointer value
   }
   return -1;
@@ -467,6 +480,148 @@ static bool isScalarSplatLoad(Operation *op) {
 }
 
 // -----------------------------------------------------------------------
+// User-expressible schedule (roadmap step 4)
+// -----------------------------------------------------------------------
+/// The classification below is a DEFAULT. A schedule forces policy on top of it,
+/// from `im.schedule` on the module (keyed `arg<N>` by kernel operand index) or
+/// from `im.residency.force` on one access op, the op winning where both apply.
+/// Input lives in its own attribute so re-running the pass cannot mistake its own
+/// output for user intent.
+///
+/// Only policy is forcible. operand_arg, axis_deps, reduction_dep and footprint
+/// are read out of the IR, and forcing those would misdescribe the kernel to the
+/// runtime rather than remap it.
+///
+/// Every rejection is a hard error, including a schedule entry that never matched
+/// an access. A silently dropped field yields a run that looks tuned and measures
+/// the default.
+
+namespace {
+
+enum class OvrKind { Str, Bool, I64, DenseI64, Flag };
+
+struct OvrSpec {
+  const char *name;
+  OvrKind kind;
+  /// Whether emitPimLayoutTable carries this field into the artifact. A field
+  /// that does not travel is stamped in the IR and read by nobody, so forcing it
+  /// changes no simulated behaviour and the pass warns rather than let a
+  /// schedule look effective.
+  bool travels;
+};
+
+static const OvrSpec kForcible[] = {
+    {"reuse_class", OvrKind::Str, true},
+    {"bank_replicated", OvrKind::Bool, true},
+    {"reduction_to_column", OvrKind::Flag, true},
+};
+
+static const char *kReuseClasses[] = {"ReductionStridedMatrix",
+                                      "BroadcastReplicate", "ParallelSpread",
+                                      "StreamedElementwise"};
+
+static const OvrSpec *findForcible(StringRef name) {
+  for (const OvrSpec &s : kForcible)
+    if (name == s.name)
+      return &s;
+  return nullptr;
+}
+
+static void setField(OpBuilder &b, SmallVectorImpl<NamedAttribute> &fields,
+                     StringRef name, Attribute val) {
+  for (NamedAttribute &f : fields)
+    if (f.getName() == name) {
+      f.setValue(val);
+      return;
+    }
+  fields.push_back(b.getNamedAttr(name, val));
+}
+
+static void eraseField(SmallVectorImpl<NamedAttribute> &fields,
+                       StringRef name) {
+  llvm::erase_if(fields,
+                 [&](const NamedAttribute &f) { return f.getName() == name; });
+}
+
+static LogicalResult checkSchedule(DictionaryAttr d, Location loc,
+                                   const Twine &where) {
+  for (NamedAttribute e : d) {
+    const OvrSpec *s = findForcible(e.getName());
+    if (!s)
+      return emitError(loc) << where << ": '" << e.getName().strref()
+                            << "' is not a forcible schedule field";
+    // Checked here, not at the call site, so both entry points get it. The first
+    // version checked this only on the module path and the per-op path accepted
+    // a field that cannot do anything, which is this codebase's oldest bug shape.
+    if (!s->travels)
+      return emitError(loc) << where << ": '" << e.getName().strref()
+                            << "' is classified but not carried into the "
+                               "artifact, so forcing it would change no "
+                               "simulated behaviour. Drop it, or teach "
+                               "emitPimLayoutTable to carry it";
+    Attribute v = e.getValue();
+    bool ok = false;
+    switch (s->kind) {
+    case OvrKind::Str: {
+      auto sa = dyn_cast<StringAttr>(v);
+      ok = (bool)sa;
+      if (ok && e.getName() == "reuse_class") {
+        ok = false;
+        for (const char *c : kReuseClasses)
+          if (sa.getValue() == c)
+            ok = true;
+        if (!ok)
+          return emitError(loc) << where << ": reuse_class '" << sa.getValue()
+                                << "' is not a known class";
+      }
+      break;
+    }
+    case OvrKind::Bool:
+      ok = isa<BoolAttr>(v);
+      break;
+    case OvrKind::I64: {
+      auto ia = dyn_cast<IntegerAttr>(v);
+      ok = ia && ia.getType().isInteger(64);
+      break;
+    }
+    case OvrKind::DenseI64:
+      ok = isa<DenseI64ArrayAttr>(v);
+      break;
+    case OvrKind::Flag:
+      ok = isa<BoolAttr>(v) || isa<UnitAttr>(v);
+      break;
+    }
+    if (!ok)
+      return emitError(loc) << where << ": '" << e.getName().strref()
+                            << "' has the wrong type for a schedule field";
+  }
+  return success();
+}
+
+/// Overlay `d` on `fields`. A flag takes a bool, false removing the lever, so a
+/// schedule can switch one off and not only on.
+static void applySchedule(OpBuilder &b, DictionaryAttr d,
+                          SmallVectorImpl<NamedAttribute> &fields) {
+  for (NamedAttribute e : d) {
+    const OvrSpec *s = findForcible(e.getName());
+    if (!s)
+      continue; // checkSchedule rejected it already
+    if (s->kind != OvrKind::Flag) {
+      setField(b, fields, e.getName(), e.getValue());
+      continue;
+    }
+    bool on = isa<UnitAttr>(e.getValue()) ||
+              cast<BoolAttr>(e.getValue()).getValue();
+    if (on)
+      setField(b, fields, e.getName(), b.getUnitAttr());
+    else
+      eraseField(fields, e.getName());
+  }
+}
+
+} // namespace
+
+// -----------------------------------------------------------------------
 // Pass implementation
 // -----------------------------------------------------------------------
 
@@ -478,6 +633,31 @@ struct IMOperandResidencyLayoutPass
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     OpBuilder b(mod.getContext());
+
+    // Step 4 user schedule, validated up front so a malformed one fails before
+    // any classification rather than half way through it.
+    llvm::MapVector<int64_t, DictionaryAttr> argSchedule;
+    llvm::DenseSet<int64_t> argScheduleUsed;
+    if (auto schedule = mod->getAttrOfType<DictionaryAttr>("im.schedule")) {
+      for (NamedAttribute e : schedule) {
+        StringRef k = e.getName().strref();
+        int64_t argIdx = 0;
+        if (!k.starts_with("arg") || k.drop_front(3).getAsInteger(10, argIdx)) {
+          mod.emitError() << "im.schedule: key '" << k
+                          << "' must be arg<N> with N a kernel operand index";
+          return signalPassFailure();
+        }
+        auto d = dyn_cast<DictionaryAttr>(e.getValue());
+        if (!d) {
+          mod.emitError() << "im.schedule: '" << k
+                          << "' must map to a dictionary of schedule fields";
+          return signalPassFailure();
+        }
+        if (failed(checkSchedule(d, mod.getLoc(), "im.schedule." + k)))
+          return signalPassFailure();
+        argSchedule[argIdx] = d;
+      }
+    }
 
     // Compiler-side ablation levers (docs/ablation-levers-plan.md).
     // IM_LAYOUT_ABLATE is a comma/space list of lever names to DISABLE. A
@@ -504,11 +684,10 @@ struct IMOperandResidencyLayoutPass
       }
       return false;
     };
+    // bank-spread, operand-scope and acc-resident are gone with the fields they
+    // gated. Disabling them was already inert: nothing downstream read the result.
     const bool dReductionCol = disabled("reduction-col");
-    const bool dBankSpread = disabled("bank-spread");
-    const bool dOperandScope = disabled("operand-scope");
     const bool dBroadcast = disabled("broadcast");
-    const bool dAccResident = disabled("acc-resident");
 
     // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
     // carries iter_args (the accumulator).  Record the count and which
@@ -524,7 +703,8 @@ struct IMOperandResidencyLayoutPass
     });
 
     // Pass B, classify each memory-access op and stamp im.residency.
-    int64_t numAnalyzed = 0, numClassified = 0;
+    int64_t numAnalyzed = 0, numClassified = 0, numForced = 0;
+    bool scheduleError = false;
     mod.walk([&](Operation *op) {
       Value ptr = getMemAccessPtr(op);
       if (!ptr)
@@ -581,8 +761,6 @@ struct IMOperandResidencyLayoutPass
       else
         cls = "StreamedElementwise";
 
-      const bool isStore = isa<triton::StoreOp>(op);
-
       // DERIVED ROLE. Replication is a property of the layout, so read it off the
       // encoding rather than letting the host assert it.
       const bool bankReplicated = scalarSplat || isBankReplicated(op);
@@ -593,41 +771,29 @@ struct IMOperandResidencyLayoutPass
                                       b.getBoolAttr(bankReplicated)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
+      // Is the contraction axis TILED INTO the access shape? A rank-1 load inside
+      // the reduction loop takes ONE value out of each DQ word, so the operand bus
+      // memo cannot fire (matmul measured 0 skips of 1,048,576); tiling the
+      // reduction into the load makes word-mates consecutive and the memo collapses
+      // them 7/8, worth 8.0x on matmul.
+      //
+      // SUFFICIENT, NOT NECESSARY, and the name says tiled for that reason. Packing
+      // can also be earned by address contiguity without any tiling: conv's scalar
+      // weight load walks s with unit stride and its memo fires at exactly 7/8
+      // (64512/73728 measured 2026-09-09) while this flag reads false on all three
+      // of its tensors. So false here does NOT mean the lever is off. Never use this
+      // as the gate for the lever or as evidence that packing is absent; the runtime
+      // skip counter is the ground truth.
+      bool reductionTiled = false;
+      if (redFor && ivDep && op->getNumResults() > 0)
+        if (auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+          reductionTiled = rt.getRank() >= 2;
       fields.push_back(
-          b.getNamedAttr("axis_deps", b.getI64IntegerAttr((int64_t)pidMask)));
-      if (ivDep)
-        fields.push_back(b.getNamedAttr("reduction_dep", b.getUnitAttr()));
+          b.getNamedAttr("reduction_tiled", b.getBoolAttr(reductionTiled)));
       // reduction-col lever. Place the contraction axis on the column-low bits.
       if (cls == "ReductionStridedMatrix" && !dReductionCol)
         fields.push_back(
             b.getNamedAttr("reduction_to_column", b.getUnitAttr()));
-      // operand-scope lever. The pid axes the operand is INVARIANT in (the
-      // complement of axis_deps over x/y/z). This migrates MemTracePass's
-      // __pim_load_persistent{,_yz,_xz,_xy} scope decision into the layout pass.
-      // The simulator dedups at this scope. 0 when the lever is disabled.
-      int64_t scope = dOperandScope ? 0 : (int64_t)((~pidMask) & 0x7u);
-      fields.push_back(b.getNamedAttr("residency_scope",
-                                      b.getI64IntegerAttr(scope)));
-      if (pidMask == 0 && funcReduction && !dOperandScope)
-        fields.push_back(b.getNamedAttr("resident", b.getUnitAttr()));
-      // broadcast lever. Per-BG replication of a bank-broadcast operand.
-      if (cls == "BroadcastReplicate") {
-        fields.push_back(
-            b.getNamedAttr("replicate_mode", b.getStringAttr("per_bg")));
-        if (scalarSplat)
-          fields.push_back(b.getNamedAttr("scalar_splat", b.getUnitAttr()));
-      }
-      // acc-resident lever. Keep the accumulated output psum in the PE across
-      // the reduction (the output store of a reduction kernel).
-      if (isStore && funcReduction && cls == "ParallelSpread" && !dAccResident)
-        fields.push_back(
-            b.getNamedAttr("accumulator_resident", b.getUnitAttr()));
-      // bank-spread lever. Spread the parallel output dim across the banks.
-      if (isTensorPtr && !dBankSpread) {
-        int64_t spreadAxis[] = {0};
-        fields.push_back(b.getNamedAttr("bank_spread_axes",
-                                        b.getDenseI64ArrayAttr(spreadAxis)));
-      }
       // Address footprint of one program instance, flattened five words per
       // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
       // stride the pass cannot fold to a number is left as a product of kernel
@@ -649,12 +815,52 @@ struct IMOperandResidencyLayoutPass
             b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
       }
 
+      // Step 4: the classification above was the default, this is the decision.
+      // Per-arg first so the per-op force wins where both name a field.
+      bool forced = false;
+      if (operandArg >= 0) {
+        auto it = argSchedule.find(operandArg);
+        if (it != argSchedule.end()) {
+          applySchedule(b, it->second, fields);
+          argScheduleUsed.insert(operandArg);
+          forced = true;
+        }
+      }
+      if (auto perOp = dyn_cast_or_null<DictionaryAttr>(
+              op->getDiscardableAttr("im.residency.force"))) {
+        if (failed(checkSchedule(perOp, op->getLoc(), "im.residency.force"))) {
+          scheduleError = true;
+          return;
+        }
+        applySchedule(b, perOp, fields);
+        forced = true;
+      }
+      if (forced) {
+        setField(b, fields, "user_forced", b.getUnitAttr());
+        ++numForced;
+      }
+
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
       ++numClassified;
     });
 
+    if (scheduleError)
+      return signalPassFailure();
+    // An arg nobody matched means the schedule silently did nothing, which reads
+    // downstream as a tuned run that measured the default.
+    for (const auto &kv : argSchedule) {
+      if (!argScheduleUsed.contains(kv.first)) {
+        mod.emitError() << "im.schedule: arg" << kv.first
+                        << " matched no classified memory access";
+        return signalPassFailure();
+      }
+    }
+
     // llvm::outs() << "\n\n\n I was here meshtag \n\n\n";
 
+    // Provenance. A reported number has to be able to say whether it came from
+    // the classifier or from a forced schedule.
+    mod->setAttr("im.residency-user-forced", b.getI64IntegerAttr(numForced));
     mod->setAttr("im.residency-analyzed-mem-ops",
                  b.getI64IntegerAttr(numAnalyzed));
     mod->setAttr("im.residency-classified-mem-ops",

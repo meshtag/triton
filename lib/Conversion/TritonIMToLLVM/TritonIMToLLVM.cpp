@@ -807,6 +807,26 @@ static void emitPimLayoutTable(ModuleOp mod) {
   LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                          LLVM::Linkage::External, "__pim_layout_count",
                          b.getI32IntegerAttr((int32_t)byOperand.size()));
+  // State the record width so the runtime can verify it rather than assume it.
+  // kRecWords here and PIM_LAYOUT_REC_WORDS in pim_layout_table.h live in separate
+  // submodules; if they drift, the runtime strides wrong and misreads every record
+  // past the first, silently. A comment asking them to agree is not a check.
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_layout_rec_words",
+                         b.getI32IntegerAttr((int32_t)kRecWords));
+
+  // Bank-group interleave: a whole-kernel address-mapping choice, so it travels as a
+  // module-level global rather than a per-tensor record field. Placing the bankgroup
+  // bits below the column bits makes consecutive elements round-robin the bank groups,
+  // so consecutive column commands are spaced by nCCDS rather than nCCDL. Bijective
+  // over power-of-two dimensions, hence correctness-invariant. Emitted so the decision
+  // is the compiler's; the runtime env var remains only for ablation.
+  int32_t bgi = 0;
+  if (auto a = mod->getAttrOfType<IntegerAttr>("im.bg_interleave"))
+    bgi = (int32_t)(a.getInt() != 0);
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_bg_interleave",
+                         b.getI32IntegerAttr(bgi));
 }
 
 // --------------------------------------------------------------------------
