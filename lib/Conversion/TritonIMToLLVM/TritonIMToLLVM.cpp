@@ -725,17 +725,16 @@ public:
 /// with the tt.load/tt.store ops that lowering replaces.
 static constexpr int kMaxAxes = 3;
 static constexpr int kAxisWords = 5;
-/// { operand_arg, bank_replicated, num_axes,
+/// { operand_arg, bank_replicated, num_axes, is_store,
 ///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg } }.
-/// bank_replicated is word 3 and is the compiler-DERIVED role: 1 when every bank
-/// sees the same elements (the value must be delivered to each PE), 0 when the
-/// tensor is bank-partitioned. Keep in sync with PIM_LAYOUT_REC_WORDS.
+/// bank_replicated is the compiler-DERIVED role: 1 when every bank sees the same
+/// elements (the value must be delivered to each PE), 0 when the tensor is
+/// bank-partitioned. is_store marks the OUTPUT, which nothing else identifies now
+/// that reuse_class no longer travels, and which the SIMDRAM occupancy charge needs
+/// specifically: only a store's footprint excludes the reduction axis.
 /* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
-   pim_layout_table.h. Went 5 -> 4 fixed words on 2026-09-10 when the
-   reduction_col_axis word left with the reduction-to-column lever and layout_kind
-   with the broadcast collapse it drove; a half rebuild aborts loudly on the
-   runtime's drift check. */
-static constexpr int kRecWords = 3 + kMaxAxes * kAxisWords;
+   pim_layout_table.h. A half rebuild aborts loudly on the runtime's drift check. */
+static constexpr int kRecWords = 4 + kMaxAxes * kAxisWords;
 
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
@@ -744,6 +743,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     // classification or the catch-all, which is what the kind's zero meant.
     bool concreteClass = false;
     int32_t bankReplicated = -1;  // -1 = the pass said nothing
+    int32_t isStore = 0;
     SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
   llvm::MapVector<int64_t, Entry> byOperand;
@@ -764,6 +764,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
       return; // address did not resolve to a kernel pointer argument
 
     Entry e;
+    e.isStore = isa<triton::StoreOp>(op) ? 1 : 0;
     StringRef cls = clsAttr.getValue();
     e.concreteClass = cls == "BroadcastReplicate" ||
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
@@ -785,6 +786,10 @@ static void emitPimLayoutTable(ModuleOp mod) {
       it->second = e;
     else if (it->second.bankReplicated < 0 && e.bankReplicated >= 0)
       it->second.bankReplicated = e.bankReplicated;
+    // Sticky, unlike the rest: an RMW pointer arg is loaded AND stored, and
+    // first-wins would drop the store bit whichever order the walk saw them in.
+    if (e.isStore)
+      byOperand[operandArg].isStore = 1;
   });
 
   if (byOperand.empty())
@@ -796,6 +801,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     flat.push_back((int32_t)kv.first);
     flat.push_back(kv.second.bankReplicated);
     flat.push_back((int32_t)(kv.second.axes.size() / kAxisWords));
+    flat.push_back(kv.second.isStore);
     flat.append(kv.second.axes.begin(), kv.second.axes.end());
     flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
                 0);
@@ -855,6 +861,10 @@ static void emitPimLayoutTable(ModuleOp mod) {
     LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                            LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
   };
+  // Row width the occupancy charge divides by, num_cols * dq_bits. Stated so the
+  // runtime can say when its geometry differs from the one the cost was computed
+  // against, the same way __pim_dq_bits does for the bus.
+  emitPolicy("im.row_values", "__pim_row_values");
   emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");
   emitPolicy("im.placement_align", "__pim_placement_align");
