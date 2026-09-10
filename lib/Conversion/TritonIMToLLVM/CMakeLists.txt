@@ -1,5 +1,6 @@
 add_triton_library(TritonIMToLLVM
     IMOperandResidencyLayout.cpp
+    IMTileBoundary.cpp
     RewriteIMLayout.cpp
     TargetInfo.cpp
     TritonIMToLLVM.cpp

@@ -80,4 +80,32 @@ def IMOperandResidencyLayout
                            "mlir::triton::gpu::TritonGPUDialect"];
 }
 
+// Marks tile boundaries in a persistent kernel so the trace runtime can scope its
+// per-dispatch collapse correctly.
+def IMTileBoundary : Pass<"im-tile-boundary", "mlir::ModuleOp"> {
+  let summary = "Call __pim_tile_boundary() at each tile-loop back edge";
+  let description = [{
+    Only runs when the module carries `im.persistent`. Inserts a call to the
+    runtime's `__pim_tile_boundary()` at the end of the OUTERMOST `scf.for` body
+    in every function.
+
+    Why it is needed. The trace runtime folds the N bank replays of one all-bank
+    command into one event, and scopes that fold to a dispatch. With one tile per
+    program instance the host's program-id setter marks the dispatch. A persistent
+    kernel puts the tile loop inside the kernel and the bank loop outside, so bank 0
+    walks every tile before bank 1 starts; without a signal from inside the loop the
+    whole run looks like one dispatch and every cross-tile re-read of the same
+    address collapses to nothing. That reads as a large speedup and nothing warns.
+
+    Why the outermost loop. In a persistent kernel the tile loop is outermost by
+    construction and the reduction loop is nested inside it. Marking the specific
+    loop in kernel source instead would put the decision back in the kernel.
+
+    Ordering. Must run BEFORE scf-to-cf: afterwards the back edge is a branch and
+    identifying the tile loop means recovering the structure just discarded.
+  }];
+
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::LLVM::LLVMDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

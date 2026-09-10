@@ -855,6 +855,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                            LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
   };
+  emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");
   emitPolicy("im.placement_align", "__pim_placement_align");
 }

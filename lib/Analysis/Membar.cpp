@@ -116,6 +116,13 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
   // Entry virtual blocks are represented by a null iterator. Populate the
   // blockList with the entry virtual blocks in the function. Then, each
   // iteration scans until a terminator or region branch operation is found.
+  // An external declaration has no body to analyze, and `getBlocks().front()`
+  // below would read off the end of an empty list. Reached as soon as a module
+  // carries a runtime-function declaration when this runs, which the IM backend
+  // does for its trace hooks (2026-09-10).
+  if (funcOp.getBlocks().empty())
+    return;
+
   DenseMap<VirtualBlock, BlockInfo> inputBlockInfoMap;
   DenseMap<VirtualBlock, BlockInfo> outputBlockInfoMap;
   std::deque<VirtualBlock> blockList;
