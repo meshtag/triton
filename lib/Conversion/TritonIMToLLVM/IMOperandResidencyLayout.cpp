@@ -110,12 +110,27 @@ static int laneAxisOfOutputTile(Operation *memOp) {
 /// inverted the charge: a transposed matmul accumulator measured 31x too fast
 /// because the replicated operand landed in the role that is never charged for
 /// replication (2026-09-06).
-static bool isBankReplicated(Operation *memOp) {
+/// TRI-STATE: 1 replicated, 0 bank-partitioned, -1 UNDETERMINED.
+///
+/// This used to return bool, which collapsed "definitely partitioned" and "I could
+/// not tell" into the same false. The layout table's contract (pim_layout_table.h)
+/// has always specified -1 for "the pass said nothing and the host's role stands",
+/// and TritonIMToLLVM.cpp already defaults to -1, but the pass always emitted a
+/// BoolAttr so -1 was unreachable.
+///
+/// The cost of that: any layout the derivation cannot read produced a SILENT role
+/// flip. When RewriteIMLayout started deriving the bank axis from the reduce axis,
+/// blocked matvec's x came back false, the runtime overrode the host's OPERAND to
+/// STREAMED, and x's 4,096 per-bank bus writes became a lockstep-collapsed bank read,
+/// i.e. nearly free. x is plainly replicated (every bank needs all of it, and with
+/// banks on M it has no M extent), so that was a misread, not a reclassification.
+/// Undetermined must fall back to the host, which is the conservative direction.
+static int bankReplicatedTri(Operation *memOp) {
   if (memOp->getNumResults() == 0)
-    return false; // a store's role is what it is, not how it is spread
+    return -1; // a store: nothing to derive, the host's role stands
   int lane = laneAxisOfOutputTile(memOp);
   if (lane < 0)
-    return false;
+    return -1; // cannot locate the lane axis, so cannot say
   SmallVector<Value, 8> work{memOp->getResult(0)};
   llvm::DenseSet<Value> seen;
   int hops = 0;
@@ -125,12 +140,12 @@ static bool isBankReplicated(Operation *memOp) {
       continue;
     for (Operation *u : v.getUsers()) {
       if (auto ed = dyn_cast<triton::ExpandDimsOp>(u))
-        return (ed.getAxis() == 0 ? 1 : 0) != lane;
+        return ((ed.getAxis() == 0 ? 1 : 0) != lane) ? 1 : 0;
       if (u->getNumResults() == 1)
         work.push_back(u->getResult(0)); // walk convert_layout and friends
     }
   }
-  return false;
+  return -1; // no expand_dims to reason from: undetermined, not partitioned
 }
 
 namespace {
@@ -511,9 +526,12 @@ struct OvrSpec {
 };
 
 static const OvrSpec kForcible[] = {
-    {"reuse_class", OvrKind::Str, true},
+    // reuse_class is classified and stamped in the IR but reaches no behaviour: its
+    // only destination was the layout_kind record word, deleted 2026-09-10 because the
+    // broadcast collapse it drove was reverted on fairness grounds. travels=false so
+    // forcing it is a hard error rather than a schedule that measures the default.
+    {"reuse_class", OvrKind::Str, false},
     {"bank_replicated", OvrKind::Bool, true},
-    {"reduction_to_column", OvrKind::Flag, true},
 };
 
 static const char *kReuseClasses[] = {"ReductionStridedMatrix",
@@ -684,9 +702,9 @@ struct IMOperandResidencyLayoutPass
       }
       return false;
     };
-    // bank-spread, operand-scope and acc-resident are gone with the fields they
-    // gated. Disabling them was already inert: nothing downstream read the result.
-    const bool dReductionCol = disabled("reduction-col");
+    // bank-spread, operand-scope, acc-resident and reduction-col are gone with the
+    // fields they gated. Disabling them was already inert: nothing downstream read
+    // the result.
     const bool dBroadcast = disabled("broadcast");
 
     // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
@@ -763,12 +781,16 @@ struct IMOperandResidencyLayoutPass
 
       // DERIVED ROLE. Replication is a property of the layout, so read it off the
       // encoding rather than letting the host assert it.
-      const bool bankReplicated = scalarSplat || isBankReplicated(op);
+      // scalarSplat is itself a positive determination of replication.
+      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op);
 
       SmallVector<NamedAttribute> fields;
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
-      fields.push_back(b.getNamedAttr("bank_replicated",
-                                      b.getBoolAttr(bankReplicated)));
+      // OMIT on -1. The emitter defaults the record word to -1, which the runtime
+      // reads as "no compiler decision, keep the host's role".
+      if (bankRep >= 0)
+        fields.push_back(b.getNamedAttr("bank_replicated",
+                                        b.getBoolAttr(bankRep == 1)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
       // Is the contraction axis TILED INTO the access shape? A rank-1 load inside
@@ -790,10 +812,6 @@ struct IMOperandResidencyLayoutPass
           reductionTiled = rt.getRank() >= 2;
       fields.push_back(
           b.getNamedAttr("reduction_tiled", b.getBoolAttr(reductionTiled)));
-      // reduction-col lever. Place the contraction axis on the column-low bits.
-      if (cls == "ReductionStridedMatrix" && !dReductionCol)
-        fields.push_back(
-            b.getNamedAttr("reduction_to_column", b.getUnitAttr()));
       // Address footprint of one program instance, flattened five words per
       // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
       // stride the pass cannot fold to a number is left as a product of kernel

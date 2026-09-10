@@ -138,13 +138,66 @@ struct RewriteIMLayoutPass
     // Step 4 lever: which axis carries the banks. Absent = keep the upstream
     // choice, so this is a no-op unless a schedule asks for it.
     int bankAxis = -1;
+    bool userPinnedBankAxis = false;
     if (auto a = mod->getAttrOfType<IntegerAttr>("im.bank_axis")) {
+      userPinnedBankAxis = true;
       bankAxis = (int)a.getInt();
       if (bankAxis < 0) {
         mod.emitError() << "im.bank_axis must be a non-negative tensor axis";
         return signalPassFailure();
       }
     }
+    // REDUCE AXIS. Banks-as-threads means one lane per bank, and a PIM bank cannot
+    // exchange data with another bank. So a tt.reduce whose axis carries lanes would
+    // need a cross-lane reduction the hardware cannot perform, and the lowering does
+    // not fail cleanly: it asserts with "dyn_cast on a non-existent value"
+    // (Casting.h:656).
+    //
+    // Triton's default layout happily splits lanes across both axes. A blocked
+    // matvec, tile (BLOCK, PACK_K), gets threadsPerWarp=[4,8], putting 8 lanes on the
+    // reduction, which is why matvec_kpacked_kernel and make_2d_tiled_matvec_config
+    // never compiled. A comment in the harness asserted this pass already handled it;
+    // it did not. Written 2026-09-09.
+    int reduceAxis = -1;
+    bool reduceAmbiguous = false;
+    mod.walk([&](triton::ReduceOp red) {
+      if (reduceAmbiguous || red.getOperands().empty())
+        return;
+      auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+      if (!opnd || opnd.getRank() != 2)
+        return;
+      int axis = (int)red.getAxis();
+      if (axis < 0 || axis > 1)
+        return;
+      if (reduceAxis >= 0 && reduceAxis != axis)
+        reduceAmbiguous = true;
+      else
+        reduceAxis = axis;
+    });
+
+    if (userPinnedBankAxis) {
+      // THE USER'S CHOICE WINS, but a choice that cannot lower must say so here
+      // rather than through an assertion 3 passes later. This is the same
+      // silent-failure class the im.schedule validator exists to prevent.
+      if (!reduceAmbiguous && reduceAxis >= 0 && bankAxis == reduceAxis) {
+        mod.emitError()
+            << "im.bank_axis=" << bankAxis << " is the reduction axis of a tt.reduce "
+            << "in this kernel. Banks-as-threads puts one lane per bank, so that "
+            << "would require a cross-bank reduction, which PIM hardware cannot do "
+            << "and the lowering cannot express. Use axis "
+            << (1 - reduceAxis) << ", or drop im.bank_axis and let the pass derive it.";
+        return signalPassFailure();
+      }
+    } else if (reduceAmbiguous) {
+      // Two reduces disagree. Deriving would be a guess, so leave the upstream
+      // choice and record that we declined.
+      mod->setAttr("im.bank-axis-ambiguous-reduce", UnitAttr::get(mod.getContext()));
+    } else if (reduceAxis >= 0) {
+      bankAxis = 1 - reduceAxis; // banks on the non-reduced axis
+      mod->setAttr("im.bank-axis-from-reduce",
+                   IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
+    }
+
     mod->setAttr("im.bank-axis-requested",
                  IntegerAttr::get(IntegerType::get(mod.getContext(), 64),
                                   bankAxis));

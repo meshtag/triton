@@ -64,6 +64,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
+#include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -181,6 +182,10 @@ struct IMBarrierOpErase
 ///
 ///     vec = min(vec, maskAlignment)
 ///
+/// Data-bus width in bits, the number of values one column command moves once
+/// divided by the element width. Must equal the runtime's cfg_dq_bits.
+static constexpr unsigned kImDqBits = 128;
+
 /// This ensures that within each vector group, either all elements are
 /// active or all are inactive, so we can use a single predicate bit
 /// for the whole vector load/store.
@@ -197,7 +202,7 @@ struct IMLoadStoreConversionBase {
 
   /// Compute the vector width for a pointer-typed tensor operand.
   ///
-  /// vec = min(128 / pointeeBitWidth, contiguity)
+  /// vec = min(kImDqBits / pointeeBitWidth, contiguity)
   ///
   /// AxisInfo tracks pointer arithmetic (make_range, splat, addptr,
   /// muli, etc.) and correctly reports contiguity=1 for non-contiguous
@@ -210,7 +215,11 @@ struct IMLoadStoreConversionBase {
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     if (pointeeBitWidth == 0)
       return 1;
-    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    /* kImDqBits is the SAME physical quantity the runtime calls cfg_dq_bits, and it
+       used to be a bare 128 here and a variable there, decided twice with no shared
+       symbol. Named so a grep finds both; the emitted @__pim_dq_bits below lets the
+       runtime compare rather than assume. */
+    return std::min<unsigned>(kImDqBits / pointeeBitWidth, contiguity);
   }
 
   /// Return the mask alignment — the number of consecutive mask
@@ -697,20 +706,12 @@ public:
 // Reuse-as-layout: carry the residency descriptor INTO the artifact
 // --------------------------------------------------------------------------
 
-/// reuse_class -> pim_layout_kind_t. Keep in sync with pim_runtime.h.
-static int32_t reuseClassToLayoutKind(StringRef cls) {
-  if (cls == "BroadcastReplicate")
-    return 3; // PIM_LAYOUT_KIND_ROW_DUP
-  if (cls == "ReductionStridedMatrix" || cls == "ParallelSpread")
-    return 2; // PIM_LAYOUT_KIND_BANK_SPREAD
-  return 0;   // PIM_LAYOUT_KIND_UNSET, impose nothing
-}
 
 /// Emit the residency descriptor as module globals the PIM runtime reads at
 /// link time:
 ///   @__pim_layout_count : i32                entry count N
 ///   @__pim_layout_table : [kRecWords*N x i32]
-///       { operand_arg, layout_kind, reduction_col_axis, num_axes,
+///       { operand_arg, num_axes,
 ///         then kMaxAxes copies of
 ///         { extent, stride factor, arg, arg, arg } }
 ///
@@ -724,17 +725,24 @@ static int32_t reuseClassToLayoutKind(StringRef cls) {
 /// with the tt.load/tt.store ops that lowering replaces.
 static constexpr int kMaxAxes = 3;
 static constexpr int kAxisWords = 5;
-/// { operand_arg, layout_kind, reduction_col_axis, bank_replicated, num_axes,
+/// { operand_arg, bank_replicated, num_axes,
 ///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg } }.
 /// bank_replicated is word 3 and is the compiler-DERIVED role: 1 when every bank
 /// sees the same elements (the value must be delivered to each PE), 0 when the
 /// tensor is bank-partitioned. Keep in sync with PIM_LAYOUT_REC_WORDS.
-static constexpr int kRecWords = 5 + kMaxAxes * kAxisWords;
+/* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
+   pim_layout_table.h. Went 5 -> 4 fixed words on 2026-09-10 when the
+   reduction_col_axis word left with the reduction-to-column lever and layout_kind
+   with the broadcast collapse it drove; a half rebuild aborts loudly on the
+   runtime's drift check. */
+static constexpr int kRecWords = 3 + kMaxAxes * kAxisWords;
 
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
-    int32_t kind = 0;
-    int32_t redcol = -1;
+    // Not emitted. The layout_kind word it used to produce went 2026-09-10, but the
+    // merge rule below still needs to know whether a record carries a real
+    // classification or the catch-all, which is what the kind's zero meant.
+    bool concreteClass = false;
     int32_t bankReplicated = -1;  // -1 = the pass said nothing
     SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
@@ -756,8 +764,9 @@ static void emitPimLayoutTable(ModuleOp mod) {
       return; // address did not resolve to a kernel pointer argument
 
     Entry e;
-    e.kind = reuseClassToLayoutKind(clsAttr.getValue());
-    e.redcol = dict.get("reduction_to_column") ? 0 : -1;
+    StringRef cls = clsAttr.getValue();
+    e.concreteClass = cls == "BroadcastReplicate" ||
+                      cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
     if (auto br = dict.getAs<BoolAttr>("bank_replicated"))
       e.bankReplicated = br.getValue() ? 1 : 0;
     if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
@@ -768,11 +777,11 @@ static void emitPimLayoutTable(ModuleOp mod) {
           e.axes.push_back((int32_t)x);
     }
 
-    // First wins, except a real class beats an earlier UNSET.
+    // First wins, except a real class beats an earlier catch-all.
     auto it = byOperand.find(operandArg);
     if (it == byOperand.end())
       byOperand.insert({operandArg, e});
-    else if (it->second.kind == 0 && e.kind != 0)
+    else if (!it->second.concreteClass && e.concreteClass)
       it->second = e;
     else if (it->second.bankReplicated < 0 && e.bankReplicated >= 0)
       it->second.bankReplicated = e.bankReplicated;
@@ -785,8 +794,6 @@ static void emitPimLayoutTable(ModuleOp mod) {
   flat.reserve(byOperand.size() * kRecWords);
   for (const auto &kv : byOperand) {
     flat.push_back((int32_t)kv.first);
-    flat.push_back(kv.second.kind);
-    flat.push_back(kv.second.redcol);
     flat.push_back(kv.second.bankReplicated);
     flat.push_back((int32_t)(kv.second.axes.size() / kAxisWords));
     flat.append(kv.second.axes.begin(), kv.second.axes.end());
@@ -827,6 +834,29 @@ static void emitPimLayoutTable(ModuleOp mod) {
   LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                          LLVM::Linkage::External, "__pim_bg_interleave",
                          b.getI32IntegerAttr(bgi));
+
+  // The bus width this artifact's vector widths were chosen for. The runtime holds
+  // the same quantity as cfg_dq_bits and used to decide it independently, so a
+  // machine configured with a different bus silently priced vectors the compiler
+  // never emitted. Stating it lets the runtime say so.
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_dq_bits",
+                         b.getI32IntegerAttr((int32_t)kImDqBits));
+
+  // Placement policy. Where a tensor lands, and therefore which tensors collide on a
+  // bank, was decided entirely by the runtime: a bump allocator in registration order
+  // under a hardcoded alignment rule, with the scheme itself a runtime default plus an
+  // env var. The runtime still executes the policy against sizes it only learns at
+  // registration, but it no longer CHOOSES it. 0 = the kernel said nothing.
+  auto emitPolicy = [&](const char *attr, const char *sym) {
+    int32_t v = 0;
+    if (auto a = mod->getAttrOfType<IntegerAttr>(attr))
+      v = (int32_t)a.getInt();
+    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
+                           LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
+  };
+  emitPolicy("im.layout_scheme", "__pim_layout_scheme");
+  emitPolicy("im.placement_align", "__pim_placement_align");
 }
 
 // --------------------------------------------------------------------------
@@ -905,6 +935,31 @@ struct ConvertTritonIMToLLVM
 
     triton::populateElementwiseOpToLLVMPatterns(
         typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
+    // FLOAT ARITHMETIC. The shared populate above registers the integer ops
+    // (AddI/MulI/SubI/DivSI...) and some float ops (MaxNumF/MinNumF/RemF/UIToFP)
+    // but NOT AddF/SubF/MulF/DivF/NegF or the float width casts. Every vendor
+    // backend adds those itself (see nvidia ElementwiseOpToLLVM.cpp:814-830).
+    // Without them arith.mulf falls through to the benefit-1
+    // populateArithToLLVMConversionPatterns fallback below, which converts the
+    // tensor to a per-thread struct and emits ONE llvm.fmul on the whole struct,
+    // which the LLVM verifier rejects:
+    //   'llvm.fmul' op operand #0 must be floating point ... but got
+    //   '!llvm.struct<(f16, f16, ... x128)>'
+    // arith.muli never hit this because ElementwiseOpConversion catches it first
+    // at benefit 10. That asymmetry is why int32 kernels worked and fp16 did not.
+#define IM_POPULATE_FP_OP(SRC_OP, DST_OP)                                      \
+  patterns.add<mlir::triton::gpu::ElementwiseOpConversion<SRC_OP, DST_OP>>(    \
+      typeConverter, axisInfoAnalysis, benefit)
+    IM_POPULATE_FP_OP(arith::AddFOp, LLVM::FAddOp);
+    IM_POPULATE_FP_OP(arith::SubFOp, LLVM::FSubOp);
+    IM_POPULATE_FP_OP(arith::MulFOp, LLVM::FMulOp);
+    IM_POPULATE_FP_OP(arith::DivFOp, LLVM::FDivOp);
+    IM_POPULATE_FP_OP(arith::NegFOp, LLVM::FNegOp);
+    IM_POPULATE_FP_OP(arith::ExtFOp, LLVM::FPExtOp);
+    IM_POPULATE_FP_OP(arith::TruncFOp, LLVM::FPTruncOp);
+    IM_POPULATE_FP_OP(arith::FPToSIOp, LLVM::FPToSIOp);
+    IM_POPULATE_FP_OP(arith::SIToFPOp, LLVM::SIToFPOp);
+#undef IM_POPULATE_FP_OP
     triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo, patterns,
                                            benefit);
     triton::populateConvertLayoutOpToLLVMPatterns(typeConverter, targetInfo,
