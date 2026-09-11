@@ -428,6 +428,69 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
   return fpBail(v, "unhandled-op");
 }
 
+/// How many times wider the LIVE accumulator is than the value that reaches the
+/// store, i.e. the factor a rank-collapsing reduce hid from the store's footprint.
+///
+/// WHY A MULTIPLIER AND NOT THE ACCUMULATOR'S OWN SIZE. The occupancy denominator
+/// keeps coming from the store footprint; this only scales it. That makes the change
+/// the IDENTITY on every kernel without such a reduce, by arithmetic rather than by
+/// inspection, which matters because the alternative had to get all 24 kernels right:
+/// kernels with no accumulator at all (axpy, matadd, the persistent three) would have
+/// fallen back to the 8192 default and lost a factor of 4096 in the divisor, and the
+/// CO-fused conv unrolls into BLOCK_CO separate accumulator-carrying loops, so an
+/// absolute rule that summed across them would rebuild BLOCK_CO*BLOCK_HW, which is
+/// the retracted 20.9-33.9x. Here that factor is 1 and the question never arises.
+///
+/// TRAPS, all of them load-bearing:
+///  - redFor is USELESS for this. It walks parents upward, and every reduction kernel
+///    here stores AFTER the loop, so a store's redFor is null. Chase the stored VALUE.
+///  - Walk ALL operands, not operand 0. Epilogues are normal: the K-tiled matmul
+///    stores c_old + acc and attention stores min(max(acc + bias, 0), MAX_VAL).
+///  - Skip pointer-typed iter_args. matmul_loopcarried carries b_ptrs at 16x32, which
+///    TIES acc on cell count, so picking by size alone is ambiguous on a real kernel.
+///  - MAX across loops reached, never sum. Summing is how BLOCK_CO comes back.
+static int64_t liveSplitFactor(triton::StoreOp st) {
+  auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
+  if (!storedTy)
+    return 1;
+  int64_t storedCells = 1;
+  for (int64_t d : storedTy.getShape())
+    storedCells *= d;
+  if (storedCells <= 0)
+    return 1;
+
+  SmallVector<Value, 16> work{st.getValue()};
+  DenseSet<Value> seen;
+  int64_t best = storedCells;
+  int hops = 0;
+  while (!work.empty() && hops++ < 256) {
+    Value v = work.pop_back_val();
+    if (!v || !seen.insert(v).second)
+      continue;
+    auto res = dyn_cast<OpResult>(v);
+    if (!res)
+      continue; // block argument: this branch ends
+    Operation *def = res.getOwner();
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      BlockArgument arg = forOp.getRegionIterArg(res.getResultNumber());
+      auto rt = dyn_cast<RankedTensorType>(arg.getType());
+      if (!rt)
+        continue;
+      if (isa<triton::PointerType>(rt.getElementType()))
+        continue; // a carried pointer tile is not an accumulator
+      int64_t cells = 1;
+      for (int64_t d : rt.getShape())
+        cells *= d;
+      if (cells > best)
+        best = cells; // widest wins; NEVER accumulate
+      continue;       // do not descend into the loop body
+    }
+    for (Value o : def->getOperands())
+      work.push_back(o);
+  }
+  return best / storedCells;
+}
+
 /// Footprint of the whole address: walk the addptr chain back to the kernel
 /// pointer argument, summing every offset on the way.
 ///
@@ -831,6 +894,14 @@ struct IMOperandResidencyLayoutPass
         }
         fields.push_back(
             b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
+      }
+
+      // The reduce-collapse factor, stamped on stores only. 1 means the stored value
+      // IS the accumulator, which is every kernel here but the split-K matvec.
+      if (auto st = dyn_cast<triton::StoreOp>(op)) {
+        int64_t ls = liveSplitFactor(st);
+        if (ls > 1)
+          fields.push_back(b.getNamedAttr("live_split", b.getI64IntegerAttr(ls)));
       }
 
       // Step 4: the classification above was the default, this is the decision.

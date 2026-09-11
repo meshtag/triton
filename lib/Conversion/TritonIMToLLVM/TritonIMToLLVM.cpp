@@ -726,7 +726,13 @@ public:
 static constexpr int kMaxAxes = 3;
 static constexpr int kAxisWords = 5;
 /// { operand_arg, bank_replicated, num_axes, is_store,
-///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg } }.
+///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg },
+///   then live_split as a TAIL word }.
+/// live_split is the factor a rank-collapsing reduce hid from the store's footprint,
+/// and it MULTIPLIES the occupancy the runtime derives. 1 on every kernel whose stored
+/// value is its accumulator, which is all of them but the split-K matvec, so the field
+/// is the identity by arithmetic rather than by inspection. Appended at the TAIL so
+/// PIM_LW_AXES_BASE and every existing index keep their values.
 /// bank_replicated is the compiler-DERIVED role: 1 when every bank sees the same
 /// elements (the value must be delivered to each PE), 0 when the tensor is
 /// bank-partitioned. is_store marks the OUTPUT, which nothing else identifies now
@@ -734,7 +740,7 @@ static constexpr int kAxisWords = 5;
 /// specifically: only a store's footprint excludes the reduction axis.
 /* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
    pim_layout_table.h. A half rebuild aborts loudly on the runtime's drift check. */
-static constexpr int kRecWords = 4 + kMaxAxes * kAxisWords;
+static constexpr int kRecWords = 5 + kMaxAxes * kAxisWords;
 
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
@@ -744,6 +750,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     bool concreteClass = false;
     int32_t bankReplicated = -1;  // -1 = the pass said nothing
     int32_t isStore = 0;
+    int32_t liveSplit = 1;
     SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
   llvm::MapVector<int64_t, Entry> byOperand;
@@ -765,6 +772,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
 
     Entry e;
     e.isStore = isa<triton::StoreOp>(op) ? 1 : 0;
+    if (auto ls = dict.getAs<IntegerAttr>("live_split"))
+      e.liveSplit = (int32_t)ls.getInt();
     StringRef cls = clsAttr.getValue();
     e.concreteClass = cls == "BroadcastReplicate" ||
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
@@ -790,6 +799,10 @@ static void emitPimLayoutTable(ModuleOp mod) {
     // first-wins would drop the store bit whichever order the walk saw them in.
     if (e.isStore)
       byOperand[operandArg].isStore = 1;
+    // MAX, not first-wins: two stores can reach one output (CO-fused conv) and the
+    // row has to hold the widest of them. Never sum -- they share the accumulator.
+    if (e.liveSplit > byOperand[operandArg].liveSplit)
+      byOperand[operandArg].liveSplit = e.liveSplit;
   });
 
   if (byOperand.empty())
@@ -805,6 +818,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     flat.append(kv.second.axes.begin(), kv.second.axes.end());
     flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
                 0);
+    flat.push_back(kv.second.liveSplit); // TAIL word, after the axis padding
   }
 
   OpBuilder b(mod.getBodyRegion());
