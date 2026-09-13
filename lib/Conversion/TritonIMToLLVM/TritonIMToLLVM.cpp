@@ -727,7 +727,7 @@ static constexpr int kMaxAxes = 3;
 static constexpr int kAxisWords = 5;
 /// { operand_arg, bank_replicated, num_axes, is_store,
 ///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg },
-///   then live_split as a TAIL word }.
+///   then live_split and cell_fanout as TAIL words }.
 /// live_split is the factor a rank-collapsing reduce hid from the store's footprint,
 /// and it MULTIPLIES the occupancy the runtime derives. 1 on every kernel whose stored
 /// value is its accumulator, which is all of them but the split-K matvec, so the field
@@ -740,7 +740,7 @@ static constexpr int kAxisWords = 5;
 /// specifically: only a store's footprint excludes the reduction axis.
 /* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
    pim_layout_table.h. A half rebuild aborts loudly on the runtime's drift check. */
-static constexpr int kRecWords = 5 + kMaxAxes * kAxisWords;
+static constexpr int kRecWords = 6 + kMaxAxes * kAxisWords;
 
 static void emitPimLayoutTable(ModuleOp mod) {
   struct Entry {
@@ -751,6 +751,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     int32_t bankReplicated = -1;  // -1 = the pass said nothing
     int32_t isStore = 0;
     int32_t liveSplit = 1;
+    int32_t cellFanout = 1;
     SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
   };
   llvm::MapVector<int64_t, Entry> byOperand;
@@ -774,6 +775,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
     e.isStore = isa<triton::StoreOp>(op) ? 1 : 0;
     if (auto ls = dict.getAs<IntegerAttr>("live_split"))
       e.liveSplit = (int32_t)ls.getInt();
+    if (auto cf = dict.getAs<IntegerAttr>("cell_fanout"))
+      e.cellFanout = (int32_t)cf.getInt();
     StringRef cls = clsAttr.getValue();
     e.concreteClass = cls == "BroadcastReplicate" ||
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
@@ -791,8 +794,15 @@ static void emitPimLayoutTable(ModuleOp mod) {
     auto it = byOperand.find(operandArg);
     if (it == byOperand.end())
       byOperand.insert({operandArg, e});
-    else if (!it->second.concreteClass && e.concreteClass)
+    else if (!it->second.concreteClass && e.concreteClass) {
+      // A wholesale replace must not drop what the earlier record knew.
+      e.isStore |= it->second.isStore;
+      if (it->second.liveSplit > e.liveSplit)
+        e.liveSplit = it->second.liveSplit;
+      if (it->second.cellFanout > e.cellFanout)
+        e.cellFanout = it->second.cellFanout;
       it->second = e;
+    }
     else if (it->second.bankReplicated < 0 && e.bankReplicated >= 0)
       it->second.bankReplicated = e.bankReplicated;
     // Sticky, unlike the rest: an RMW pointer arg is loaded AND stored, and
@@ -803,6 +813,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
     // row has to hold the widest of them. Never sum -- they share the accumulator.
     if (e.liveSplit > byOperand[operandArg].liveSplit)
       byOperand[operandArg].liveSplit = e.liveSplit;
+    if (e.cellFanout > byOperand[operandArg].cellFanout)
+      byOperand[operandArg].cellFanout = e.cellFanout;
   });
 
   if (byOperand.empty())
@@ -819,6 +831,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
                 0);
     flat.push_back(kv.second.liveSplit); // TAIL word, after the axis padding
+    flat.push_back(kv.second.cellFanout); // second TAIL word
   }
 
   OpBuilder b(mod.getBodyRegion());
@@ -882,6 +895,13 @@ static void emitPimLayoutTable(ModuleOp mod) {
   emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");
   emitPolicy("im.placement_align", "__pim_placement_align");
+
+  // The lane count the kernel was compiled for. The runtime divides the SIMDRAM
+  // occupancy by its configured bank count and the harness replays num_banks lanes;
+  // three copies of one number, none checked against another until this travelled.
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_lanes",
+                         b.getI32IntegerAttr((int32_t)ttg::TritonGPUDialect::getThreadsPerWarp(mod)));
 }
 
 // --------------------------------------------------------------------------

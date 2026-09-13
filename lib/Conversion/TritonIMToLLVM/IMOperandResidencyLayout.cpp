@@ -51,6 +51,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 // -----------------------------------------------------------------------
 // TableGen pass base class
@@ -69,83 +70,155 @@ using namespace mlir;
 
 namespace ttg_ = mlir::triton::gpu;
 
-/// Lane (bank) axis of the kernel's output tile, or -1.
-///
-/// The store's pointer type is the one 2-D encoding that is already canonical when
-/// this pass runs, so it is the reliable anchor for "which axis carries the banks".
-/// The per-operand expand_dims encodings are NOT: at this stage each still puts the
-/// lanes on its own axis ([32,1] for the M vector, [1,32] for the N vector), and
-/// they only agree on the common tile after later canonicalization.
-static int laneAxisOfOutputTile(Operation *memOp) {
-  auto fn = memOp->getParentOfType<triton::FuncOp>();
-  if (!fn)
+/// Dim of a STORE tile that carries the lanes, -1 if none. Stores are the one
+/// encoding this pass can trust: RewriteIMLayout set them directly and
+/// remove-layout-conversions has not run yet, so a load's type still puts the lanes
+/// on its own axis and says nothing about its place in the tile.
+static int laneAxisOf(Type ty) {
+  auto tt = dyn_cast<RankedTensorType>(ty);
+  if (!tt)
     return -1;
-  int lane = -1;
-  fn.walk([&](triton::StoreOp st) {
-    auto tt = dyn_cast<RankedTensorType>(st.getPtr().getType());
-    if (!tt || tt.getRank() != 2)
-      return;
-    auto blocked =
-        dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
-    if (!blocked)
-      return;
-    SmallVector<unsigned> tpw(blocked.getThreadsPerWarp());
-    if (tpw.size() == 2)
-      lane = tpw[0] > 1 ? 0 : 1;
-  });
-  return lane;
+  auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
+  if (!blocked)
+    return -1;
+  auto tpw = blocked.getThreadsPerWarp();
+  for (int d = 0; d < tt.getRank(); ++d)
+    if (tpw[d] > 1 && tt.getShape()[d] > 1)
+      return d;
+  return -1;
 }
 
-/// Does every bank see the SAME elements of this loaded operand?
-///
-/// Banks-as-threads means the lane axis of the output tile IS the bank axis. A
-/// rank-1 operand is expand_dims'd into that tile, so it is replicated across the
-/// banks exactly when its own axis is not the lane axis. For matmul with a
-/// [BLOCK_M, BLOCK_N] tile and lanes on N: A expands on axis 1, occupies dim 0, and
-/// every bank reads all of it; B expands on axis 0, occupies the lane dim, and is
-/// partitioned.
-///
-/// Deriving this instead of letting the host assert it is the whole point. The
-/// hard-coded role strings were written for one layout, so a layout change silently
-/// inverted the charge: a transposed matmul accumulator measured 31x too fast
-/// because the replicated operand landed in the role that is never charged for
-/// replication (2026-09-06).
-/// TRI-STATE: 1 replicated, 0 bank-partitioned, -1 UNDETERMINED.
-///
-/// This used to return bool, which collapsed "definitely partitioned" and "I could
-/// not tell" into the same false. The layout table's contract (pim_layout_table.h)
-/// has always specified -1 for "the pass said nothing and the host's role stands",
-/// and TritonIMToLLVM.cpp already defaults to -1, but the pass always emitted a
-/// BoolAttr so -1 was unreachable.
-///
-/// The cost of that: any layout the derivation cannot read produced a SILENT role
-/// flip. When RewriteIMLayout started deriving the bank axis from the reduce axis,
-/// blocked matvec's x came back false, the runtime overrode the host's OPERAND to
-/// STREAMED, and x's 4,096 per-bank bus writes became a lockstep-collapsed bank read,
-/// i.e. nearly free. x is plainly replicated (every bank needs all of it, and with
-/// banks on M it has no M extent), so that was a misread, not a reclassification.
-/// Undetermined must fall back to the host, which is the conservative direction.
-static int bankReplicatedTri(Operation *memOp) {
-  if (memOp->getNumResults() == 0)
-    return -1; // a store: nothing to derive, the host's role stands
-  int lane = laneAxisOfOutputTile(memOp);
-  if (lane < 0)
-    return -1; // cannot locate the lane axis, so cannot say
-  SmallVector<Value, 8> work{memOp->getResult(0)};
+/// 1 replicated, 0 bank-partitioned, -1 undetermined (runtime keeps the host role).
+/// A load's own type is never read (see laneAxisOf). Track the dims the loaded value
+/// OCCUPIES through the dataflow to the store and ask whether the store's lane dim is
+/// one of them: expand_dims inserts a dim it does not occupy, reduce deletes one.
+/// TRAP this replaces: reading a rank-2 load directly because it matched the store's
+/// rank flipped kpacked matmul's A to partitioned, 65,537 -> 246 cycles on HBM.
+/// `cellFanout` (out) is how many output cells IN ONE LANE consume a single loaded
+/// value: the product of the output tile's extents over the dims that are neither the
+/// lane axis nor occupied by the value. SIMDRAM computes across the columns of a row,
+/// so an operand feeding F cells must be written into F columns; charging it once per
+/// bank was a 64x discount on matmul (review 2026-09-12). The largest fanout over the
+/// stores a value reaches wins, for the same reason replicated wins below.
+static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
+  if (cellFanout)
+    *cellFanout = 1;
+  if (auto st = dyn_cast<triton::StoreOp>(memOp))
+    return laneAxisOf(st.getValue().getType()) >= 0 ? 0 : 1;
+  if (memOp->getNumResults() != 1)
+    return -1;
+  Value v0 = memOp->getResult(0);
+  auto tt0 = dyn_cast<RankedTensorType>(v0.getType());
+  // Only dims of extent > 1 are occupied: a [BM,1] load is the same value in every
+  // lane along the size-1 dim, so counting it stamped a bias vector partitioned.
+  uint32_t occ0 = 0u;
+  if (tt0)
+    for (int d = 0; d < tt0.getRank(); ++d)
+      if (tt0.getShape()[d] > 1)
+        occ0 |= 1u << d;
+  SmallVector<std::pair<Value, uint32_t>, 16> work{{v0, occ0}};
   llvm::DenseSet<Value> seen;
   int hops = 0;
-  while (!work.empty() && hops++ < 128) {
-    Value v = work.pop_back_val();
-    if (!seen.insert(v).second)
+  // Every store the value reaches gets a verdict; replicated wins because OPERAND is
+  // the charge that never under-bills. First-store-wins stamped a tensor with a
+  // partitioned copy-out and a replicated outer-product use as partitioned.
+  bool anyRep = false, anyPart = false;
+  while (!work.empty() && hops++ < 4096) {
+    auto [cur, occ] = work.pop_back_val();
+    if (!seen.insert(cur).second)
       continue;
-    for (Operation *u : v.getUsers()) {
-      if (auto ed = dyn_cast<triton::ExpandDimsOp>(u))
-        return ((ed.getAxis() == 0 ? 1 : 0) != lane) ? 1 : 0;
-      if (u->getNumResults() == 1)
-        work.push_back(u->getResult(0)); // walk convert_layout and friends
+    for (Operation *u : cur.getUsers()) {
+      if (auto st = dyn_cast<triton::StoreOp>(u)) {
+        if (st.getValue() != cur)
+          continue; // reached through the pointer or mask, not the stored value
+        int lane = laneAxisOf(st.getValue().getType());
+        if (lane < 0)
+          return -1;
+        if ((occ >> lane) & 1u)
+          anyPart = true;
+        else
+          anyRep = true;
+        if (cellFanout) {
+          auto stt = cast<RankedTensorType>(st.getValue().getType());
+          int64_t f = 1;
+          for (int d = 0; d < stt.getRank(); ++d)
+            if (d != lane && !((occ >> d) & 1u))
+              f *= stt.getShape()[d];
+          if (f > *cellFanout)
+            *cellFanout = f;
+        }
+        continue;
+      }
+      if (auto tr = dyn_cast<triton::TransOp>(u)) {
+        // result dim i is source dim order[i]
+        uint32_t nocc = 0;
+        auto order = tr.getOrder();
+        for (unsigned i = 0; i < order.size(); ++i)
+          if ((occ >> order[i]) & 1u)
+            nocc |= 1u << i;
+        work.push_back({tr.getResult(), nocc});
+        continue;
+      }
+      // Ops that move values between dims in ways not tracked here: say so rather
+      // than pass occ through unchanged, which stamped tt.trans wrong.
+      if (isa<triton::ReshapeOp, triton::JoinOp, triton::SplitOp, triton::CatOp>(u))
+        return -1;
+      if (isa<triton::DotOp>(u))
+        return -1; // operand roles inside a dot are not tracked here
+      if (auto ed = dyn_cast<triton::ExpandDimsOp>(u)) {
+        unsigned a = ed.getAxis();
+        uint32_t lo = occ & ((1u << a) - 1), hi = occ >> a;
+        work.push_back({ed.getResult(), lo | (hi << (a + 1))});
+        continue;
+      }
+      if (auto rd = dyn_cast<triton::ReduceOp>(u)) {
+        unsigned a = rd.getAxis();
+        uint32_t lo = occ & ((1u << a) - 1), hi = occ >> (a + 1);
+        for (Value r : rd.getResults())
+          work.push_back({r, lo | (hi << a)});
+        continue;
+      }
+      // The accumulator is loop-carried: its last in-loop user is the yield, and
+      // the store sits outside on the for's RESULT. Cross both edges or every load
+      // that feeds an accumulator comes back undetermined.
+      if (auto y = dyn_cast<scf::YieldOp>(u)) {
+        auto forOp = dyn_cast<scf::ForOp>(y->getParentOp());
+        if (!forOp)
+          continue;
+        for (unsigned i = 0; i < y.getNumOperands(); ++i)
+          if (y.getOperand(i) == cur) {
+            work.push_back({forOp.getResult(i), occ});
+            work.push_back({forOp.getRegionIterArg(i), occ});
+          }
+        continue;
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(u)) { // cur is an init operand
+        auto inits = forOp.getInitArgs();
+        for (unsigned i = 0; i < inits.size(); ++i)
+          if (inits[i] == cur) {
+            work.push_back({forOp.getRegionIterArg(i), occ});
+            work.push_back({forOp.getResult(i), occ});
+          }
+        continue;
+      }
+      if (u->getNumResults() == 1) {
+        // Elementwise or layout-only: occupancy passes through. Anything else is
+        // unknown and stays -1 rather than guessed.
+        StringRef dialect = u->getName().getDialectNamespace();
+        if (dialect == "arith" || dialect == "math" ||
+            isa<triton::gpu::ConvertLayoutOp, triton::BroadcastOp, triton::SplatOp,
+                triton::BitcastOp, triton::FpToFpOp>(u))
+          work.push_back({u->getResult(0), occ});
+        else
+          return -1;
+      }
     }
   }
-  return -1; // no expand_dims to reason from: undetermined, not partitioned
+  if (anyRep)
+    return 1;
+  if (anyPart)
+    return 0;
+  return -1;
 }
 
 namespace {
@@ -845,7 +918,8 @@ struct IMOperandResidencyLayoutPass
       // DERIVED ROLE. Replication is a property of the layout, so read it off the
       // encoding rather than letting the host assert it.
       // scalarSplat is itself a positive determination of replication.
-      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op);
+      int64_t cellFanout = 1;
+      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op, &cellFanout);
 
       SmallVector<NamedAttribute> fields;
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
@@ -854,6 +928,13 @@ struct IMOperandResidencyLayoutPass
       if (bankRep >= 0)
         fields.push_back(b.getNamedAttr("bank_replicated",
                                         b.getBoolAttr(bankRep == 1)));
+      // Cells per lane that one CONSUMED value feeds through a TILE BROADCAST. Sharing
+      // that reaches memory as repeated loads is counted by the runtime from the loads,
+      // so this covers only what never reaches memory. 1 is the identity and the safe
+      // default; only a partitioned (STREAMED) tensor is charged by it.
+      if (cellFanout > 1)
+        fields.push_back(
+            b.getNamedAttr("cell_fanout", b.getI64IntegerAttr(cellFanout)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
       // Is the contraction axis TILED INTO the access shape? A rank-1 load inside
