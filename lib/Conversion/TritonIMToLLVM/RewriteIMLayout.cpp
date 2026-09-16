@@ -92,12 +92,60 @@ static int laneAxisFor(ArrayRef<int64_t> shape, int rank, int64_t bankExtent,
   return -1;
 }
 
+/// The split, stated on the widest tile, mapped onto a tensor of lower rank.
+///
+/// A tt.reduce is the only thing that drops an axis here, and the pass refuses a reduce
+/// over any axis carrying lanes, so the axis it removes is always one the split left at
+/// 1. Projecting is therefore just dropping those entries: a (SPLIT_K, KS, BLOCK_M)
+/// tile split "4,1,8" reduces over KS to a (SPLIT_K, BLOCK_M) store, which is "4,8".
+/// Empty means this tensor is not one the split describes, and the caller falls through.
+static SmallVector<int64_t> projectSplit(ArrayRef<int64_t> split, int rank) {
+  if (split.empty() || rank > (int)split.size())
+    return {};
+  if ((int)split.size() == rank)
+    return SmallVector<int64_t>(split.begin(), split.end());
+  int drop = (int)split.size() - rank;
+  SmallVector<int64_t> out;
+  for (int64_t v : split) {
+    if (v == 1 && drop > 0) {
+      --drop;
+      continue;
+    }
+    out.push_back(v);
+  }
+  return (int)out.size() == rank ? out : SmallVector<int64_t>{};
+}
+
 static Attribute buildIMEncoding(RankedTensorType tensorType,
                                  int threadsPerWarp, int numWarps,
-                                 int bankAxis, int64_t bankExtent = 0) {
+                                 int bankAxis, int64_t bankExtent = 0,
+                                 ArrayRef<int64_t> bankSplit = {}) {
   auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(tensorType.getEncoding());
   if (!blocked)
     return {};
+
+  // Lanes on MORE THAN ONE axis. Everything below places all the banks on a single
+  // axis, which is what a kernel reducing over the other axis needs. A split states a
+  // lane count per axis instead, so a bank owns a slice of the reduction too and holds
+  // only K/split[k] of the operand. That is the tiling shape DCC's tuner picks and the
+  // one thing its search space expresses that ours could not.
+  //
+  // The cross-bank reduction this would otherwise imply is NOT solved here: the pass
+  // refuses a split over any axis a tt.reduce runs on, so the partials must leave the
+  // kernel and be merged by a second one. That merge is real traffic and is measured.
+  SmallVector<int64_t> split = projectSplit(bankSplit, tensorType.getRank());
+  if (!split.empty()) {
+    auto shp = tensorType.getShape();
+    int rk = tensorType.getRank();
+    SmallVector<unsigned> tpw(rk, 1), wpc(rk, 1), spt(rk, 1);
+    for (int d = 0; d < rk; ++d) {
+      tpw[d] = (unsigned)std::max<int64_t>(1, split[d]);
+      spt[d] = std::max<unsigned>(1, llvm::bit_floor((unsigned)(shp[d] / tpw[d])));
+    }
+    return ttg::BlockedEncodingAttr::get(
+        tensorType.getContext(), spt, tpw, wpc,
+        SmallVector<unsigned>(blocked.getOrder()), blocked.getCGALayout());
+  }
 
   auto shape = tensorType.getShape();
   int rank = shape.size();
@@ -175,6 +223,32 @@ struct RewriteIMLayoutPass
 
     // Step 4 lever: which axis carries the banks. Absent = keep the upstream
     // choice, so this is a no-op unless a schedule asks for it.
+    // Per-axis lane counts. Product must be the bank count: every bank still gets
+    // exactly one lane, the split only says which axes they spread over.
+    SmallVector<int64_t> bankSplit;
+    if (auto a = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_split")) {
+      bankSplit.assign(a.asArrayRef().begin(), a.asArrayRef().end());
+      int64_t prod = 1;
+      for (int64_t v : bankSplit) {
+        if (v < 1) {
+          mod.emitError() << "im.bank_split entries must be >= 1";
+          return signalPassFailure();
+        }
+        prod *= v;
+      }
+      if (prod != threadsPerWarp) {
+        mod.emitError() << "im.bank_split product is " << prod << " but this kernel has "
+                        << threadsPerWarp << " banks. Banks-as-threads gives each bank "
+                        << "exactly one lane, so the split must account for all of them.";
+        return signalPassFailure();
+      }
+      if (mod->hasAttr("im.bank_axis")) {
+        mod.emitError() << "im.bank_split and im.bank_axis both set; the split already "
+                        << "says where every lane goes. Drop im.bank_axis.";
+        return signalPassFailure();
+      }
+    }
+
     int bankAxis = -1;
     bool userPinnedBankAxis = false;
     if (auto a = mod->getAttrOfType<IntegerAttr>("im.bank_axis")) {
@@ -219,6 +293,19 @@ struct RewriteIMLayoutPass
         reduceRank = opnd.getRank();
       }
     });
+
+    // A split over an axis something reduces IS the cross-bank reduction. Refuse it
+    // here, naming the fix, rather than asserting in Casting.h three passes later.
+    if (!bankSplit.empty() && !reduceAmbiguous && reduceAxis >= 0 &&
+        reduceRank == (int)bankSplit.size() && bankSplit[reduceAxis] > 1) {
+      mod.emitError()
+          << "im.bank_split puts " << bankSplit[reduceAxis] << " banks on axis "
+          << reduceAxis << ", which a tt.reduce in this kernel reduces over. A bank "
+          << "cannot read another bank's data, so that reduction cannot be expressed. "
+          << "Split the kernel: write the partial sums out, and reduce them in a second "
+          << "kernel whose lanes sit on a different axis.";
+      return signalPassFailure();
+    }
 
     if (userPinnedBankAxis) {
       // THE USER'S CHOICE WINS, but a choice that cannot lower must say so here
@@ -284,7 +371,7 @@ struct RewriteIMLayoutPass
     // on the old encoding, and reconciling the two needs a lane transpose. On a
     // GPU that materialises through shared memory; on PIM it is cross-bank data
     // movement, which the hardware cannot do and the lowering asserts on.
-    if (bankAxis >= 0) {
+    if (bankAxis >= 0 || !bankSplit.empty()) {
       // EVERY distinct encoding, not the first. The operand tiles are ttg.slice views of
       // the rank-3 layout, so a kernel carries several, and replacing one left the module
       // with lanes on N in [BM,BN] and on M in its slices at once. That mix asserts in
@@ -305,7 +392,8 @@ struct RewriteIMLayoutPass
         if (!be || encSubst.count(be))
           return;
         auto rebuilt = dyn_cast_or_null<ttg::BlockedEncodingAttr>(
-            buildIMEncoding(tt, threadsPerWarp, numWarps, bankAxis, bankExtent));
+            buildIMEncoding(tt, threadsPerWarp, numWarps, bankAxis, bankExtent,
+                            bankSplit));
         if (rebuilt && rebuilt != be)
           encSubst.insert({be, rebuilt});
       };
@@ -358,7 +446,7 @@ struct RewriteIMLayoutPass
         return;
 
       Attribute newEnc = buildIMEncoding(tensorType, threadsPerWarp, numWarps,
-                                         bankAxis, bankExtent);
+                                         bankAxis, bankExtent, bankSplit);
       if (newEnc)
         layoutMap[op] = newEnc;
     });

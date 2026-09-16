@@ -184,7 +184,23 @@ struct IMBarrierOpErase
 ///
 /// Data-bus width in bits, the number of values one column command moves once
 /// divided by the element width. Must equal the runtime's cfg_dq_bits.
+/// Default only: the harness states the machine's width as `im.dq_bits`, and the two
+/// targets differ (HBM-PIM moves prefetch*dq = 256 bits per column command, SIMDRAM's
+/// column is a bit-serial slot whose width is dq itself).
 static constexpr unsigned kImDqBits = 128;
+
+/// The bus width this module's vector widths are being chosen for.
+static unsigned imDqBits(Value anchor) {
+  Operation *op = anchor.getDefiningOp();
+  if (!op && anchor.getParentBlock())
+    op = anchor.getParentBlock()->getParentOp();
+  if (op)
+    if (auto mod = op->getParentOfType<ModuleOp>())
+      if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
+        if (a.getInt() > 0)
+          return (unsigned)a.getInt();
+  return kImDqBits;
+}
 
 /// This ensures that within each vector group, either all elements are
 /// active or all are inactive, so we can use a single predicate bit
@@ -215,11 +231,10 @@ struct IMLoadStoreConversionBase {
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     if (pointeeBitWidth == 0)
       return 1;
-    /* kImDqBits is the SAME physical quantity the runtime calls cfg_dq_bits, and it
-       used to be a bare 128 here and a variable there, decided twice with no shared
-       symbol. Named so a grep finds both; the emitted @__pim_dq_bits below lets the
-       runtime compare rather than assume. */
-    return std::min<unsigned>(kImDqBits / pointeeBitWidth, contiguity);
+    /* The SAME physical quantity the runtime calls cfg_dq_bits, and it used to be a
+       bare 128 here and a variable there, decided twice with no shared symbol. The
+       emitted @__pim_dq_bits below lets the runtime compare rather than assume. */
+    return std::min<unsigned>(imDqBits(ptr) / pointeeBitWidth, contiguity);
   }
 
   /// Return the mask alignment — the number of consecutive mask
@@ -872,9 +887,13 @@ static void emitPimLayoutTable(ModuleOp mod) {
   // the same quantity as cfg_dq_bits and used to decide it independently, so a
   // machine configured with a different bus silently priced vectors the compiler
   // never emitted. Stating it lets the runtime say so.
+  int32_t dqBits = (int32_t)kImDqBits;
+  if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
+    if (a.getInt() > 0)
+      dqBits = (int32_t)a.getInt();
   LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                          LLVM::Linkage::External, "__pim_dq_bits",
-                         b.getI32IntegerAttr((int32_t)kImDqBits));
+                         b.getI32IntegerAttr(dqBits));
 
   // Placement policy. Where a tensor lands, and therefore which tensors collide on a
   // bank, was decided entirely by the runtime: a bump allocator in registration order

@@ -74,22 +74,28 @@ namespace ttg_ = mlir::triton::gpu;
 /// encoding this pass can trust: RewriteIMLayout set them directly and
 /// remove-layout-conversions has not run yet, so a load's type still puts the lanes
 /// on its own axis and says nothing about its place in the tile.
-static int laneAxisOf(Type ty) {
+/// Mask of the dims that carry lanes. Usually one bit; im.bank_split places lanes on
+/// several, and then a value can be partitioned along one lane axis and REPLICATED
+/// along another. Returning only the first axis called such a value partitioned and
+/// made its replication free, which is the delivery charge going missing. Identical to
+/// the old single-axis form whenever only one dim carries lanes.
+static uint32_t laneAxisMask(Type ty) {
   auto tt = dyn_cast<RankedTensorType>(ty);
   if (!tt)
-    return -1;
+    return 0u;
   auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
   if (!blocked)
-    return -1;
+    return 0u;
   auto tpw = blocked.getThreadsPerWarp();
+  uint32_t m = 0u;
   for (int d = 0; d < tt.getRank(); ++d)
     if (tpw[d] > 1 && tt.getShape()[d] > 1)
-      return d;
-  return -1;
+      m |= 1u << d;
+  return m;
 }
 
 /// 1 replicated, 0 bank-partitioned, -1 undetermined (runtime keeps the host role).
-/// A load's own type is never read (see laneAxisOf). Track the dims the loaded value
+/// A load's own type is never read (see laneAxisMask). Track the dims the loaded value
 /// OCCUPIES through the dataflow to the store and ask whether the store's lane dim is
 /// one of them: expand_dims inserts a dim it does not occupy, reduce deletes one.
 /// TRAP this replaces: reading a rank-2 load directly because it matched the store's
@@ -104,7 +110,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
   if (cellFanout)
     *cellFanout = 1;
   if (auto st = dyn_cast<triton::StoreOp>(memOp))
-    return laneAxisOf(st.getValue().getType()) >= 0 ? 0 : 1;
+    return laneAxisMask(st.getValue().getType()) != 0u ? 0 : 1;
   if (memOp->getNumResults() != 1)
     return -1;
   Value v0 = memOp->getResult(0);
@@ -131,10 +137,12 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
       if (auto st = dyn_cast<triton::StoreOp>(u)) {
         if (st.getValue() != cur)
           continue; // reached through the pointer or mask, not the stored value
-        int lane = laneAxisOf(st.getValue().getType());
-        if (lane < 0)
+        uint32_t laneM = laneAxisMask(st.getValue().getType());
+        if (laneM == 0u)
           return -1;
-        if ((occ >> lane) & 1u)
+        // Partitioned only if the value occupies EVERY lane axis. Miss one and it is
+        // replicated along it, so every bank on that axis is delivered the value.
+        if ((occ & laneM) == laneM)
           anyPart = true;
         else
           anyRep = true;
@@ -142,7 +150,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
           auto stt = cast<RankedTensorType>(st.getValue().getType());
           int64_t f = 1;
           for (int d = 0; d < stt.getRank(); ++d)
-            if (d != lane && !((occ >> d) & 1u))
+            if (!((laneM >> d) & 1u) && !((occ >> d) & 1u))
               f *= stt.getShape()[d];
           if (f > *cellFanout)
             *cellFanout = f;
