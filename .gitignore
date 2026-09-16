@@ -26,6 +26,12 @@ python/triton/backends/*
 !python/triton/backends/__init__.py
 !python/triton/backends/compiler.py
 !python/triton/backends/driver.py
+# The IM backend is NOT copied from a submodule: it is this project's own source, and the
+# TritonIMToLLVM passes read module attributes that only backends/im/compiler.py sets. With
+# it untracked the passes fall back to a 128-bit bus and single-axis lane placement without
+# saying so, which is a fresh clone silently reproducing different numbers.
+!python/triton/backends/im/
+python/triton/backends/im/__pycache__/
 
 # Language extras
 python/triton/language/extra/*
