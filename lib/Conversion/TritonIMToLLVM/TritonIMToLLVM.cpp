@@ -914,6 +914,9 @@ static void emitPimLayoutTable(ModuleOp mod) {
   emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");
   emitPolicy("im.placement_align", "__pim_placement_align");
+  // Cells one lane keeps live across a reduction, the widest loop-carried accumulator.
+  // 0 when no store drains one, which is every elementwise kernel.
+  emitPolicy("im.acc_cells_per_lane", "__pim_acc_cells_per_lane");
 
   // The lane count the kernel was compiled for. The runtime divides the SIMDRAM
   // occupancy by its configured bank count and the harness replays num_banks lanes;

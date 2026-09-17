@@ -572,6 +572,91 @@ static int64_t liveSplitFactor(triton::StoreOp st) {
   return best / storedCells;
 }
 
+/// Cells ONE LANE holds of the accumulator a store drains, 0 when nothing accumulates.
+/// This is what the register file keeps live across a reduction, so it is what a GRF
+/// bound compares against.
+///
+/// TWO shapes reach it. A loop-carried accumulator (scf.for iter_arg) is the widest
+/// carried tile. A single-shot reduce -- tl.sum over a tile with no carry, which is what
+/// the persistent matvec, matmul and conv kernels emit, and what canonicalize leaves when
+/// a reduction loop has trip count 1 -- keeps the STORED tile live instead, so that is
+/// the figure. Taking only the carried form reported 0 for those kernels and the bound
+/// never fired on them.
+///
+/// An elementwise store (VA, RELU) neither carries nor reduces and reports 0: it streams
+/// through the ALU without occupying the accumulator file.
+///
+/// KNOWN GAP: MAX across stores and across carried values, so two accumulators live in
+/// one loop are undercounted. No kernel here does that; a bound that must be exact for
+/// such a kernel needs the live set, not the widest member.
+static int64_t accCellsPerLane(triton::StoreOp st) {
+  auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
+  if (!storedTy)
+    return 0;
+  // Lanes come off the carried tensor's own encoding; the stored type stands in when
+  // the carried value has none, and no layout anywhere means one lane holds it all.
+  auto perLane = [&](RankedTensorType rt) -> int64_t {
+    auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(rt.getEncoding());
+    if (!blocked)
+      blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(storedTy.getEncoding());
+    int64_t cells = 1;
+    for (int d = 0; d < rt.getRank(); ++d) {
+      int64_t tpw = 1;
+      if (blocked && d < (int)blocked.getThreadsPerWarp().size())
+        tpw = blocked.getThreadsPerWarp()[d];
+      cells *= (rt.getShape()[d] + tpw - 1) / tpw;
+    }
+    return cells;
+  };
+  SmallVector<Value, 16> work{st.getValue()};
+  DenseSet<Value> seen;
+  int64_t best = 0;
+  int hops = 0;
+  while (!work.empty() && hops++ < 256) {
+    Value v = work.pop_back_val();
+    if (!v || !seen.insert(v).second)
+      continue;
+    auto res = dyn_cast<OpResult>(v);
+    if (!res)
+      continue;
+    Operation *def = res.getOwner();
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      auto rt = dyn_cast<RankedTensorType>(
+          forOp.getRegionIterArg(res.getResultNumber()).getType());
+      if (rt && !isa<triton::PointerType>(rt.getElementType())) {
+        int64_t c = perLane(rt);
+        if (c > best)
+          best = c;
+      }
+      continue;
+    }
+    for (Value o : def->getOperands())
+      work.push_back(o);
+  }
+  if (best > 0)
+    return best;
+  // No carry. If a reduce feeds the store, the stored tile is the accumulator.
+  SmallVector<Value, 16> w2{st.getValue()};
+  DenseSet<Value> seen2;
+  hops = 0;
+  while (!w2.empty() && hops++ < 256) {
+    Value v = w2.pop_back_val();
+    if (!v || !seen2.insert(v).second)
+      continue;
+    auto res = dyn_cast<OpResult>(v);
+    if (!res)
+      continue;
+    Operation *def = res.getOwner();
+    if (isa<triton::ReduceOp>(def))
+      return perLane(storedTy);
+    if (isa<scf::ForOp>(def))
+      continue;
+    for (Value o : def->getOperands())
+      w2.push_back(o);
+  }
+  return 0;
+}
+
 /// Footprint of the whole address: walk the addptr chain back to the kernel
 /// pointer argument, summing every offset on the way.
 ///
@@ -1035,6 +1120,17 @@ struct IMOperandResidencyLayoutPass
     }
 
     // llvm::outs() << "\n\n\n I was here meshtag \n\n\n";
+
+    // The widest loop-carried accumulator per lane, for the runtime's register-file
+    // bound. One number at module level because the machine has one GRF_B per bank.
+    int64_t accCells = 0;
+    mod.walk([&](triton::StoreOp st) {
+      int64_t c = accCellsPerLane(st);
+      if (c > accCells)
+        accCells = c;
+    });
+    if (accCells > 0)
+      mod->setAttr("im.acc_cells_per_lane", b.getI64IntegerAttr(accCells));
 
     // Provenance. A reported number has to be able to say whether it came from
     // the classifier or from a forced schedule.
