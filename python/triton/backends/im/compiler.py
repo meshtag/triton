@@ -250,6 +250,8 @@ class IMBackend(BaseBackend):
 
         builder = ir.builder(mod.context)
         # ── IM-specific module attributes (clean, readable names) ──
+        # Documentation only, for IR dumps: the lowering takes the bank count
+        # from ttg.threads-per-warp, nothing reads this attribute.
         mod.set_attr("im.num-banks", builder.get_int32_attr(options.num_banks))
         mod.set_attr("im.arch", builder.get_string_attr(options.arch))
         # Step 4 schedule channel. The pass rejects a malformed or unmatched
@@ -260,8 +262,10 @@ class IMBackend(BaseBackend):
         if options.im_bg_interleave:
             mod.set_attr("im.bg_interleave", builder.parse_attr("1 : i64"))
         if options.im_persistent:
+            # im.noalias_args is NOT re-stamped here: it has to be set before
+            # make_ttir (above) because triton-licm reads it there, and the
+            # module keeps it.
             mod.set_attr("im.persistent", builder.parse_attr("1 : i64"))
-            mod.set_attr("im.noalias_args", builder.parse_attr("1 : i64"))
         _SCHEMES = {"striped": 1, "interleaved": 2}
         _ALIGNS = {"dq": 1, "global-row": 2}
         if options.im_layout_scheme not in _SCHEMES:

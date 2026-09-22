@@ -248,16 +248,6 @@ struct IMLoadStoreConversionBase {
 protected:
   ModuleAxisInfoAnalysis &axisAnalysisPass;
 
-  /// Build a zero-valued LLVM vector constant.  Used as the `other`
-  /// (false-value) default when no explicit `other` operand is given
-  /// on a masked load.
-  static Value createZeroVector(OpBuilder &builder, Location loc,
-                                VectorType vecTy) {
-    auto zeroAttr = builder.getZeroAttr(vecTy.getElementType());
-    auto denseVal = DenseElementsAttr::get(cast<ShapedType>(vecTy), zeroAttr);
-    return LLVM::ConstantOp::create(builder, loc, vecTy, denseVal);
-  }
-
   /// Pack `elems[start .. start+vec-1]` into an LLVM vector value.
   /// Used to build the `other` vector for masked loads and the value
   /// vector for stores.
@@ -939,18 +929,10 @@ struct ConvertTritonIMToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    // Read the number of PIM banks from the IM-specific module attribute.
-    // (The compiler also sets ttg.threads-per-warp = num_banks so that
-    // TritonGPU's BlockedEncodingAttr distributes elements across banks,
-    // but our code reads the canonical "im.num-banks" attribute directly.)
-    unsigned numBanks = 1;
-    if (auto attr = mod->getAttrOfType<IntegerAttr>("im.num-banks"))
-      numBanks = attr.getInt();
-
     // Before conversion: it drops the discardable im.residency attrs.
     emitPimLayoutTable(mod);
 
-    triton::im::TargetInfo targetInfo(numBanks);
+    triton::im::TargetInfo targetInfo;
 
     // -- Allocation: analyze shared-memory needs (which IM has none of,
     //    but TritonGPU's shared lowering patterns invoke
