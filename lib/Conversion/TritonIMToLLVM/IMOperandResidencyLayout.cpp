@@ -94,7 +94,29 @@ static uint32_t laneAxisMask(Type ty) {
   return m;
 }
 
-/// 1 replicated, 0 bank-partitioned, -1 undetermined (runtime keeps the host role).
+/// How many banks receive a copy of one value: the product of the lane extents over the
+/// lane axes the value does NOT occupy. 1 means bank-partitioned. This is the MAGNITUDE
+/// that the replicated/partitioned verdict below was missing: with a single-axis split the
+/// two agree (miss the one lane axis and every bank gets a copy), but a multi-axis split
+/// like 2 on M and 16 on N has a value occupying N replicated over only the 2 M lanes, and
+/// calling that "replicated" charged it to all 32. Measured on OptiPIM's own mapping for
+/// matmul 128x128x64: B cost 16,384 operand writes where 1,024 is the delivery it needs.
+static int64_t laneReplicationFactor(Type ty, uint32_t occ) {
+  auto tt = dyn_cast<RankedTensorType>(ty);
+  if (!tt)
+    return 1;
+  auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
+  if (!blocked)
+    return 1;
+  auto tpw = blocked.getThreadsPerWarp();
+  int64_t f = 1;
+  for (int d = 0; d < tt.getRank(); ++d)
+    if (tpw[d] > 1 && tt.getShape()[d] > 1 && !((occ >> d) & 1u))
+      f *= tpw[d];
+  return f;
+}
+
+/// >1 replicated over that many banks, 0 bank-partitioned, -1 undetermined.
 /// A load's own type is never read (see laneAxisMask). Track the dims the loaded value
 /// OCCUPIES through the dataflow to the store and ask whether the store's lane dim is
 /// one of them: expand_dims inserts a dim it does not occupy, reduce deletes one.
@@ -129,6 +151,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
   // the charge that never under-bills. First-store-wins stamped a tensor with a
   // partitioned copy-out and a replicated outer-product use as partitioned.
   bool anyRep = false, anyPart = false;
+  int64_t repFactor = 1;
   while (!work.empty() && hops++ < 4096) {
     auto [cur, occ] = work.pop_back_val();
     if (!seen.insert(cur).second)
@@ -142,10 +165,15 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
           return -1;
         // Partitioned only if the value occupies EVERY lane axis. Miss one and it is
         // replicated along it, so every bank on that axis is delivered the value.
-        if ((occ & laneM) == laneM)
+        if ((occ & laneM) == laneM) {
           anyPart = true;
-        else
+        } else {
           anyRep = true;
+          // The largest over the stores a value reaches, matching "replicated wins".
+          int64_t f = laneReplicationFactor(st.getValue().getType(), occ);
+          if (f > repFactor)
+            repFactor = f;
+        }
         if (cellFanout) {
           auto stt = cast<RankedTensorType>(st.getValue().getType());
           int64_t f = 1;
@@ -223,7 +251,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
     }
   }
   if (anyRep)
-    return 1;
+    return (int)repFactor;   // banks that receive a copy, >= 2 here
   if (anyPart)
     return 0;
   return -1;
@@ -1018,9 +1046,12 @@ struct IMOperandResidencyLayoutPass
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
       // OMIT on -1. The emitter defaults the record word to -1, which the runtime
       // reads as "no compiler decision, keep the host's role".
+      // The VALUE is how many banks receive a copy: 0 partitioned, >1 replicated over
+      // that many. It used to be a bool, which charged every replicated tensor to all
+      // 32 banks even when the split replicated it over 2.
       if (bankRep >= 0)
         fields.push_back(b.getNamedAttr("bank_replicated",
-                                        b.getBoolAttr(bankRep == 1)));
+                                        b.getI32IntegerAttr(bankRep)));
       // Cells per lane that one CONSUMED value feeds through a TILE BROADCAST. Sharing
       // that reaches memory as repeated loads is counted by the runtime from the loads,
       // so this covers only what never reaches memory. 1 is the identity and the safe

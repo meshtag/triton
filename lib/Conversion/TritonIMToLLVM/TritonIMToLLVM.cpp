@@ -785,8 +785,12 @@ static void emitPimLayoutTable(ModuleOp mod) {
     StringRef cls = clsAttr.getValue();
     e.concreteClass = cls == "BroadcastReplicate" ||
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
-    if (auto br = dict.getAs<BoolAttr>("bank_replicated"))
-      e.bankReplicated = br.getValue() ? 1 : 0;
+    // Integer now: 0 partitioned, >1 the number of banks that receive a copy. The bool
+    // form is still read so an artifact built before this change keeps its meaning.
+    if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
+      e.bankReplicated = (int32_t)br.getInt();
+    else if (auto bb = dict.getAs<BoolAttr>("bank_replicated"))
+      e.bankReplicated = bb.getValue() ? 1 : 0;
     if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
       ArrayRef<int64_t> v = fp.asArrayRef();
       if (v.size() % kAxisWords == 0 &&
