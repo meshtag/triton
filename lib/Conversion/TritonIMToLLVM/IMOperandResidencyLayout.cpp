@@ -614,9 +614,9 @@ static int64_t liveSplitFactor(triton::StoreOp st) {
 /// An elementwise store (VA, RELU) neither carries nor reduces and reports 0: it streams
 /// through the ALU without occupying the accumulator file.
 ///
-/// KNOWN GAP: MAX across stores and across carried values, so two accumulators live in
-/// one loop are undercounted. No kernel here does that; a bound that must be exact for
-/// such a kernel needs the live set, not the widest member.
+/// Every tensor one loop carries is live at once, so a loop's figure is the SUM of its
+/// carried tiles, and the widest loop wins. Taking the widest carried value admitted an
+/// interchanged GEMV holding four 128-cell accumulators as 128.
 static int64_t accCellsPerLane(triton::StoreOp st) {
   auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
   if (!storedTy)
@@ -649,13 +649,18 @@ static int64_t accCellsPerLane(triton::StoreOp st) {
       continue;
     Operation *def = res.getOwner();
     if (auto forOp = dyn_cast<scf::ForOp>(def)) {
-      auto rt = dyn_cast<RankedTensorType>(
-          forOp.getRegionIterArg(res.getResultNumber()).getType());
-      if (rt && !isa<triton::PointerType>(rt.getElementType())) {
-        int64_t c = perLane(rt);
-        if (c > best)
-          best = c;
+      // Float carries only, and the one reaching the store: an integer offset carried
+      // beside the accumulator lives in the host's registers, not GRF_B.
+      int64_t live = 0;
+      Value stored = forOp.getRegionIterArg(res.getResultNumber());
+      for (Value arg : forOp.getRegionIterArgs()) {
+        auto rt = dyn_cast<RankedTensorType>(arg.getType());
+        if (rt && !isa<triton::PointerType>(rt.getElementType()) &&
+            (isa<FloatType>(rt.getElementType()) || arg == stored))
+          live += perLane(rt);
       }
+      if (live > best)
+        best = live;
       continue;
     }
     for (Value o : def->getOperands())

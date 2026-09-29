@@ -336,6 +336,44 @@ struct RewriteIMLayoutPass
                    IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
     }
 
+    // Nothing stated and no rank-2 reduce decided: banks on the output's outermost axis
+    // when every store can hold them, so the contiguous axis stays inside a lane and its
+    // loads vectorize. Other tensors take the lanes on the first dim of that extent, so
+    // the rule declines when that dim is a higher-rank reduce's axis. Opt-in, because
+    // every other path was measured on the upstream layout.
+    if (bankAxis < 0 && bankSplit.empty() && !reduceAmbiguous &&
+        mod->hasAttr("im.derive_bank_axis")) {
+      bool any = false, all = true;
+      int64_t extent = 0;
+      mod.walk([&](triton::StoreOp st) {
+        auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
+        if (!tt || tt.getRank() < 2)
+          return;
+        any = true;
+        extent = tt.getShape()[0];
+        all &= tt.getShape()[0] >= threadsPerWarp;
+      });
+      bool hitsReduce = false;
+      mod.walk([&](triton::ReduceOp red) {
+        auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+        if (!opnd || opnd.getRank() < 3)
+          return;
+        auto shp = opnd.getShape();
+        for (int d = 0; d < opnd.getRank(); ++d)
+          if (shp[d] == extent) {
+            hitsReduce |= d == (int)red.getAxis();
+            break;
+          }
+      });
+      if (any && all && !hitsReduce) {
+        bankAxis = 0;
+        mod->setAttr("im.bank-axis-from-shape",
+                     IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
+      } else if (any) {
+        mod->setAttr("im.bank-axis-derive-declined", UnitAttr::get(mod.getContext()));
+      }
+    }
+
     // The choice is stated on the OUTPUT's rank, so every other tensor's placement is
     // mapped from it by position. Without this anchor the same index means the row dim
     // in [M,K] and the reduction in [K,N].

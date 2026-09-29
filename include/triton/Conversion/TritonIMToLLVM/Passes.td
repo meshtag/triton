@@ -108,4 +108,69 @@ def IMTileBoundary : Pass<"im-tile-boundary", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::LLVM::LLVMDialect"];
 }
 
+// Marks reductions that fold the lanes of one DRAM column, so the trace runtime can
+// price a cost no memory access represents.
+def IMLaneFold : Pass<"im-lane-fold", "mlir::ModuleOp"> {
+  let summary = "Call __pim_trace_fold(steps, outputs) after each in-column reduce";
+  let description = [{
+    Only runs when the module carries `im.price_folds`. A reduce whose axis is the
+    layout's contiguous axis within a lane adds values that shared a DRAM column,
+    which the lane-parallel PIM MAC cannot do: it is a tree of log2(values) steps.
+    The call after the reduce reports the steps and the outputs per lane. A reduce
+    along any other axis is MAC accumulation across columns and is not marked.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::LLVM::LLVMDialect"];
+}
+
+// Marks loads a ReLU consumes, so the dcc-parity runtime issues them as PIM_RELU.
+def IMReluOpcode : Pass<"im-relu-opcode", "mlir::ModuleOp"> {
+  let summary = "Bracket each ReLU-only load with __pim_trace_op calls";
+  let description = [{
+    Only runs when the module carries `im.dcc_relu_opcode`. A load whose only use,
+    through float casts, is a max against zero is bracketed by
+    `__pim_trace_op(1)` and `__pim_trace_op(0)`, so the runtime issues its reads as
+    DCC's PIM_RELU. This adopts DCC's pricing of ReLU, which their simulator does not
+    space on the command bus.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::LLVM::LLVMDialect"];
+}
+
+// Groups a loop's loads by tensor, n unrolled iterations at a time.
+def IMLoadCluster : Pass<"im-load-cluster", "mlir::ModuleOp"> {
+  let summary = "Unroll a two-tensor loop and group each strip's loads by argument";
+  let description = [{
+    Only runs when the module carries `im.cluster_loads = n`, the register-file entries
+    per lane. An innermost scf.for with a constant trip count whose body loads two or
+    more kernel arguments, stores none of them and touches memory no other way is
+    unrolled by G, the largest proper divisor of its trip count whose G iterations of
+    any one argument fit n entries. Each strip's loads are grouped by argument, so a
+    DRAM row stays open for G loads. With `im.cluster_serpentine` the body holds two
+    strips and the second takes the arguments in reverse. Reads the lane layout.
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
+}
+
+def IMReductionDistribute : Pass<"im-reduction-distribute", "mlir::ModuleOp"> {
+  let summary = "Interchange a reduction loop with the sum of loads it accumulates";
+  let description = [{
+    Only runs when the module carries `im.distribute_reductions`. A loop whose only
+    carried value is acc and whose body yields acc + (x + z), with x and z each built
+    from loads and independent of acc, becomes two loops, one adding x and one adding z.
+    Reassociates the floating-point sum.
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
+}
+
+def IMOperandHoist : Pass<"im-operand-hoist", "mlir::ModuleOp"> {
+  let summary = "Fully unroll a reduction loop so its tile-invariant operand can be hoisted";
+  let description = [{
+    Only runs when the module carries `im.hoist_operand_regs = n`. An innermost scf.for
+    with a constant trip count T, inside another loop, whose loads depend on nothing in
+    the outer loop but its own induction variable, is fully unrolled when T copies of
+    those loads fit n register-file entries per lane. triton-licm then hoists them above
+    the outer loop. Runs after rewrite-im-layout, because the count reads the layout.
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

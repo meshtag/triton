@@ -1,5 +1,10 @@
 add_triton_library(TritonIMToLLVM
     IMOperandResidencyLayout.cpp
+    IMLaneFold.cpp
+    IMLoadCluster.cpp
+    IMOperandHoist.cpp
+    IMReductionDistribute.cpp
+    IMReluOpcode.cpp
     IMTileBoundary.cpp
     RewriteIMLayout.cpp
     TargetInfo.cpp

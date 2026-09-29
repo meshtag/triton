@@ -110,6 +110,9 @@ class IMOptions:
     # where each tensor starts: "dq" packs tensors so they share rows but land on
     # different banks, "global-row" starts every tensor at bank 0, which hot-spots
     # small tensors and measured 3.2x worse on one conv shape. Both are levers now.
+    # "row-pack" gives lane-placed tensors their exact per-lane share of one column space,
+    # so a kernel's small tensors share rows the way DCC packs its vectors. The dcc-parity
+    # runtime honours it, and a lane that touches more than its share fails coverage.
     # Persistent kernel: the grid stops being the work decomposition and one program
     # instance loops over several tiles. Marks the module so im-tile-boundary knows
     # which loop to signal; without it the trace runtime sees the whole replay as one
@@ -130,6 +133,29 @@ class IMOptions:
     # split over an axis the kernel reduces is refused by rewrite-im-layout: that is
     # a cross-bank reduction, and the partials have to leave the kernel instead.
     im_bank_split: str = ""
+    # Price in-column reduction folds (im-lane-fold). Only the dcc-parity runtime defines
+    # the call it inserts, so it is off unless a DCC harness asks for it.
+    im_price_folds: bool = False
+    # With no im_bank_split or im_bank_axis, let rewrite-im-layout put the banks on the
+    # output's outermost axis instead of keeping the upstream layout. Off by default for
+    # the same reason: other paths were measured on the upstream layout.
+    im_derive_bank_axis: bool = False
+    # Loads a ReLU consumes issue as DCC's PIM_RELU (im-relu-opcode). Adopts DCC's pricing,
+    # which their simulator does not space on the command bus. Only the dcc-parity runtime
+    # defines the call, so it is off unless a DCC harness asks for it.
+    im_dcc_relu_opcode: bool = False
+    # Group a two-tensor loop's loads by tensor (im-load-cluster), in strips that fit this
+    # many register-file entries per lane. 0 leaves loop bodies as written.
+    im_cluster_loads: int = 0
+    # Two strips per unrolled body, the second taking the tensors in reverse order.
+    im_cluster_serpentine: bool = False
+    # Split acc += x + z into a loop adding x and a loop adding z (im-reduction-distribute).
+    # Reassociates the floating-point sum.
+    im_distribute_reductions: bool = False
+    # Operand register-file entries per lane (GRF_A, 8 on HBM-PIM). A reduction loop whose
+    # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
+    # loop (im-operand-hoist). 0 leaves the loops as written.
+    im_hoist_operand_regs: int = 0
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -140,7 +166,12 @@ class IMOptions:
                 f"-bgi:{int(self.im_bg_interleave)}"
                 f"-lay:{self.im_layout_scheme}-align:{self.im_placement_align}"
                 f"-persist:{int(self.im_persistent)}-row:{int(self.im_row_values)}"
-                f"-dq:{int(self.im_dq_bits)}-split:{self.im_bank_split or 'none'}")
+                f"-dq:{int(self.im_dq_bits)}-split:{self.im_bank_split or 'none'}"
+                f"-fold:{int(self.im_price_folds)}-dax:{int(self.im_derive_bank_axis)}"
+                f"-relu:{int(self.im_dcc_relu_opcode)}-clu:{int(self.im_cluster_loads)}"
+                f"-hoist:{int(self.im_hoist_operand_regs)}"
+                f"-serp:{int(self.im_cluster_serpentine)}"
+                f"-dist:{int(self.im_distribute_reductions)}")
 
 
 class IMBackend(BaseBackend):
@@ -206,17 +237,17 @@ class IMBackend(BaseBackend):
             "cse",
         ]
 
-        if options.im_persistent:
+        if options.im_persistent or options.im_hoist_operand_regs or options.im_cluster_loads:
             # MUST be set here, not in make_ttgir: triton-licm runs in THIS stage,
             # and it is the only pass in the pipeline that hoists loads. Setting it
             # later meant the attribute existed but nothing had read it.
             #
-            # Licenses triton-licm to hoist a load out of a loop that writes, when
-            # the write provably lands on a different kernel pointer argument. Safe
-            # here because pim_register_tensor refuses overlapping tensors, so two
-            # pointer arguments are always distinct buffers. Named separately from
-            # im.persistent so the assumption is visible in the IR rather than
-            # implied by the kernel shape.
+            # Licenses triton-licm, and im-load-cluster's reordering, to move a load
+            # past a write that lands on a different kernel pointer argument. The
+            # dcc-parity runtime's pim_register_tensor refuses overlapping tensors, so
+            # there two pointer arguments are distinct buffers. The default runtime does
+            # not check, and a caller passing aliased buffers gets wrong results. Named
+            # separately from im.persistent so the assumption is visible in the IR.
             mod.set_attr("im.noalias_args",
                          ir.builder(mod.context).parse_attr("1 : i64"))
 
@@ -266,8 +297,27 @@ class IMBackend(BaseBackend):
             # make_ttir (above) because triton-licm reads it there, and the
             # module keeps it.
             mod.set_attr("im.persistent", builder.parse_attr("1 : i64"))
+        if options.im_price_folds:
+            mod.set_attr("im.price_folds", builder.parse_attr("1 : i64"))
+        if options.im_derive_bank_axis:
+            mod.set_attr("im.derive_bank_axis", builder.parse_attr("1 : i64"))
+        if options.im_dcc_relu_opcode:
+            mod.set_attr("im.dcc_relu_opcode", builder.parse_attr("1 : i64"))
+        if options.im_cluster_loads:
+            mod.set_attr("im.cluster_loads",
+                         builder.parse_attr(f"{int(options.im_cluster_loads)} : i64"))
+        if options.im_cluster_serpentine:
+            mod.set_attr("im.cluster_serpentine", builder.parse_attr("1 : i64"))
+        if options.im_distribute_reductions:
+            mod.set_attr("im.distribute_reductions", builder.parse_attr("1 : i64"))
+        if options.im_hoist_operand_regs:
+            if int(options.im_hoist_operand_regs) < 1:
+                raise ValueError(
+                    f"im_hoist_operand_regs={options.im_hoist_operand_regs!r}; must be positive")
+            mod.set_attr("im.hoist_operand_regs",
+                         builder.parse_attr(f"{int(options.im_hoist_operand_regs)} : i64"))
         _SCHEMES = {"striped": 1, "interleaved": 2}
-        _ALIGNS = {"dq": 1, "global-row": 2}
+        _ALIGNS = {"dq": 1, "global-row": 2, "row-pack": 3}
         if options.im_layout_scheme not in _SCHEMES:
             raise ValueError(
                 f"im_layout_scheme={options.im_layout_scheme!r}; "
@@ -323,6 +373,12 @@ class IMBackend(BaseBackend):
             f"threads-per-warp={options.num_banks} "
             f"num-ctas={options.num_ctas}}}",
             "rewrite-im-layout",
+            "im-operand-hoist",
+            "triton-licm",
+            "canonicalize",
+            "cse",
+            "im-reduction-distribute",
+            "im-load-cluster",
             "im-operand-residency-layout",
             "tritongpu-remove-layout-conversions",
             "tritongpu-reduce-data-duplication",
@@ -343,6 +399,22 @@ class IMBackend(BaseBackend):
         )
         if "rewrite-im-layout" not in skip:
             passes.convert.add_rewrite_im_layout(pm)
+        # The count of what fits reads the lane layout, so this cannot run in make_ttir
+        # beside the other triton-licm.
+        if options.im_hoist_operand_regs and "im-operand-hoist" not in skip:
+            passes.convert.add_im_operand_hoist(pm)
+            if "triton-licm" not in skip:
+                passes.ttir.add_triton_licm(pm)
+                # Folds the trip-count guard licm puts on each hoisted load. Left in,
+                # tritongpu-remove-layout-conversions rebuilds the masked loads and drops
+                # their im.residency, so x loses its lane placement.
+                passes.common.add_canonicalizer(pm)
+                passes.common.add_cse(pm)
+        # Both count or place against the lane layout, so they follow rewrite-im-layout.
+        if "im-reduction-distribute" not in skip:
+            passes.convert.add_im_reduction_distribute(pm)
+        if "im-load-cluster" not in skip:
+            passes.convert.add_im_load_cluster(pm)
         if "im-operand-residency-layout" not in skip:
             passes.convert.add_im_operand_residency_layout(pm)
         if "tritongpu-remove-layout-conversions" not in skip:
@@ -389,6 +461,10 @@ class IMBackend(BaseBackend):
         # Membar.cpp, so persistent cycle numbers are quotable again.
         if "im-tile-boundary" not in skip:
             passes.convert.add_im_tile_boundary(pm)
+        if "im-lane-fold" not in skip:
+            passes.convert.add_im_lane_fold(pm)
+        if "im-relu-opcode" not in skip:
+            passes.convert.add_im_relu_opcode(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_convert_triton_im_to_llvm(pm)
         passes.convert.add_index_to_llvmir(pm)

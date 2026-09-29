@@ -20,6 +20,11 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonIMToLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createRewriteIMLayoutPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMOperandResidencyLayoutPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMTileBoundaryPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMLaneFoldPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMReluOpcodePass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMLoadClusterPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMOperandHoistPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMReductionDistributePass();
 
 #define GEN_PASS_REGISTRATION
 #include "triton/Conversion/TritonIMToLLVM/Passes.h.inc"

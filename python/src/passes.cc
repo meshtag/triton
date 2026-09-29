@@ -142,6 +142,11 @@ void init_triton_passes_convert(py::module &&m) {
                      triton::im::createRewriteIMLayoutPass);
   ADD_PASS_WRAPPER_0("add_im_tile_boundary",
                      triton::im::createIMTileBoundaryPass);
+  ADD_PASS_WRAPPER_0("add_im_lane_fold", triton::im::createIMLaneFoldPass);
+  ADD_PASS_WRAPPER_0("add_im_relu_opcode", triton::im::createIMReluOpcodePass);
+  ADD_PASS_WRAPPER_0("add_im_load_cluster", triton::im::createIMLoadClusterPass);
+  ADD_PASS_WRAPPER_0("add_im_operand_hoist", triton::im::createIMOperandHoistPass);
+  ADD_PASS_WRAPPER_0("add_im_reduction_distribute", triton::im::createIMReductionDistributePass);
   ADD_PASS_WRAPPER_0("add_im_operand_residency_layout",
                      triton::im::createIMOperandResidencyLayoutPass);
 }
