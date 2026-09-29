@@ -153,6 +153,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::im::registerIMLoadClusterPass();
   mlir::triton::im::registerIMOperandHoistPass();
   mlir::triton::im::registerIMReductionDistributePass();
+  mlir::triton::im::registerIMDccTileMacPass();
 
   mlir::triton::proton::registerConvertProtonToProtonGPU();
   mlir::triton::proton::gpu::registerConvertProtonNvidiaGPUToLLVM();

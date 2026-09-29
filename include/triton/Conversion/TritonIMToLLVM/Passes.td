@@ -173,4 +173,15 @@ def IMOperandHoist : Pass<"im-operand-hoist", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
 }
 
+def IMDccTileMac : Pass<"im-dcc-tile-mac", "mlir::ModuleOp"> {
+  let summary = "Select DCC's tile MAC for a contraction whose per-lane tile is one";
+  let description = [{
+    Only runs when the module carries `im.dcc_tile_mac`. A reduce over load * broadcast
+    whose load keeps one column of outputs lane-fastest and whole tiles of the reduce axis
+    next is stamped with the column reads one DCC MAC_OP1 covers. Every load of that
+    argument must qualify. Adopts DCC's ISA pricing, a convention of the DCC path.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

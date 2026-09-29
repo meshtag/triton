@@ -152,6 +152,9 @@ class IMOptions:
     # Split acc += x + z into a loop adding x and a loop adding z (im-reduction-distribute).
     # Reassociates the floating-point sum.
     im_distribute_reductions: bool = False
+    # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
+    # issues one command per tile, their ISA's pricing, a convention of the DCC path.
+    im_dcc_tile_mac: bool = False
     # Operand register-file entries per lane (GRF_A, 8 on HBM-PIM). A reduction loop whose
     # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
     # loop (im-operand-hoist). 0 leaves the loops as written.
@@ -171,7 +174,8 @@ class IMOptions:
                 f"-relu:{int(self.im_dcc_relu_opcode)}-clu:{int(self.im_cluster_loads)}"
                 f"-hoist:{int(self.im_hoist_operand_regs)}"
                 f"-serp:{int(self.im_cluster_serpentine)}"
-                f"-dist:{int(self.im_distribute_reductions)}")
+                f"-dist:{int(self.im_distribute_reductions)}"
+                f"-tilemac:{int(self.im_dcc_tile_mac)}")
 
 
 class IMBackend(BaseBackend):
@@ -310,6 +314,8 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.cluster_serpentine", builder.parse_attr("1 : i64"))
         if options.im_distribute_reductions:
             mod.set_attr("im.distribute_reductions", builder.parse_attr("1 : i64"))
+        if options.im_dcc_tile_mac:
+            mod.set_attr("im.dcc_tile_mac", builder.parse_attr("1 : i64"))
         if options.im_hoist_operand_regs:
             if int(options.im_hoist_operand_regs) < 1:
                 raise ValueError(
@@ -463,6 +469,8 @@ class IMBackend(BaseBackend):
             passes.convert.add_im_tile_boundary(pm)
         if "im-lane-fold" not in skip:
             passes.convert.add_im_lane_fold(pm)
+        if "im-dcc-tile-mac" not in skip:
+            passes.convert.add_im_dcc_tile_mac(pm)
         if "im-relu-opcode" not in skip:
             passes.convert.add_im_relu_opcode(pm)
         passes.convert.add_scf_to_cf(pm)

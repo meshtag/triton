@@ -920,6 +920,40 @@ static void emitPimLayoutTable(ModuleOp mod) {
                          b.getI32IntegerAttr((int32_t)ttg::TritonGPUDialect::getThreadsPerWarp(mod)));
 }
 
+// DCC's tile MAC per tensor, [operand_arg, reads per MAC] pairs, only when the module
+// asked for it (im-dcc-tile-mac). Absent otherwise, so the default artifact is unchanged.
+static void emitDccTileMac(ModuleOp mod) {
+  if (!mod->hasAttr("im.dcc_tile_mac"))
+    return;
+  llvm::MapVector<int64_t, int32_t> byArg;
+  mod.walk([&](triton::LoadOp ld) {
+    auto stamp = ld->getAttrOfType<DenseI64ArrayAttr>("im.dcc-tile-mac");
+    auto res = dyn_cast_or_null<DictionaryAttr>(ld->getDiscardableAttr("im.residency"));
+    auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
+    if (stamp && arg && arg.getInt() >= 0)
+      byArg[arg.getInt()] = (int32_t)stamp.asArrayRef()[2];
+  });
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  if (!byArg.empty()) {
+    SmallVector<int32_t> flat;
+    for (const auto &kv : byArg) {
+      flat.push_back((int32_t)kv.first);
+      flat.push_back(kv.second);
+    }
+    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
+                           "__pim_dcc_tile_mac",
+                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  }
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_dcc_tile_mac_count",
+                         b.getI32IntegerAttr((int32_t)byArg.size()));
+}
+
 // --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
@@ -935,6 +969,7 @@ struct ConvertTritonIMToLLVM
 
     // Before conversion: it drops the discardable im.residency attrs.
     emitPimLayoutTable(mod);
+    emitDccTileMac(mod);
 
     triton::im::TargetInfo targetInfo;
 
