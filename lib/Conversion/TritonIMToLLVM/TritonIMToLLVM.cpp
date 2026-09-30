@@ -952,6 +952,33 @@ static void emitDccTileMac(ModuleOp mod) {
   LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
                          "__pim_dcc_tile_mac_count",
                          b.getI32IntegerAttr((int32_t)byArg.size()));
+  // DCC's MAC addressing (im.dcc_mac_addressing): [operand_arg, head stride, reduce
+  // stride, reduce extent] per tensor, the geometry their generator addresses a tile by.
+  if (!mod->hasAttr("im.dcc_mac_addressing"))
+    return;
+  llvm::MapVector<int64_t, SmallVector<int32_t>> geo;
+  mod.walk([&](triton::LoadOp ld) {
+    auto g = ld->getAttrOfType<DenseI64ArrayAttr>("im.dcc-mac-addr");
+    auto res = dyn_cast_or_null<DictionaryAttr>(ld->getDiscardableAttr("im.residency"));
+    auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
+    if (g && arg && arg.getInt() >= 0)
+      geo[arg.getInt()] = {(int32_t)g.asArrayRef()[0], (int32_t)g.asArrayRef()[1],
+                           (int32_t)g.asArrayRef()[2]};
+  });
+  SmallVector<int32_t> flat;
+  for (const auto &kv : geo) {
+    flat.push_back((int32_t)kv.first);
+    flat.append(kv.second.begin(), kv.second.end());
+  }
+  if (!flat.empty()) {
+    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
+                           "__pim_dcc_mac_addr",
+                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  }
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_dcc_mac_addr_count", b.getI32IntegerAttr((int32_t)geo.size()));
 }
 
 // DCC's accumulator convention per stored tensor and its GRF_A operand election, derived
