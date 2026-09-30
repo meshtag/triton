@@ -118,6 +118,10 @@ class IMOptions:
     # which loop to signal; without it the trace runtime sees the whole replay as one
     # dispatch and cross-tile re-reads collapse to nothing.
     im_persistent: bool = False
+    # Work hoisted above the tile loop belongs to the first tile (im-tile-boundary), so an
+    # operand hoisted out of the loop loads after that tile's accumulator reset, as DCC
+    # orders a round. Off by default: other paths were measured with the prologue apart.
+    im_tile_prologue_first: bool = False
     im_layout_scheme: str = "interleaved"
     im_placement_align: str = "dq"
     # Values one DRAM row holds per bank (num_cols * dq_bits). Hardware geometry the
@@ -175,7 +179,8 @@ class IMOptions:
                 f"-hoist:{int(self.im_hoist_operand_regs)}"
                 f"-serp:{int(self.im_cluster_serpentine)}"
                 f"-dist:{int(self.im_distribute_reductions)}"
-                f"-tilemac:{int(self.im_dcc_tile_mac)}")
+                f"-tilemac:{int(self.im_dcc_tile_mac)}"
+                f"-prologue:{int(self.im_tile_prologue_first)}")
 
 
 class IMBackend(BaseBackend):
@@ -301,6 +306,8 @@ class IMBackend(BaseBackend):
             # make_ttir (above) because triton-licm reads it there, and the
             # module keeps it.
             mod.set_attr("im.persistent", builder.parse_attr("1 : i64"))
+        if options.im_tile_prologue_first:
+            mod.set_attr("im.tile_prologue_first", builder.parse_attr("1 : i64"))
         if options.im_price_folds:
             mod.set_attr("im.price_folds", builder.parse_attr("1 : i64"))
         if options.im_derive_bank_axis:
