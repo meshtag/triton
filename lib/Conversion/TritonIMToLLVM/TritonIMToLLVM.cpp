@@ -954,6 +954,86 @@ static void emitDccTileMac(ModuleOp mod) {
                          b.getI32IntegerAttr((int32_t)byArg.size()));
 }
 
+// DCC's accumulator convention per stored tensor and its GRF_A operand election, derived
+// from the residency stamps, only when the module asked for it (im.dcc_acc_grf). A map, or
+// a store folded across a column's SIMD lanes, is DCC's result-register path: no reset,
+// one write-back per PCU pair. Any other store is an accumulator, reset and written back
+// in every lane. GRF_A holds a partitioned input whose loaded values each feed several
+// cells of the lane, when another partitioned input feeds one.
+static void emitDccAccGrf(ModuleOp mod) {
+  if (!mod->hasAttr("im.dcc_acc_grf"))
+    return;
+  auto accAttr = mod->getAttrOfType<IntegerAttr>("im.acc_cells_per_lane");
+  int64_t accCells = accAttr ? accAttr.getInt() : 0;
+  auto field = [](Operation *op, StringRef name, int64_t dflt) {
+    auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
+    auto v = res ? res.getAs<IntegerAttr>(name) : IntegerAttr();
+    return v ? v.getInt() : dflt;
+  };
+  llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> acc;
+  bool conflict = false;
+  mod.walk([&](triton::StoreOp st) {
+    int64_t arg = field(st, "operand_arg", -1);
+    if (arg < 0)
+      return;
+    bool result = accCells == 0 || field(st, "live_split", 1) > 1;
+    std::pair<int32_t, int32_t> c = result ? std::make_pair(0, 2) : std::make_pair(1, 1);
+    auto it = acc.find(arg);
+    if (it != acc.end() && it->second != c)
+      conflict = true;
+    acc[arg] = c;
+  });
+  // Per argument: every load partitioned, and the most cells one value feeds.
+  llvm::MapVector<int64_t, std::pair<bool, int64_t>> loads;
+  mod.walk([&](triton::LoadOp ld) {
+    int64_t arg = field(ld, "operand_arg", -1);
+    if (arg < 0)
+      return;
+    auto &e = loads.insert({arg, {true, INT64_MAX}}).first->second;
+    e.first &= field(ld, "bank_replicated", -1) == 0;
+    e.second = std::min(e.second, field(ld, "cell_fanout", 1));
+  });
+  bool streamed = llvm::any_of(loads, [](auto &kv) {
+    return kv.second.first && kv.second.second == 1;
+  });
+  SmallVector<int32_t> grf;
+  for (auto &kv : loads)
+    if (streamed && kv.second.first && kv.second.second > 1)
+      grf.push_back((int32_t)kv.first);
+  if (conflict) {
+    mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result and as "
+                       "an accumulator, which no single DCC convention covers";
+    return;
+  }
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  auto table = [&](StringRef name, ArrayRef<int32_t> flat) {
+    if (flat.empty())
+      return;
+    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External, name,
+                           DenseElementsAttr::get(dataTy, flat));
+  };
+  auto scalar = [&](StringRef name, int32_t v) {
+    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External, name,
+                           b.getI32IntegerAttr(v));
+  };
+  SmallVector<int32_t> flat;
+  for (auto &kv : acc) {
+    flat.push_back((int32_t)kv.first);
+    flat.push_back(kv.second.first);
+    flat.push_back(kv.second.second);
+  }
+  table("__pim_dcc_acc", flat);
+  scalar("__pim_dcc_acc_count", (int32_t)acc.size());
+  table("__pim_dcc_grf_a", grf);
+  scalar("__pim_dcc_grf_a_count", (int32_t)grf.size());
+  scalar("__pim_dcc_decided", 1);
+}
+
 // --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
@@ -970,6 +1050,7 @@ struct ConvertTritonIMToLLVM
     // Before conversion: it drops the discardable im.residency attrs.
     emitPimLayoutTable(mod);
     emitDccTileMac(mod);
+    emitDccAccGrf(mod);
 
     triton::im::TargetInfo targetInfo;
 

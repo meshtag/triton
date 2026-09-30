@@ -159,6 +159,9 @@ class IMOptions:
     # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
     # issues one command per tile, their ISA's pricing, a convention of the DCC path.
     im_dcc_tile_mac: bool = False
+    # DCC's accumulator convention per stored tensor and its GRF_A operand, derived from
+    # the residency stamps and written into the artifact, for the dcc-parity runtime.
+    im_dcc_acc_grf: bool = False
     # Operand register-file entries per lane (GRF_A, 8 on HBM-PIM). A reduction loop whose
     # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
     # loop (im-operand-hoist). 0 leaves the loops as written.
@@ -180,7 +183,8 @@ class IMOptions:
                 f"-serp:{int(self.im_cluster_serpentine)}"
                 f"-dist:{int(self.im_distribute_reductions)}"
                 f"-tilemac:{int(self.im_dcc_tile_mac)}"
-                f"-prologue:{int(self.im_tile_prologue_first)}")
+                f"-prologue:{int(self.im_tile_prologue_first)}"
+                f"-accgrf:{int(self.im_dcc_acc_grf)}")
 
 
 class IMBackend(BaseBackend):
@@ -323,6 +327,8 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.distribute_reductions", builder.parse_attr("1 : i64"))
         if options.im_dcc_tile_mac:
             mod.set_attr("im.dcc_tile_mac", builder.parse_attr("1 : i64"))
+        if options.im_dcc_acc_grf:
+            mod.set_attr("im.dcc_acc_grf", builder.parse_attr("1 : i64"))
         if options.im_hoist_operand_regs:
             if int(options.im_hoist_operand_regs) < 1:
                 raise ValueError(
