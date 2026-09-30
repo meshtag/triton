@@ -988,9 +988,9 @@ static void emitDccTileMac(ModuleOp mod) {
 // one write-back per PCU pair. Any other store is an accumulator, reset and written back
 // in every lane. GRF_A holds a partitioned input whose loaded values each feed several
 // cells of the lane, when another partitioned input feeds one.
-static void emitDccAccGrf(ModuleOp mod) {
+static LogicalResult emitDccAccGrf(ModuleOp mod) {
   if (!mod->hasAttr("im.dcc_acc_grf"))
-    return;
+    return success();
   auto accAttr = mod->getAttrOfType<IntegerAttr>("im.acc_cells_per_lane");
   int64_t accCells = accAttr ? accAttr.getInt() : 0;
   auto field = [](Operation *op, StringRef name, int64_t dflt) {
@@ -1028,11 +1028,9 @@ static void emitDccAccGrf(ModuleOp mod) {
   for (auto &kv : loads)
     if (streamed && kv.second.first && kv.second.second > 1)
       grf.push_back((int32_t)kv.first);
-  if (conflict) {
-    mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result and as "
-                       "an accumulator, which no single DCC convention covers";
-    return;
-  }
+  if (conflict)
+    return mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result "
+                              "and as an accumulator, which no single DCC convention covers";
   OpBuilder b(mod.getBodyRegion());
   b.setInsertionPointToStart(mod.getBody());
   Location loc = mod.getLoc();
@@ -1060,6 +1058,7 @@ static void emitDccAccGrf(ModuleOp mod) {
   table("__pim_dcc_grf_a", grf);
   scalar("__pim_dcc_grf_a_count", (int32_t)grf.size());
   scalar("__pim_dcc_decided", 1);
+  return success();
 }
 
 // DCC's return stage sized from the input (im.dcc_return_from_input): a store of partials
@@ -1125,7 +1124,8 @@ struct ConvertTritonIMToLLVM
     // Before conversion: it drops the discardable im.residency attrs.
     emitPimLayoutTable(mod);
     emitDccTileMac(mod);
-    emitDccAccGrf(mod);
+    if (failed(emitDccAccGrf(mod)))
+      return signalPassFailure();
     emitDccReturnFrom(mod);
 
     triton::im::TargetInfo targetInfo;

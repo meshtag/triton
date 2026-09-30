@@ -34,6 +34,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -95,6 +96,15 @@ struct IMTileBoundaryPass
 
     LLVM::LLVMFuncOp fn = getOrDeclareBoundaryFn(mod);
     bool prologueFirst = mod->hasAttr(kPrologueFirstAttr);
+    // Two tile loops in one function would share a tile at their seam.
+    if (prologueFirst) {
+      llvm::DenseMap<Operation *, int> perFn;
+      for (scf::ForOp forOp : outermost)
+        if (++perFn[forOp->getParentOfType<FunctionOpInterface>()] > 1) {
+          forOp.emitError() << "im.tile_prologue_first needs one tile loop per function";
+          return signalPassFailure();
+        }
+    }
     for (scf::ForOp forOp : outermost) {
       OpBuilder b(forOp.getContext());
       // At the TOP of the body, not before the terminator. Sitting next to the

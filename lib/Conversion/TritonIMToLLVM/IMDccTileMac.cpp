@@ -195,7 +195,7 @@ struct IMDccTileMacPass : public triton::im::impl::IMDccTileMacBase<IMDccTileMac
     if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
       dqBits = a.getInt();
 
-    bool addressing = mod->hasAttr(kAddrGateAttr);
+    bool addressing = mod->hasAttr(kAddrGateAttr), refused = false;
     llvm::DenseMap<Operation *, SmallVector<int64_t>> geometry;
     llvm::DenseMap<Value, SmallVector<std::pair<triton::LoadOp, int64_t>>> picked;
     mod.walk([&](triton::ReduceOp red) {
@@ -217,6 +217,7 @@ struct IMDccTileMacPass : public triton::im::impl::IMDccTileMacBase<IMDccTileMac
           if (!g) {
             ld->emitError() << "im.dcc_mac_addressing: this tile load's matrix is not laid "
                                "out as DCC's generator addresses it, mat[head][k][out]";
+            refused = true;
             return;
           }
           geometry[ld] = *g;
@@ -225,6 +226,8 @@ struct IMDccTileMacPass : public triton::im::impl::IMDccTileMacBase<IMDccTileMac
           picked[arg].push_back({ld, r});
       }
     });
+    if (refused)
+      return signalPassFailure();
     // Every load of a selected argument has to be one of the tiles, or the per-tensor
     // count the runtime keeps would mix tiles with plain column reads.
     llvm::DenseMap<Value, int64_t> loadsOf;
