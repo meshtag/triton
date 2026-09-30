@@ -165,6 +165,9 @@ class IMOptions:
     # With the tile MAC, state the matrix geometry DCC's generator addresses each tile by,
     # so the runtime can issue a MAC at their address as a declared convention.
     im_dcc_mac_addressing: bool = False
+    # A lane-folded partial's return stage is sized from its one input, as DCC's RED does,
+    # for the dcc-parity runtime's RET bit.
+    im_dcc_return_from_input: bool = False
     # Operand register-file entries per lane (GRF_A, 8 on HBM-PIM). A reduction loop whose
     # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
     # loop (im-operand-hoist). 0 leaves the loops as written.
@@ -188,7 +191,8 @@ class IMOptions:
                 f"-tilemac:{int(self.im_dcc_tile_mac)}"
                 f"-prologue:{int(self.im_tile_prologue_first)}"
                 f"-accgrf:{int(self.im_dcc_acc_grf)}"
-                f"-macaddr:{int(self.im_dcc_mac_addressing)}")
+                f"-macaddr:{int(self.im_dcc_mac_addressing)}"
+                f"-retfrom:{int(self.im_dcc_return_from_input)}")
 
 
 class IMBackend(BaseBackend):
@@ -338,6 +342,8 @@ class IMBackend(BaseBackend):
                 raise ValueError("im_dcc_mac_addressing addresses DCC's tile MAC, set "
                                  "im_dcc_tile_mac too")
             mod.set_attr("im.dcc_mac_addressing", builder.parse_attr("1 : i64"))
+        if options.im_dcc_return_from_input:
+            mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
         if options.im_hoist_operand_regs:
             if int(options.im_hoist_operand_regs) < 1:
                 raise ValueError(

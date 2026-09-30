@@ -60,6 +60,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
@@ -1061,6 +1062,53 @@ static void emitDccAccGrf(ModuleOp mod) {
   scalar("__pim_dcc_decided", 1);
 }
 
+// DCC's return stage sized from the input (im.dcc_return_from_input): a store of partials
+// folded across a column's lanes, in a kernel that reads one other argument, returns as
+// many columns per bank as that input spans, as their RED does. [store_arg, source_arg]
+// pairs. A store with two sources, the fused VA -> RED kernel, is not stated.
+static void emitDccReturnFrom(ModuleOp mod) {
+  if (!mod->hasAttr("im.dcc_return_from_input"))
+    return;
+  auto field = [](Operation *op, StringRef name, int64_t dflt) {
+    auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
+    auto v = res ? res.getAs<IntegerAttr>(name) : IntegerAttr();
+    return v ? v.getInt() : dflt;
+  };
+  llvm::SetVector<int64_t> sources;
+  mod.walk([&](triton::LoadOp ld) {
+    if (int64_t arg = field(ld, "operand_arg", -1); arg >= 0)
+      sources.insert(arg);
+  });
+  SmallVector<int32_t> flat;
+  mod.walk([&](triton::StoreOp st) {
+    int64_t arg = field(st, "operand_arg", -1);
+    if (arg < 0 || field(st, "live_split", 1) <= 1)
+      return;
+    SmallVector<int64_t> others;
+    for (int64_t s : sources)
+      if (s != arg)
+        others.push_back(s);
+    if (others.size() != 1)
+      return;
+    flat.push_back((int32_t)arg);
+    flat.push_back((int32_t)others.front());
+  });
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  if (!flat.empty()) {
+    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
+                           "__pim_dcc_return_from",
+                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  }
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_dcc_return_from_count",
+                         b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
+}
+
 // --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
@@ -1078,6 +1126,7 @@ struct ConvertTritonIMToLLVM
     emitPimLayoutTable(mod);
     emitDccTileMac(mod);
     emitDccAccGrf(mod);
+    emitDccReturnFrom(mod);
 
     triton::im::TargetInfo targetInfo;
 
