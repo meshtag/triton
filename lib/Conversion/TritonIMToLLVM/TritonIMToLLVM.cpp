@@ -71,7 +71,9 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 // --------------------------------------------------------------------------
 // TableGen pass base class
@@ -788,10 +790,12 @@ static void emitPimLayoutTable(ModuleOp mod) {
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
     // Integer now: 0 partitioned, >1 the number of banks that receive a copy. The bool
     // form is still read so an artifact built before this change keeps its meaning.
-    if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
-      e.bankReplicated = (int32_t)br.getInt();
-    else if (auto bb = dict.getAs<BoolAttr>("bank_replicated"))
+    // A BoolAttr is an i1 IntegerAttr, so it is tested first: read as an integer, true
+    // sign-extends to -1, the runtime's "no decision".
+    if (auto bb = dict.getAs<BoolAttr>("bank_replicated"))
       e.bankReplicated = bb.getValue() ? 1 : 0;
+    else if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
+      e.bankReplicated = (int32_t)br.getInt();
     if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
       ArrayRef<int64_t> v = fp.asArrayRef();
       if (v.size() % kAxisWords == 0 &&
@@ -1108,6 +1112,71 @@ static void emitDccReturnFrom(ModuleOp mod) {
                          b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
 }
 
+// Banks are lanes, and a bank cannot read another bank's registers, so the target's shuffles
+// return their input (TargetInfo.cpp). Anything that would move a value between lanes then
+// lowers to a wrong value with no error: a reduce with banks on its axis adds each lane to
+// itself once per lane bit, and a conversion that moves data across lanes keeps the lane's
+// own value. A partitioned tensor whose layout copies it across lanes is two banks reading
+// or writing one element. Each is refused here, on the layouts the lowering will use.
+static LogicalResult refuseCrossBank(ModuleOp mod) {
+  MLIRContext *ctx = mod.getContext();
+  auto lane = StringAttr::get(ctx, "lane"), warp = StringAttr::get(ctx, "warp");
+  bool bad = false;
+  auto banksOn = [&](const triton::LinearLayout &ll, unsigned axis) {
+    int64_t n = 1;
+    for (StringAttr dim : {lane, warp})
+      if (ll.hasInDim(dim))
+        for (const auto &basis : ll.getBases().lookup(dim))
+          if (basis[axis] != 0)
+            n *= 2;
+    return n;
+  };
+  mod.walk([&](Operation *op) {
+    if (auto red = dyn_cast<triton::ReduceOp>(op)) {
+      auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+      if (!ty || !ty.getEncoding())
+        return;
+      if (int64_t n = banksOn(triton::gpu::toLinearLayout(ty), red.getAxis()); n > 1) {
+        red.emitError() << "this reduce runs over axis " << red.getAxis() << ", which the "
+                        << "bank placement spreads over " << n << " banks, and a bank cannot "
+                        << "read another bank's data. Reduce within a bank and combine the "
+                        << "partials in a second kernel.";
+        bad = true;
+      }
+    } else if (auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
+      auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
+      auto dstTy = dyn_cast<RankedTensorType>(cvt.getType());
+      if (!srcTy || !dstTy || !srcTy.getEncoding() || !dstTy.getEncoding())
+        return;
+      triton::LinearLayout c = minimalCvtLayout(srcTy, dstTy);
+      if (c.hasInDim(lane) || c.hasInDim(warp)) {
+        cvt.emitError() << "this layout conversion moves values between banks, which no "
+                        << "bank can do. The lane placement upstream of it is not one the "
+                        << "target can run.";
+        bad = true;
+      }
+    } else if (isa<triton::LoadOp, triton::StoreOp>(op)) {
+      auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
+      auto br = res ? res.getAs<IntegerAttr>("bank_replicated") : IntegerAttr();
+      Value v = isa<triton::LoadOp>(op) ? op->getResult(0) : op->getOperand(1);
+      auto ty = dyn_cast<RankedTensorType>(v.getType());
+      if (!br || br.getInt() != 0 || !ty || !ty.getEncoding())
+        return;
+      triton::LinearLayout ll = triton::gpu::toLinearLayout(ty);
+      if (!ll.hasInDim(lane))
+        return;
+      for (const auto &basis : ll.getBases().lookup(lane))
+        if (llvm::all_of(basis, [](int32_t x) { return x == 0; })) {
+          op->emitError() << "this tensor is partitioned across banks, but its layout puts "
+                          << "the same elements in two banks.";
+          bad = true;
+          return;
+        }
+    }
+  });
+  return failure(bad);
+}
+
 // --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
@@ -1120,6 +1189,9 @@ struct ConvertTritonIMToLLVM
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
+
+    if (failed(refuseCrossBank(mod)))
+      return signalPassFailure();
 
     // Before conversion: it drops the discardable im.residency attrs.
     emitPimLayoutTable(mod);

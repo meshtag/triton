@@ -617,6 +617,29 @@ static int64_t liveSplitFactor(triton::StoreOp st) {
 /// Every tensor one loop carries is live at once, so a loop's figure is the SUM of its
 /// carried tiles, and the widest loop wins. Taking the widest carried value admitted an
 /// interchanged GEMV holding four 128-cell accumulators as 128.
+/// Cells a loop nest keeps live in fresh tiles: a loop's float carries whose initial value
+/// is not an enclosing loop's carry (that one is the same registers), plus the widest of its
+/// own nests. A block loop carrying a running sum around a k loop holds both tiles.
+template <typename PerLane>
+static int64_t freshNestCells(scf::ForOp loop, PerLane &perLane) {
+  int64_t cells = 0;
+  for (auto [init, arg] : llvm::zip(loop.getInitArgs(), loop.getRegionIterArgs())) {
+    auto rt = dyn_cast<RankedTensorType>(arg.getType());
+    if (!rt || !isa<FloatType>(rt.getElementType()))
+      continue;
+    auto ba = dyn_cast<BlockArgument>(init);
+    bool threaded = ba && isa<scf::ForOp>(ba.getOwner()->getParentOp());
+    if (!threaded)
+      cells += perLane(rt);
+  }
+  int64_t inner = 0;
+  loop.getBody()->walk<WalkOrder::PreOrder>([&](scf::ForOp child) {
+    inner = std::max(inner, freshNestCells(child, perLane));
+    return WalkResult::skip();
+  });
+  return cells + inner;
+}
+
 static int64_t accCellsPerLane(triton::StoreOp st) {
   auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
   if (!storedTy)
@@ -659,6 +682,12 @@ static int64_t accCellsPerLane(triton::StoreOp st) {
             (isa<FloatType>(rt.getElementType()) || arg == stored))
           live += perLane(rt);
       }
+      int64_t nested = 0;
+      forOp.getBody()->walk<WalkOrder::PreOrder>([&](scf::ForOp child) {
+        nested = std::max(nested, freshNestCells(child, perLane));
+        return WalkResult::skip();
+      });
+      live += nested;
       if (live > best)
         best = live;
       continue;
@@ -887,7 +916,13 @@ static void applySchedule(OpBuilder &b, DictionaryAttr d,
     if (!s)
       continue; // checkSchedule rejected it already
     if (s->kind != OvrKind::Flag) {
-      setField(b, fields, e.getName(), e.getValue());
+      // The classifier writes bank_replicated as a receiver count, so a forced bool is
+      // stamped the same way, true as every bank.
+      if (e.getName() == "bank_replicated" && isa<BoolAttr>(e.getValue()))
+        setField(b, fields, e.getName(),
+                 b.getI32IntegerAttr(cast<BoolAttr>(e.getValue()).getValue() ? 1 : 0));
+      else
+        setField(b, fields, e.getName(), e.getValue());
       continue;
     }
     bool on = isa<UnitAttr>(e.getValue()) ||
@@ -1138,6 +1173,16 @@ struct IMOperandResidencyLayoutPass
         setField(b, fields, "user_forced", b.getUnitAttr());
         ++numForced;
       }
+      // Lanes store distinct elements, so a stored tensor cannot have identical copies.
+      if (forced && isa<triton::StoreOp>(op))
+        for (NamedAttribute f : fields)
+          if (f.getName() == "bank_replicated")
+            if (auto n = dyn_cast<IntegerAttr>(f.getValue()); n && n.getInt() != 0) {
+              op->emitError() << "a stored tensor cannot be forced bank_replicated: each "
+                              << "lane stores its own elements";
+              scheduleError = true;
+              return;
+            }
 
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
       ++numClassified;
