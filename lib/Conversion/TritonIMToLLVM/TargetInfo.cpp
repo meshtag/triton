@@ -134,12 +134,45 @@ Value TargetInfo::programId(RewriterBase &rewriter, Location loc,
 // Warp-level reduce
 // ---------------------------------------------------------------------------
 
-bool TargetInfo::warpReduce(RewriterBase & /*rewriter*/, Location /*loc*/,
-                            SmallVector<Value> & /*acc*/,
-                            triton::ReduceOp /*op*/,
-                            unsigned /*reduceLaneIdMask*/) const {
-  // No hardware reduce; fall back to the generic tree reduction.
-  return false;
+// A reduce rewrite-im-layout stamped im.pcu-pair sums the two banks of one PCU over lane
+// bit 0. The PCU does it by accumulating both passes into one GRF_B entry, which the
+// runtime models with an untraced carry: the even bank deposits each cell and gets 0, the
+// odd bank receives it. Anything else has no hardware reduce, and refuseCrossBank has
+// refused it before lowering, so the identity-shuffle fallback is never reached.
+bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+                            SmallVector<Value> &acc, triton::ReduceOp op,
+                            unsigned reduceLaneIdMask) const {
+  if (reduceLaneIdMask != 1 || !op->hasAttr("im.pcu-pair"))
+    return false;
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  auto *ctx = rewriter.getContext();
+  Type i32 = IntegerType::get(ctx, 32);
+  auto fn = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_pcu_carry");
+  if (!fn) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+    fn = LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_pcu_carry",
+                                  LLVM::LLVMFunctionType::get(i32, {i32}));
+  }
+  for (Value &v : acc) {
+    Type ty = v.getType();
+    unsigned bits = ty.getIntOrFloatBitWidth();
+    if (bits > 32)
+      return false;
+    Type ity = IntegerType::get(ctx, bits);
+    Value raw = isa<FloatType>(ty) ? LLVM::BitcastOp::create(rewriter, loc, ity, v).getResult()
+                                   : v;
+    if (bits < 32)
+      raw = LLVM::ZExtOp::create(rewriter, loc, i32, raw);
+    Value got = LLVM::CallOp::create(rewriter, loc, fn, ValueRange{raw}).getResult();
+    if (bits < 32)
+      got = LLVM::TruncOp::create(rewriter, loc, ity, got);
+    if (isa<FloatType>(ty))
+      got = LLVM::BitcastOp::create(rewriter, loc, ty, got);
+    v = isa<FloatType>(ty) ? LLVM::FAddOp::create(rewriter, loc, v, got).getResult()
+                           : LLVM::AddOp::create(rewriter, loc, v, got).getResult();
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -586,11 +586,40 @@ struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     if (llMask)
       maskElems = unpackLLElements(loc, llMask, rewriter);
 
+    // A PCU-paired store (im.pcu-owner): the pair's sum sits in both banks' lanes, and
+    // only the odd bank, which owns the GRF_B entry, writes it.
+    bool owner = op->hasAttr("im.pcu-owner");
+    if (owner) {
+      auto lane = StringAttr::get(op->getContext(), "lane");
+      auto free = ttg::toLinearLayout(cast<RankedTensorType>(op.getValue().getType()))
+                      .getFreeVariableMasks()
+                      .lookup(lane);
+      if (free != 1)
+        return op.emitError() << "im.pcu-owner: the stored value's free lanes are " << free
+                              << ", not the PCU's pair bit alone";
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto fn = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_get_bank_id");
+      if (!fn) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+        fn = LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_get_bank_id",
+                                      LLVM::LLVMFunctionType::get(i32_ty, {}));
+      }
+      Value bank = LLVM::CallOp::create(rewriter, loc, fn, ValueRange{}).getResult();
+      Value odd = b.icmp_eq(b.and_(bank, b.i32_val(1)), b.i32_val(1));
+      if (maskElems.empty())
+        maskElems.assign(numElems, odd);
+      else
+        for (Value &m : maskElems)
+          m = b.and_(m, odd);
+    }
+    const bool masked = mask || owner;
+
     // ---- Emit one (vector) store per group of `vec` elements ----
     for (unsigned vecStart = 0; vecStart < numElems; vecStart += vec) {
       Value basePtr = ptrElems[vecStart];
 
-      if (!mask) {
+      if (!masked) {
         // ---- Unconditional vector store ----
         if (vec > 1) {
           auto vecTy = cast<VectorType>(LLVM::getVectorType(valueElemTy, vec));
@@ -1087,6 +1116,10 @@ static void emitDccReturnFrom(ModuleOp mod) {
     int64_t arg = field(st, "operand_arg", -1);
     if (arg < 0 || field(st, "live_split", 1) <= 1)
       return;
+    // Their return stage spans the input over the banks that store, and a paired store
+    // has half of them. It is not their convention's subject, so it is not stated.
+    if (st->hasAttr("im.pcu-owner"))
+      return;
     SmallVector<int64_t> others;
     for (int64_t s : sources)
       if (s != arg)
@@ -1112,6 +1145,62 @@ static void emitDccReturnFrom(ModuleOp mod) {
                          b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
 }
 
+// Banks per PCU (im.pcu_lanes), so the runtime can refuse a machine that pairs its banks
+// differently. Absent unless stated.
+static LogicalResult emitPcuGeometry(ModuleOp mod) {
+  auto a = mod->getAttrOfType<IntegerAttr>("im.pcu_lanes");
+  if (!a)
+    return success();
+  int64_t lanes = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+  if (a.getInt() < 2 || lanes % a.getInt())
+    return mod.emitError() << "im.pcu_lanes=" << a.getInt() << " does not divide the "
+                           << lanes << " banks";
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  LLVM::GlobalOp::create(b, mod.getLoc(), b.getI32Type(), /*isConstant=*/true,
+                         LLVM::Linkage::External, "__pim_pcu_lanes",
+                         b.getI32IntegerAttr((int32_t)a.getInt()));
+  return success();
+}
+
+// PCU-paired stores (im.pcu_pair_accumulate), [store_arg, owner side, carried cells] each,
+// so the runtime models GRF_B surviving from the even pass into the odd one.
+static LogicalResult emitPcuPair(ModuleOp mod) {
+  if (!mod->hasAttr("im.pcu_pair_accumulate"))
+    return success();
+  SmallVector<int32_t> flat;
+  bool bad = false;
+  mod.walk([&](triton::StoreOp st) {
+    auto own = st->getAttrOfType<DenseI64ArrayAttr>("im.pcu-owner");
+    if (!own)
+      return;
+    auto res = dyn_cast_or_null<DictionaryAttr>(st->getDiscardableAttr("im.residency"));
+    auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
+    if (!arg || arg.getInt() < 0) {
+      st.emitError() << "im.pcu-owner: the paired store's tensor is not a kernel argument";
+      bad = true;
+      return;
+    }
+    flat.append({(int32_t)arg.getInt(), (int32_t)own[0], (int32_t)own[1]});
+  });
+  if (bad)
+    return failure();
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  if (!flat.empty()) {
+    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
+                           "__pim_pcu_pair",
+                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  }
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_pcu_pair_count", b.getI32IntegerAttr((int32_t)(flat.size() / 3)));
+  return success();
+}
+
 // Banks are lanes, and a bank cannot read another bank's registers, so the target's shuffles
 // return their input (TargetInfo.cpp). Anything that would move a value between lanes then
 // lowers to a wrong value with no error: a reduce with banks on its axis adds each lane to
@@ -1120,8 +1209,32 @@ static void emitDccReturnFrom(ModuleOp mod) {
 // or writing one element. Each is refused here, on the layouts the lowering will use.
 static LogicalResult refuseCrossBank(ModuleOp mod) {
   MLIRContext *ctx = mod.getContext();
-  auto lane = StringAttr::get(ctx, "lane"), warp = StringAttr::get(ctx, "warp");
+  auto lane = StringAttr::get(ctx, "lane"), warp = StringAttr::get(ctx, "warp"),
+       reg = StringAttr::get(ctx, "register");
   bool bad = false;
+  // The one exchange a bank pair can make: both banks of a PCU accumulate into its GRF_B
+  // (im.pcu_pair_accumulate). Re-derived here from the final layouts, so a stamp a later
+  // pass dropped or a layout it moved is refused rather than lowered.
+  auto pcu = mod->getAttrOfType<IntegerAttr>("im.pcu_lanes");
+  const bool pair = mod->hasAttr("im.pcu_pair_accumulate") && pcu && pcu.getInt() == 2;
+  auto pairReduce = [&](triton::ReduceOp red, const triton::LinearLayout &ll) {
+    if (!pair || !red->hasAttr("im.pcu-pair") || !ll.hasInDim(lane))
+      return false;
+    unsigned axis = red.getAxis();
+    const auto &lb = ll.getBases().lookup(lane);
+    if (lb.empty() || lb[0][axis] == 0)
+      return false;
+    for (auto [i, basis] : llvm::enumerate(lb))
+      for (auto [d, x] : llvm::enumerate(basis))
+        if (x != 0 && ((i == 0) != (d == axis)))
+          return false;
+    for (StringAttr dim : {reg, warp})
+      if (ll.hasInDim(dim))
+        for (const auto &basis : ll.getBases().lookup(dim))
+          if (basis[axis] != 0)
+            return false;
+    return true;
+  };
   auto banksOn = [&](const triton::LinearLayout &ll, unsigned axis) {
     int64_t n = 1;
     for (StringAttr dim : {lane, warp})
@@ -1136,7 +1249,10 @@ static LogicalResult refuseCrossBank(ModuleOp mod) {
       auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
       if (!ty || !ty.getEncoding())
         return;
-      if (int64_t n = banksOn(triton::gpu::toLinearLayout(ty), red.getAxis()); n > 1) {
+      triton::LinearLayout ll = triton::gpu::toLinearLayout(ty);
+      if (pairReduce(red, ll))
+        return;
+      if (int64_t n = banksOn(ll, red.getAxis()); n > 1) {
         red.emitError() << "this reduce runs over axis " << red.getAxis() << ", which the "
                         << "bank placement spreads over " << n << " banks, and a bank cannot "
                         << "read another bank's data. Reduce within a bank and combine the "
@@ -1165,8 +1281,10 @@ static LogicalResult refuseCrossBank(ModuleOp mod) {
       triton::LinearLayout ll = triton::gpu::toLinearLayout(ty);
       if (!ll.hasInDim(lane))
         return;
-      for (const auto &basis : ll.getBases().lookup(lane))
-        if (llvm::all_of(basis, [](int32_t x) { return x == 0; })) {
+      // A paired store leaves the pair bit free, and only its odd bank writes.
+      bool owner = pair && isa<triton::StoreOp>(op) && op->hasAttr("im.pcu-owner");
+      for (auto [i, basis] : llvm::enumerate(ll.getBases().lookup(lane)))
+        if (llvm::all_of(basis, [](int32_t x) { return x == 0; }) && !(owner && i == 0)) {
           op->emitError() << "this tensor is partitioned across banks, but its layout puts "
                           << "the same elements in two banks.";
           bad = true;
@@ -1199,6 +1317,8 @@ struct ConvertTritonIMToLLVM
     if (failed(emitDccAccGrf(mod)))
       return signalPassFailure();
     emitDccReturnFrom(mod);
+    if (failed(emitPcuGeometry(mod)) || failed(emitPcuPair(mod)))
+      return signalPassFailure();
 
     triton::im::TargetInfo targetInfo;
 
