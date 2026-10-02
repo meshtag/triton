@@ -4,17 +4,12 @@
 /// Target scope: this pass is substrate-agnostic. Its classification is a pure IR
 /// analysis of the kernel's SSA and loop structure with no architecture branch, so
 /// it runs for every IM target, both near-memory PIM (HBM-PIM) and
-/// processing-using-memory PUM (SIMDRAM). Today the stamped attributes are honored
-/// only by the HBM-PIM runtime. The SIMDRAM runtime has no residency-as-layout
-/// consumer, so on SIMDRAM the pass runs but is inert. A PUM backend could consume
-/// the same classification (bank and subarray parallelism and reduction-to-column
-/// are meaningful there too), it just does not yet.
+/// processing-using-memory PUM (SIMDRAM). Both runtimes read the layout table
+/// emitPimLayoutTable builds from its stamps.
 ///
 /// Phase 1 (classification): for each tensor-of-pointer load or store, and each
 /// scalar load that feeds a broadcast (the matvec `x[k]` operand), classify the
-/// operand's reuse axes and stamp an `im.residency` dictionary attribute that a
-/// later runtime increment will honor. Classification is purely an IR analysis. It
-/// changes NO simulated behaviour until a consumer reads the attrs.
+/// operand's reuse axes and stamp an `im.residency` dictionary attribute.
 ///
 ///   reuse_class is decided from two reachability facts about the address:
 ///     pidMask: does the address depend on tt.get_program_id (output tile)?
@@ -50,7 +45,6 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
-#include <string>
 #include <utility>
 
 // -----------------------------------------------------------------------
@@ -70,15 +64,9 @@ using namespace mlir;
 
 namespace ttg_ = mlir::triton::gpu;
 
-/// Dim of a STORE tile that carries the lanes, -1 if none. Stores are the one
-/// encoding this pass can trust: RewriteIMLayout set them directly and
-/// remove-layout-conversions has not run yet, so a load's type still puts the lanes
-/// on its own axis and says nothing about its place in the tile.
-/// Mask of the dims that carry lanes. Usually one bit; im.bank_split places lanes on
-/// several, and then a value can be partitioned along one lane axis and REPLICATED
-/// along another. Returning only the first axis called such a value partitioned and
-/// made its replication free, which is the delivery charge going missing. Identical to
-/// the old single-axis form whenever only one dim carries lanes.
+/// Mask of the dims of a STORE tile that carry lanes, several under im.bank_split. Only
+/// store encodings are trusted: remove-layout-conversions has not run yet, so a load's
+/// type still puts the lanes on its own axis and says nothing about its place in the tile.
 static uint32_t laneAxisMask(Type ty) {
   auto tt = dyn_cast<RankedTensorType>(ty);
   if (!tt)
@@ -794,8 +782,8 @@ static bool isScalarSplatLoad(Operation *op) {
 /// Input lives in its own attribute so re-running the pass cannot mistake its own
 /// output for user intent.
 ///
-/// Only policy is forcible. operand_arg, axis_deps, reduction_dep and footprint
-/// are read out of the IR, and forcing those would misdescribe the kernel to the
+/// Only policy is forcible. operand_arg, footprint and the other stamped facts are
+/// read out of the IR, and forcing those would misdescribe the kernel to the
 /// runtime rather than remap it.
 ///
 /// Every rejection is a hard error, including a schedule entry that never matched
@@ -804,30 +792,19 @@ static bool isScalarSplatLoad(Operation *op) {
 
 namespace {
 
-enum class OvrKind { Str, Bool, I64, DenseI64, Flag };
-
 struct OvrSpec {
   const char *name;
-  OvrKind kind;
-  /// Whether emitPimLayoutTable carries this field into the artifact. A field
-  /// that does not travel is stamped in the IR and read by nobody, so forcing it
-  /// changes no simulated behaviour and the pass warns rather than let a
-  /// schedule look effective.
+  /// Whether emitPimLayoutTable carries this field into a record word. Forcing one
+  /// that does not is a compile error.
   bool travels;
 };
 
 static const OvrSpec kForcible[] = {
-    // reuse_class is classified and stamped in the IR but reaches no behaviour: its
-    // only destination was the layout_kind record word, deleted 2026-09-10 because the
-    // broadcast collapse it drove was reverted on fairness grounds. travels=false so
-    // forcing it is a hard error rather than a schedule that measures the default.
-    {"reuse_class", OvrKind::Str, false},
-    {"bank_replicated", OvrKind::Bool, true},
+    // reuse_class reaches the artifact only through emitPimLayoutTable's merge rule,
+    // which picks the record kept when several accesses share an operand.
+    {"reuse_class", false},
+    {"bank_replicated", true},
 };
-
-static const char *kReuseClasses[] = {"ReductionStridedMatrix",
-                                      "BroadcastReplicate", "ParallelSpread",
-                                      "StreamedElementwise"};
 
 static const OvrSpec *findForcible(StringRef name) {
   for (const OvrSpec &s : kForcible)
@@ -846,12 +823,6 @@ static void setField(OpBuilder &b, SmallVectorImpl<NamedAttribute> &fields,
   fields.push_back(b.getNamedAttr(name, val));
 }
 
-static void eraseField(SmallVectorImpl<NamedAttribute> &fields,
-                       StringRef name) {
-  llvm::erase_if(fields,
-                 [&](const NamedAttribute &f) { return f.getName() == name; });
-}
-
 static LogicalResult checkSchedule(DictionaryAttr d, Location loc,
                                    const Twine &where) {
   for (NamedAttribute e : d) {
@@ -868,69 +839,27 @@ static LogicalResult checkSchedule(DictionaryAttr d, Location loc,
                                "artifact, so forcing it would change no "
                                "simulated behaviour. Drop it, or teach "
                                "emitPimLayoutTable to carry it";
-    Attribute v = e.getValue();
-    bool ok = false;
-    switch (s->kind) {
-    case OvrKind::Str: {
-      auto sa = dyn_cast<StringAttr>(v);
-      ok = (bool)sa;
-      if (ok && e.getName() == "reuse_class") {
-        ok = false;
-        for (const char *c : kReuseClasses)
-          if (sa.getValue() == c)
-            ok = true;
-        if (!ok)
-          return emitError(loc) << where << ": reuse_class '" << sa.getValue()
-                                << "' is not a known class";
-      }
-      break;
-    }
-    case OvrKind::Bool:
-      ok = isa<BoolAttr>(v);
-      break;
-    case OvrKind::I64: {
-      auto ia = dyn_cast<IntegerAttr>(v);
-      ok = ia && ia.getType().isInteger(64);
-      break;
-    }
-    case OvrKind::DenseI64:
-      ok = isa<DenseI64ArrayAttr>(v);
-      break;
-    case OvrKind::Flag:
-      ok = isa<BoolAttr>(v) || isa<UnitAttr>(v);
-      break;
-    }
-    if (!ok)
+    // Every field that travels takes a bool.
+    if (!isa<BoolAttr>(e.getValue()))
       return emitError(loc) << where << ": '" << e.getName().strref()
                             << "' has the wrong type for a schedule field";
   }
   return success();
 }
 
-/// Overlay `d` on `fields`. A flag takes a bool, false removing the lever, so a
-/// schedule can switch one off and not only on.
+/// Overlay `d`, which checkSchedule accepted, on `fields`.
 static void applySchedule(OpBuilder &b, DictionaryAttr d,
                           SmallVectorImpl<NamedAttribute> &fields) {
   for (NamedAttribute e : d) {
-    const OvrSpec *s = findForcible(e.getName());
-    if (!s)
+    if (!findForcible(e.getName()))
       continue; // checkSchedule rejected it already
-    if (s->kind != OvrKind::Flag) {
-      // The classifier writes bank_replicated as a receiver count, so a forced bool is
-      // stamped the same way, true as every bank.
-      if (e.getName() == "bank_replicated" && isa<BoolAttr>(e.getValue()))
-        setField(b, fields, e.getName(),
-                 b.getI32IntegerAttr(cast<BoolAttr>(e.getValue()).getValue() ? 1 : 0));
-      else
-        setField(b, fields, e.getName(), e.getValue());
-      continue;
-    }
-    bool on = isa<UnitAttr>(e.getValue()) ||
-              cast<BoolAttr>(e.getValue()).getValue();
-    if (on)
-      setField(b, fields, e.getName(), b.getUnitAttr());
+    // The classifier writes bank_replicated as a receiver count, so a forced bool is
+    // stamped the same way, true as every bank.
+    if (e.getName() == "bank_replicated" && isa<BoolAttr>(e.getValue()))
+      setField(b, fields, e.getName(),
+               b.getI32IntegerAttr(cast<BoolAttr>(e.getValue()).getValue() ? 1 : 0));
     else
-      eraseField(fields, e.getName());
+      setField(b, fields, e.getName(), e.getValue());
   }
 }
 
@@ -973,36 +902,6 @@ struct IMOperandResidencyLayoutPass
         argSchedule[argIdx] = d;
       }
     }
-
-    // Compiler-side ablation levers (docs/ablation-levers-plan.md).
-    // IM_LAYOUT_ABLATE is a comma/space list of lever names to DISABLE. A
-    // disabled lever makes the pass emit the naive (no-reuse) layout for that
-    // axis. Read here, inside the compiler pass, so ablation is a compiler-side
-    // control rather than a simulator knob. NOTE: Triton caches compiled
-    // kernels and does not key on env read inside a pass, so the ablation
-    // runner must use a fresh TRITON_CACHE_DIR per level.
-    const char *ablateEnv = std::getenv("IM_LAYOUT_ABLATE");
-    std::string ablate = ablateEnv ? ablateEnv : "";
-    auto disabled = [&](const char *lever) -> bool {
-      if (ablate.empty())
-        return false;
-      std::string needle(lever);
-      size_t pos = 0;
-      while ((pos = ablate.find(needle, pos)) != std::string::npos) {
-        bool lb = (pos == 0) || ablate[pos - 1] == ',' || ablate[pos - 1] == ' ';
-        size_t end = pos + needle.size();
-        bool rb = (end == ablate.size()) || ablate[end] == ',' ||
-                  ablate[end] == ' ';
-        if (lb && rb)
-          return true;
-        pos = end;
-      }
-      return false;
-    };
-    // bank-spread, operand-scope, acc-resident and reduction-col are gone with the
-    // fields they gated. Disabling them was already inert: nothing downstream read
-    // the result.
-    const bool dBroadcast = disabled("broadcast");
 
     // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
     // carries iter_args (the accumulator).  Record the count and which
@@ -1063,13 +962,13 @@ struct IMOperandResidencyLayoutPass
       // is identical across all banks for a given access, exactly what per-BG
       // replication models, independent of pid/reduction dependence.
       StringRef cls;
-      if (scalarSplat && !dBroadcast)
+      if (scalarSplat)
         cls = "BroadcastReplicate";
       else if (!funcReduction)
         cls = "StreamedElementwise";
       else if (ivDep && pidMask != 0)
         cls = "ReductionStridedMatrix";
-      else if (ivDep && pidMask == 0 && !dBroadcast)
+      else if (ivDep && pidMask == 0)
         cls = "BroadcastReplicate";
       else if (!ivDep && pidMask != 0)
         cls = "ParallelSpread";
@@ -1199,8 +1098,6 @@ struct IMOperandResidencyLayoutPass
         return signalPassFailure();
       }
     }
-
-    // llvm::outs() << "\n\n\n I was here meshtag \n\n\n";
 
     // The widest loop-carried accumulator per lane, for the runtime's register-file
     // bound. One number at module level because the machine has one GRF_B per bank.

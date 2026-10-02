@@ -138,7 +138,8 @@ bool TargetInfo::warpReduce(RewriterBase & /*rewriter*/, Location /*loc*/,
                             SmallVector<Value> & /*acc*/,
                             triton::ReduceOp /*op*/,
                             unsigned /*reduceLaneIdMask*/) const {
-  // No hardware reduce; fall back to the generic tree reduction.
+  // Never reached. The shared lowering calls this only for a reduce across lanes, and
+  // refuseCrossBank rejects those before lowering starts.
   return false;
 }
 

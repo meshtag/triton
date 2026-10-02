@@ -4,10 +4,8 @@
  * A loop that loads two tensors per iteration alternates between them. Once each tensor
  * fills its own DRAM row per bank, every load switches rows. DCC's generator walks n_grf
  * columns of one operand before the next (gen_trace_HBMPIM_VA.py:118-131), so a row stays
- * open for G commands. This unrolls such a loop and moves each strip's loads up, grouped
- * by the kernel argument they read. With `im.cluster_serpentine` the unrolled body holds
- * two strips and the second takes the arguments in reverse, so it opens on the row the
- * first one closed.
+ * open for G commands. This unrolls such a loop by G and moves its loads up, grouped by
+ * the kernel argument they read.
  *
  * A strip's first group stays live until its last is loaded, so G iterations of any one
  * argument must fit `im.cluster_loads` register-file entries per lane. That count reads
@@ -15,7 +13,7 @@
  * of the trip count, so no epilogue loop and no promotion to straight-line code.
  *
  * Only loads and ops free of memory effects move, and a load never moves above a store
- * to the argument it reads or above an earlier strip's stores. Moving a load past a store
+ * to the argument it reads. Moving a load past a store
  * to another argument needs im.noalias_args, so the pass does nothing without it. A
  * persistent kernel's tile loop is never touched, because im-tile-boundary marks one
  * dispatch per iteration of it.
@@ -47,11 +45,11 @@ namespace ttg = mlir::triton::gpu;
 namespace {
 
 constexpr llvm::StringLiteral kGateAttr = "im.cluster_loads";
-constexpr llvm::StringLiteral kSerpentineAttr = "im.cluster_serpentine";
-/// Stamped on the unrolled loop as [G, strips].
+/// Stamped on the unrolled loop as G.
 constexpr llvm::StringLiteral kMarkedAttr = "im.load-cluster";
-/// Unrolled iteration of each body op, only while this pass runs.
-constexpr llvm::StringLiteral kIterAttr = "im.load-cluster.iter";
+/// Marks the body's own ops while this pass runs. Clones copy it and the index arithmetic
+/// the unroll adds has none, so that arithmetic is placed only as a dependency or last.
+constexpr llvm::StringLiteral kBodyAttr = "im.load-cluster.body";
 
 /// The kernel argument a pointer is derived from, or null.
 static Value baseArg(Value p) {
@@ -128,15 +126,11 @@ static bool qualifies(scf::ForOp f, int64_t dqBits, int64_t &widest) {
   return widest > 0;
 }
 
-/// Reorder the body strip by strip: the strip's loads grouped by argument in order of
-/// first use (reversed on odd strips), then the rest of the strip in program order.
-/// Returns false, touching nothing, when a load depends on an op that cannot move.
-static bool clusterStrips(Block &body, int64_t iters, int64_t strips) {
+/// Reorder the body: its loads grouped by argument in order of first use, then the rest
+/// in program order. Returns false, touching nothing, when a load depends on an op that
+/// cannot move.
+static bool clusterLoads(Block &body) {
   Operation *term = body.getTerminator();
-  auto stripOf = [&](Operation *op) -> int64_t {
-    auto a = op->getAttrOfType<IntegerAttr>(kIterAttr);
-    return a ? a.getInt() * strips / iters : -1;
-  };
   SmallVector<Value> args;
   for (Operation &op : body)
     if (auto ld = dyn_cast<triton::LoadOp>(op))
@@ -157,19 +151,14 @@ static bool clusterStrips(Block &body, int64_t iters, int64_t strips) {
     }
     order.insert(op);
   };
-  for (int64_t s = 0; s < strips; ++s) {
-    SmallVector<Value> byArg(args);
-    if (s % 2)
-      std::reverse(byArg.begin(), byArg.end());
-    for (Value a : byArg)
-      for (Operation &op : body)
-        if (auto ld = dyn_cast<triton::LoadOp>(op))
-          if (stripOf(ld) == s && baseArg(ld.getPtr()) == a)
-            place(ld, /*mayWrite=*/false);
+  for (Value a : args)
     for (Operation &op : body)
-      if (stripOf(&op) == s)
-        place(&op, /*mayWrite=*/true);
-  }
+      if (auto ld = dyn_cast<triton::LoadOp>(op))
+        if (ld->hasAttr(kBodyAttr) && baseArg(ld.getPtr()) == a)
+          place(ld, /*mayWrite=*/false);
+  for (Operation &op : body)
+    if (op.hasAttr(kBodyAttr))
+      place(&op, /*mayWrite=*/true);
   for (Operation &op : body)
     place(&op, /*mayWrite=*/true);
   if (!ok)
@@ -187,7 +176,6 @@ struct IMLoadClusterPass
     if (!a || a.getInt() < 2 || !mod->hasAttr("im.noalias_args"))
       return;
     int64_t cap = a.getInt();
-    bool serpentine = mod->hasAttr(kSerpentineAttr);
     int64_t dqBits = 256;
     if (auto q = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
       dqBits = q.getInt();
@@ -201,7 +189,7 @@ struct IMLoadClusterPass
       if (!nested && !tileLoop && qualifies(f, dqBits, widest))
         loops.push_back({f, widest});
     });
-    auto i64 = IntegerType::get(mod.getContext(), 64);
+    MLIRContext *ctx = mod.getContext();
     for (auto [f, widest] : loops) {
       auto trip = tripCount(f);
       if (!trip)
@@ -214,19 +202,14 @@ struct IMLoadClusterPass
         }
       if (g < 2)
         continue;
-      int64_t strips = serpentine && *trip % (2 * g) == 0 && 2 * g < *trip ? 2 : 1;
-      int64_t factor = g * strips;
       for (Operation &op : f.getBody()->without_terminator())
-        op.setAttr(kIterAttr, IntegerAttr::get(i64, 0));
-      auto res = loopUnrollByFactor(f, factor, [&](unsigned i, Operation *op, OpBuilder) {
-        op->setAttr(kIterAttr, IntegerAttr::get(i64, i));
-      });
-      if (succeeded(res) && res->mainLoopOp &&
-          clusterStrips(*res->mainLoopOp->getBody(), factor, strips))
+        op.setAttr(kBodyAttr, UnitAttr::get(ctx));
+      auto res = loopUnrollByFactor(f, g);
+      if (succeeded(res) && res->mainLoopOp && clusterLoads(*res->mainLoopOp->getBody()))
         (*res->mainLoopOp)->setAttr(kMarkedAttr,
-                                    DenseI64ArrayAttr::get(mod.getContext(), {g, strips}));
+                                    IntegerAttr::get(IntegerType::get(ctx, 64), g));
     }
-    mod.walk([&](Operation *op) { op->removeAttr(kIterAttr); });
+    mod.walk([&](Operation *op) { op->removeAttr(kBodyAttr); });
   }
 };
 

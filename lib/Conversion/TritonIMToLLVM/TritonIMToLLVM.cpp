@@ -788,13 +788,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
     StringRef cls = clsAttr.getValue();
     e.concreteClass = cls == "BroadcastReplicate" ||
                       cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
-    // Integer now: 0 partitioned, >1 the number of banks that receive a copy. The bool
-    // form is still read so an artifact built before this change keeps its meaning.
-    // A BoolAttr is an i1 IntegerAttr, so it is tested first: read as an integer, true
-    // sign-extends to -1, the runtime's "no decision".
-    if (auto bb = dict.getAs<BoolAttr>("bank_replicated"))
-      e.bankReplicated = bb.getValue() ? 1 : 0;
-    else if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
+    // 0 partitioned, >1 the number of banks that receive a copy.
+    if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
       e.bankReplicated = (int32_t)br.getInt();
     if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
       ArrayRef<int64_t> v = fp.asArrayRef();
@@ -906,9 +901,7 @@ static void emitPimLayoutTable(ModuleOp mod) {
     LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                            LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
   };
-  // Row width the occupancy charge divides by, num_cols * dq_bits. Stated so the
-  // runtime can say when its geometry differs from the one the cost was computed
-  // against, the same way __pim_dq_bits does for the bus.
+  // Always 0 now that no option sets it. Kept for runtimes that link the symbol.
   emitPolicy("im.row_values", "__pim_row_values");
   emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");

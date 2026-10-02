@@ -151,8 +151,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::im::registerIMLaneFoldPass();
   mlir::triton::im::registerIMReluOpcodePass();
   mlir::triton::im::registerIMLoadClusterPass();
-  mlir::triton::im::registerIMOperandHoistPass();
-  mlir::triton::im::registerIMReductionDistributePass();
   mlir::triton::im::registerIMDccTileMacPass();
 
   mlir::triton::proton::registerConvertProtonToProtonGPU();

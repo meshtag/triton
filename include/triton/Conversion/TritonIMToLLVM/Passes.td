@@ -45,7 +45,7 @@ def RewriteIMLayout : Pass<"rewrite-im-layout", "mlir::ModuleOp"> {
     Rewrites BlockedEncodingAttr on tensor-typed memory operations so
     that each PIM bank (= one TritonGPU "lane") owns a consecutive
     slice of elements rather than an interleaved slice.  The pass
-    reads im.num-banks and ttg.num-warps from the module and computes
+    reads ttg.threads-per-warp and ttg.num-warps from the module and computes
     sizePerThread = tensorShape / (threadsPerWarp × warpsPerCTA) for
     each dimension.  ConvertLayoutOps are inserted around load/store
     operations; the downstream tritongpu-remove-layout-conversions
@@ -56,24 +56,17 @@ def RewriteIMLayout : Pass<"rewrite-im-layout", "mlir::ModuleOp"> {
                            "mlir::triton::gpu::TritonGPUDialect"];
 }
 
-// Operand-residency layout pass: the explicit, compiler-side analog of
-// OptiPIM's DataLayout/DetailLayout MILP (heuristic, not a solver).  Decides a
-// per-operand physical layout + residency so that operand reuse is a property
-// of the chosen layout (operand laid out resident / replicated across the
-// spatial banks; reduction axis on the column-low bits) rather than something
-// recovered post-hoc by trace dedup.  Run over fused regions it can co-optimize
-// layout across operators — a capability per-operator MILP compilers lack.
-// See docs/reuse-as-layout-plan.md.
+// Stamps what the runtimes need to know about each operand, read back through
+// emitPimLayoutTable.
 def IMOperandResidencyLayout
     : Pass<"im-operand-residency-layout", "mlir::ModuleOp"> {
-  let summary = "Assign per-operand physical layout/residency for PIM reuse";
+  let summary = "Stamp each memory access with its replication and footprint";
   let description = [{
-    Classifies each tensor operand's reuse axes and assigns a physical layout
-    (bank/bankgroup placement, reduction-axis column locality, residency,
-    per-BG replication for broadcasts) that realizes operand reuse in the
-    layout itself.  This is the explicit alternative to recovering reuse via
-    trace dedup, making the per-operator cost comparison fair by construction
-    and enabling cross-operator layout co-optimization over fused regions.
+    Stamps each tensor-of-pointer load or store, and each scalar load splatted
+    across the lanes, with an im.residency dictionary. Its fields include the reuse
+    class, how many banks receive a copy (bank_replicated), the kernel argument read
+    and the footprint of one program instance. im.schedule and
+    im.residency.force can override bank_replicated.
   }];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
@@ -144,31 +137,7 @@ def IMLoadCluster : Pass<"im-load-cluster", "mlir::ModuleOp"> {
     more kernel arguments, stores none of them and touches memory no other way is
     unrolled by G, the largest proper divisor of its trip count whose G iterations of
     any one argument fit n entries. Each strip's loads are grouped by argument, so a
-    DRAM row stays open for G loads. With `im.cluster_serpentine` the body holds two
-    strips and the second takes the arguments in reverse. Reads the lane layout.
-  }];
-  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
-}
-
-def IMReductionDistribute : Pass<"im-reduction-distribute", "mlir::ModuleOp"> {
-  let summary = "Interchange a reduction loop with the sum of loads it accumulates";
-  let description = [{
-    Only runs when the module carries `im.distribute_reductions`. A loop whose only
-    carried value is acc and whose body yields acc + (x + z), with x and z each built
-    from loads and independent of acc, becomes two loops, one adding x and one adding z.
-    Reassociates the floating-point sum.
-  }];
-  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
-}
-
-def IMOperandHoist : Pass<"im-operand-hoist", "mlir::ModuleOp"> {
-  let summary = "Fully unroll a reduction loop so its tile-invariant operand can be hoisted";
-  let description = [{
-    Only runs when the module carries `im.hoist_operand_regs = n`. An innermost scf.for
-    with a constant trip count T, inside another loop, whose loads depend on nothing in
-    the outer loop but its own induction variable, is fully unrolled when T copies of
-    those loads fit n register-file entries per lane. triton-licm then hoists them above
-    the outer loop. Runs after rewrite-im-layout, because the count reads the layout.
+    DRAM row stays open for G loads. Reads the lane layout.
   }];
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
 }

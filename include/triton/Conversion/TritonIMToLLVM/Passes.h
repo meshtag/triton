@@ -23,8 +23,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createIMTileBoundaryPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMLaneFoldPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMReluOpcodePass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMLoadClusterPass();
-std::unique_ptr<OperationPass<ModuleOp>> createIMOperandHoistPass();
-std::unique_ptr<OperationPass<ModuleOp>> createIMReductionDistributePass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMDccTileMacPass();
 
 #define GEN_PASS_REGISTRATION

@@ -92,8 +92,7 @@ class IMOptions:
     arch: str = "hbm-pim"
     skip_passes: tuple[str, ...] = ()  # pass names to skip (for ablation)
     # User schedule for im-operand-residency-layout, as MLIR dictionary text
-    # keyed by kernel operand index, e.g.
-    #   '{arg1 = {reuse_class = "BroadcastReplicate", resident = true}}'
+    # keyed by kernel operand index, e.g. '{arg1 = {bank_replicated = true}}'.
     # Empty means the classifier decides everything.
     im_schedule: str = ""
     # Which tensor axis carries the banks (rewrite-im-layout). -1 keeps the
@@ -104,15 +103,6 @@ class IMOptions:
     # Bank-group interleave (whole-kernel address mapping). Compiler-emitted so the
     # decision lives in the artifact rather than a runtime env var.
     im_bg_interleave: bool = False
-    # Placement policy, stated here so the artifact records it instead of the runtime
-    # picking a default. "interleaved" spreads consecutive elements across banks;
-    # "striped" is the legacy compact/row-stripe scheme. The alignment rule decides
-    # where each tensor starts: "dq" packs tensors so they share rows but land on
-    # different banks, "global-row" starts every tensor at bank 0, which hot-spots
-    # small tensors and measured 3.2x worse on one conv shape. Both are levers now.
-    # "row-pack" gives lane-placed tensors their exact per-lane share of one column space,
-    # so a kernel's small tensors share rows the way DCC packs its vectors. The dcc-parity
-    # runtime honours it, and a lane that touches more than its share fails coverage.
     # Persistent kernel: the grid stops being the work decomposition and one program
     # instance loops over several tiles. Marks the module so im-tile-boundary knows
     # which loop to signal; without it the trace runtime sees the whole replay as one
@@ -122,12 +112,14 @@ class IMOptions:
     # operand hoisted out of the loop loads after that tile's accumulator reset, as DCC
     # orders a round. Off by default: other paths were measured with the prologue apart.
     im_tile_prologue_first: bool = False
+    # Placement policy, stated so the artifact records it instead of the runtime picking
+    # one. "interleaved" spreads consecutive elements across banks, "striped" keeps a
+    # small tensor in one bank.
     im_layout_scheme: str = "interleaved"
+    # Where each tensor starts. "dq" packs tensors into shared rows on different banks,
+    # "global-row" starts every tensor at bank 0, and "row-pack" gives each lane its exact
+    # share of one column space (honoured by the dcc-parity runtime).
     im_placement_align: str = "dq"
-    # Values one DRAM row holds per bank (num_cols * dq_bits). Hardware geometry the
-    # compiler does not choose but must STATE, because the SIMDRAM occupancy charge
-    # divides by it. 0 = unstated, and the runtime then keeps its own.
-    im_row_values: int = 0
     # Bits one column command moves, which is what a vector access is sized against.
     # Differs by target: HBM-PIM moves prefetch*dq = 256, SIMDRAM's column is a
     # bit-serial slot of dq = 128. 0 = unstated, and the lowering keeps its default.
@@ -151,11 +143,6 @@ class IMOptions:
     # Group a two-tensor loop's loads by tensor (im-load-cluster), in strips that fit this
     # many register-file entries per lane. 0 leaves loop bodies as written.
     im_cluster_loads: int = 0
-    # Two strips per unrolled body, the second taking the tensors in reverse order.
-    im_cluster_serpentine: bool = False
-    # Split acc += x + z into a loop adding x and a loop adding z (im-reduction-distribute).
-    # Reassociates the floating-point sum.
-    im_distribute_reductions: bool = False
     # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
     # issues one command per tile, their ISA's pricing, a convention of the DCC path.
     im_dcc_tile_mac: bool = False
@@ -168,10 +155,6 @@ class IMOptions:
     # A lane-folded partial's return stage is sized from its one input, as DCC's RED does,
     # for the dcc-parity runtime's RET bit.
     im_dcc_return_from_input: bool = False
-    # Operand register-file entries per lane (GRF_A, 8 on HBM-PIM). A reduction loop whose
-    # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
-    # loop (im-operand-hoist). 0 leaves the loops as written.
-    im_hoist_operand_regs: int = 0
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -181,13 +164,10 @@ class IMOptions:
                 f"-skip:{skip_tag}-sched:{sched_tag}-bax:{self.im_bank_axis}"
                 f"-bgi:{int(self.im_bg_interleave)}"
                 f"-lay:{self.im_layout_scheme}-align:{self.im_placement_align}"
-                f"-persist:{int(self.im_persistent)}-row:{int(self.im_row_values)}"
+                f"-persist:{int(self.im_persistent)}"
                 f"-dq:{int(self.im_dq_bits)}-split:{self.im_bank_split or 'none'}"
                 f"-fold:{int(self.im_price_folds)}-dax:{int(self.im_derive_bank_axis)}"
                 f"-relu:{int(self.im_dcc_relu_opcode)}-clu:{int(self.im_cluster_loads)}"
-                f"-hoist:{int(self.im_hoist_operand_regs)}"
-                f"-serp:{int(self.im_cluster_serpentine)}"
-                f"-dist:{int(self.im_distribute_reductions)}"
                 f"-tilemac:{int(self.im_dcc_tile_mac)}"
                 f"-prologue:{int(self.im_tile_prologue_first)}"
                 f"-accgrf:{int(self.im_dcc_acc_grf)}"
@@ -258,7 +238,7 @@ class IMBackend(BaseBackend):
             "cse",
         ]
 
-        if options.im_persistent or options.im_hoist_operand_regs or options.im_cluster_loads:
+        if options.im_persistent or options.im_cluster_loads:
             # MUST be set here, not in make_ttgir: triton-licm runs in THIS stage,
             # and it is the only pass in the pipeline that hoists loads. Setting it
             # later meant the attribute existed but nothing had read it.
@@ -280,13 +260,8 @@ class IMBackend(BaseBackend):
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
-        # NOT run on IM. CombineBroadcastMulReducePattern folds
-        # reduce_add(broadcast(a)*broadcast(b)) into tt.dot, which this backend has
-        # no lowering for at all (zero mentions in TritonIMToLLVM.cpp). In fp16 it
-        # also splats an f32 zero into an f16 accumulator and fails the verifier at
-        # standard.py:293. Measured byte-identical LLIR with and without on seven
-        # configs (matmul k-packed, matmul 128^3, matvec, conv 3x3/1x1/stride-2,
-        # SIMDRAM conv), so dropping it changes nothing that works today.
+        # triton-combine is left out of this stage. Its CombineBroadcastMulReducePattern
+        # folds reduce_add(broadcast(a)*broadcast(b)) into tt.dot, which IM cannot lower.
         if "triton-reorder-broadcast" not in skip:
             passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
@@ -329,10 +304,6 @@ class IMBackend(BaseBackend):
         if options.im_cluster_loads:
             mod.set_attr("im.cluster_loads",
                          builder.parse_attr(f"{int(options.im_cluster_loads)} : i64"))
-        if options.im_cluster_serpentine:
-            mod.set_attr("im.cluster_serpentine", builder.parse_attr("1 : i64"))
-        if options.im_distribute_reductions:
-            mod.set_attr("im.distribute_reductions", builder.parse_attr("1 : i64"))
         if options.im_dcc_tile_mac:
             mod.set_attr("im.dcc_tile_mac", builder.parse_attr("1 : i64"))
         if options.im_dcc_acc_grf:
@@ -344,12 +315,6 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_mac_addressing", builder.parse_attr("1 : i64"))
         if options.im_dcc_return_from_input:
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
-        if options.im_hoist_operand_regs:
-            if int(options.im_hoist_operand_regs) < 1:
-                raise ValueError(
-                    f"im_hoist_operand_regs={options.im_hoist_operand_regs!r}; must be positive")
-            mod.set_attr("im.hoist_operand_regs",
-                         builder.parse_attr(f"{int(options.im_hoist_operand_regs)} : i64"))
         _SCHEMES = {"striped": 1, "interleaved": 2}
         _ALIGNS = {"dq": 1, "global-row": 2, "row-pack": 3}
         if options.im_layout_scheme not in _SCHEMES:
@@ -364,12 +329,6 @@ class IMBackend(BaseBackend):
                      builder.parse_attr(f"{_SCHEMES[options.im_layout_scheme]} : i64"))
         mod.set_attr("im.placement_align",
                      builder.parse_attr(f"{_ALIGNS[options.im_placement_align]} : i64"))
-        if options.im_row_values:
-            if int(options.im_row_values) < 1:
-                raise ValueError(
-                    f"im_row_values={options.im_row_values!r}; must be positive")
-            mod.set_attr("im.row_values",
-                         builder.parse_attr(f"{int(options.im_row_values)} : i64"))
         if options.im_dq_bits:
             if int(options.im_dq_bits) < 1:
                 raise ValueError(
@@ -387,10 +346,6 @@ class IMBackend(BaseBackend):
         if options.im_bank_axis >= 0:
             mod.set_attr("im.bank_axis",
                          builder.parse_attr(f"{options.im_bank_axis} : i64"))
-        # # ── TritonGPU plumbing ──
-        # mod.set_attr("ttg.num-warps", builder.get_int32_attr(options.num_warps))
-        # mod.set_attr("ttg.num-ctas", builder.get_int32_attr(options.num_ctas))
-        # mod.set_attr("ttg.threads-per-warp", builder.get_int32_attr(options.num_banks))
 
         if _im_debug():
             _dump_stage(mod, "ttir", "ttir.mlir")
@@ -407,11 +362,6 @@ class IMBackend(BaseBackend):
             f"threads-per-warp={options.num_banks} "
             f"num-ctas={options.num_ctas}}}",
             "rewrite-im-layout",
-            "im-operand-hoist",
-            "triton-licm",
-            "canonicalize",
-            "cse",
-            "im-reduction-distribute",
             "im-load-cluster",
             "im-operand-residency-layout",
             "tritongpu-remove-layout-conversions",
@@ -433,20 +383,7 @@ class IMBackend(BaseBackend):
         )
         if "rewrite-im-layout" not in skip:
             passes.convert.add_rewrite_im_layout(pm)
-        # The count of what fits reads the lane layout, so this cannot run in make_ttir
-        # beside the other triton-licm.
-        if options.im_hoist_operand_regs and "im-operand-hoist" not in skip:
-            passes.convert.add_im_operand_hoist(pm)
-            if "triton-licm" not in skip:
-                passes.ttir.add_triton_licm(pm)
-                # Folds the trip-count guard licm puts on each hoisted load. Left in,
-                # tritongpu-remove-layout-conversions rebuilds the masked loads and drops
-                # their im.residency, so x loses its lane placement.
-                passes.common.add_canonicalizer(pm)
-                passes.common.add_cse(pm)
-        # Both count or place against the lane layout, so they follow rewrite-im-layout.
-        if "im-reduction-distribute" not in skip:
-            passes.convert.add_im_reduction_distribute(pm)
+        # It places against the lane layout, so it follows rewrite-im-layout.
         if "im-load-cluster" not in skip:
             passes.convert.add_im_load_cluster(pm)
         if "im-operand-residency-layout" not in skip:
@@ -472,6 +409,10 @@ class IMBackend(BaseBackend):
     def make_llir(src, metadata, options):
         llir_passes = [
             "loop-invariant-code-motion",
+            "im-tile-boundary",
+            "im-lane-fold",
+            "im-dcc-tile-mac",
+            "im-relu-opcode",
             "convert-scf-to-cf",
             "convert-triton-im-to-llvm",
             "convert-index-to-llvm",
