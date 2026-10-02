@@ -172,12 +172,6 @@ class IMOptions:
     # tile-invariant loads fit is fully unrolled so triton-licm hoists them above the tile
     # loop (im-operand-hoist). 0 leaves the loops as written.
     im_hoist_operand_regs: int = 0
-    # Banks one PCU serves (2 on HBM-PIM, banks 2p and 2p+1). Geometry the compiler states
-    # so the runtime can refuse a machine that pairs differently. 0 = unstated.
-    im_pcu_lanes: int = 0
-    # A reduction over the PCU's two banks accumulates both into the PCU's one GRF_B entry,
-    # and the odd bank alone folds and stores the sum (needs im_pcu_lanes=2).
-    im_pcu_pair_accumulate: bool = False
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -198,10 +192,7 @@ class IMOptions:
                 f"-prologue:{int(self.im_tile_prologue_first)}"
                 f"-accgrf:{int(self.im_dcc_acc_grf)}"
                 f"-macaddr:{int(self.im_dcc_mac_addressing)}"
-                f"-retfrom:{int(self.im_dcc_return_from_input)}"
-                # Appended only when set, so every existing cache key stays the same string.
-                + (f"-pcu:{int(self.im_pcu_lanes)}" if self.im_pcu_lanes else "")
-                + ("-pair:1" if self.im_pcu_pair_accumulate else ""))
+                f"-retfrom:{int(self.im_dcc_return_from_input)}")
 
 
 class IMBackend(BaseBackend):
@@ -353,20 +344,6 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_mac_addressing", builder.parse_attr("1 : i64"))
         if options.im_dcc_return_from_input:
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
-        if options.im_pcu_lanes:
-            n = int(options.im_pcu_lanes)
-            if n < 2 or n & (n - 1) or options.num_banks % n:
-                raise ValueError(f"im_pcu_lanes={options.im_pcu_lanes!r}; must be a power of "
-                                 f"two of at least 2 dividing num_banks={options.num_banks}")
-            mod.set_attr("im.pcu_lanes", builder.parse_attr(f"{n} : i64"))
-        if options.im_pcu_pair_accumulate:
-            if int(options.im_pcu_lanes) != 2:
-                raise ValueError("im_pcu_pair_accumulate pairs the two banks of a PCU, set "
-                                 "im_pcu_lanes=2 too")
-            if options.im_persistent:
-                raise ValueError("im_pcu_pair_accumulate carries GRF_B across one dispatch's "
-                                 "two passes, which a persistent kernel's tiles would share")
-            mod.set_attr("im.pcu_pair_accumulate", builder.parse_attr("1 : i64"))
         if options.im_hoist_operand_regs:
             if int(options.im_hoist_operand_regs) < 1:
                 raise ValueError(

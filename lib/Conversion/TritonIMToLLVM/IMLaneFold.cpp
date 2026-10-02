@@ -19,7 +19,6 @@
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir {
@@ -37,54 +36,20 @@ namespace ttg = mlir::triton::gpu;
 namespace {
 
 constexpr llvm::StringLiteral kFoldFn = "__pim_trace_fold";
-/// The same with a mask of the PCU sides that record it (im.pcu_pair_accumulate). Every
-/// lane still calls it, so the lanes of a PCU stay at one access ordinal.
-constexpr llvm::StringLiteral kFoldSidesFn = "__pim_trace_fold_sides";
 constexpr llvm::StringLiteral kPriceAttr = "im.price_folds";
 /// Stamped on each marked reduce as [steps, outputs per lane], so the IR says what the
 /// runtime will be told.
 constexpr llvm::StringLiteral kMarkedAttr = "im.lane-fold";
 
-static LLVM::LLVMFuncOp getOrDeclareFoldFn(ModuleOp mod, StringRef name, unsigned args) {
-  if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(name))
+static LLVM::LLVMFuncOp getOrDeclareFoldFn(ModuleOp mod) {
+  if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(kFoldFn))
     return fn;
   OpBuilder b(mod.getBodyRegion());
   b.setInsertionPointToStart(mod.getBody());
   auto i64 = IntegerType::get(mod.getContext(), 64);
   auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()),
-                                          SmallVector<Type>(args, i64), /*isVarArg=*/false);
-  return LLVM::LLVMFuncOp::create(b, mod.getLoc(), name, fnTy);
-}
-
-/// A blocked encoding's per-dim fields, or under the pair option a slice of one with the
-/// sliced dim dropped, which is what the fold after a PCU pair reduce reads.
-struct LaneFields {
-  SmallVector<unsigned> spt, order, tpw, wpc;
-};
-static std::optional<LaneFields> laneFields(Attribute enc, bool slices) {
-  if (auto bl = dyn_cast_or_null<ttg::BlockedEncodingAttr>(enc))
-    return LaneFields{SmallVector<unsigned>(bl.getSizePerThread()),
-                      SmallVector<unsigned>(bl.getOrder()),
-                      SmallVector<unsigned>(bl.getThreadsPerWarp()),
-                      SmallVector<unsigned>(bl.getWarpsPerCTA())};
-  auto sl = dyn_cast_or_null<ttg::SliceEncodingAttr>(enc);
-  if (!slices || !sl)
-    return std::nullopt;
-  auto parent = laneFields(sl.getParent(), /*slices=*/false);
-  if (!parent)
-    return std::nullopt;
-  unsigned cut = sl.getDim();
-  LaneFields f;
-  for (unsigned d = 0; d < parent->spt.size(); ++d)
-    if (d != cut) {
-      f.spt.push_back(parent->spt[d]);
-      f.tpw.push_back(parent->tpw[d]);
-      f.wpc.push_back(parent->wpc[d]);
-    }
-  for (unsigned d : parent->order)
-    if (d != cut)
-      f.order.push_back(d > cut ? d - 1 : d);
-  return f;
+                                          {i64, i64}, /*isVarArg=*/false);
+  return LLVM::LLVMFuncOp::create(b, mod.getLoc(), kFoldFn, fnTy);
 }
 
 struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> {
@@ -96,11 +61,9 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
     if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
       dqBits = a.getInt();
 
-    const bool pair = mod->hasAttr("im.pcu_pair_accumulate");
     struct Mark {
       triton::ReduceOp op;
       int64_t steps, outputs;
-      bool oddOnly;
     };
     SmallVector<Mark> marks;
     bool unknown = false;
@@ -108,14 +71,16 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
       auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
       if (!ty)
         return;
-      auto fields = laneFields(ty.getEncoding(), pair);
-      if (!fields) {
+      auto enc = dyn_cast_or_null<ttg::BlockedEncodingAttr>(ty.getEncoding());
+      if (!enc) {
         unknown = true;
         return;
       }
       unsigned axis = red.getAxis();
-      ArrayRef<unsigned> spt = fields->spt, order = fields->order, tpw = fields->tpw,
-                         wpc = fields->wpc;
+      auto spt = enc.getSizePerThread();
+      auto order = enc.getOrder();
+      auto tpw = enc.getThreadsPerWarp();
+      auto wpc = enc.getWarpsPerCTA();
       // In-column when the reduced axis is the lane's register-fastest one, the first
       // in `order` with more than one value per lane. Placement follows access order,
       // so that run of values is what shares a column.
@@ -137,16 +102,7 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
         if (d == axis)
           along = n;
       }
-      // Lane bit 0 free: the pair reduce left the PCU's sum in both lanes, and only the
-      // odd bank, which owns the GRF_B entry, folds it.
-      bool oddOnly = false;
-      if (pair) {
-        auto lane = StringAttr::get(mod.getContext(), "lane");
-        triton::LinearLayout ll = ttg::toLinearLayout(ty);
-        oddOnly = ll.hasInDim(lane) && !ll.getBases().lookup(lane).empty() &&
-                  llvm::all_of(ll.getBases().lookup(lane)[0], [](int32_t x) { return x == 0; });
-      }
-      marks.push_back({red, (int64_t)llvm::Log2_64_Ceil(lanes), perThread / along, oddOnly});
+      marks.push_back({red, (int64_t)llvm::Log2_64_Ceil(lanes), perThread / along});
     });
     // A layout this pass cannot read would leave a fold unpriced without a trace of it.
     if (unknown)
@@ -155,17 +111,15 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
     if (marks.empty())
       return;
 
+    LLVM::LLVMFuncOp fn = getOrDeclareFoldFn(mod);
     for (Mark &m : marks) {
       OpBuilder b(m.op);
       b.setInsertionPointAfter(m.op);
       Location loc = m.op.getLoc();
-      SmallVector<Value> args{arith::ConstantIntOp::create(b, loc, m.steps, 64),
-                              arith::ConstantIntOp::create(b, loc, m.outputs, 64)};
-      if (m.oddOnly)
-        args.push_back(arith::ConstantIntOp::create(b, loc, /*odd side=*/2, 64));
-      LLVM::LLVMFuncOp fn = m.oddOnly ? getOrDeclareFoldFn(mod, kFoldSidesFn, 3)
-                                      : getOrDeclareFoldFn(mod, kFoldFn, 2);
-      LLVM::CallOp::create(b, loc, TypeRange{}, SymbolRefAttr::get(fn), args);
+      Value steps = arith::ConstantIntOp::create(b, loc, m.steps, 64);
+      Value outputs = arith::ConstantIntOp::create(b, loc, m.outputs, 64);
+      LLVM::CallOp::create(b, loc, TypeRange{}, SymbolRefAttr::get(fn),
+                           ValueRange{steps, outputs});
       m.op->setAttr(kMarkedAttr, b.getDenseI64ArrayAttr({m.steps, m.outputs}));
     }
   }

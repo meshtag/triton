@@ -13,13 +13,10 @@
 
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/MapVector.h"
 #include <bit>
@@ -208,301 +205,6 @@ static Attribute buildIMEncoding(RankedTensorType tensorType,
                                        order, cgaLayout);
 }
 
-/// Re-creates `v`, a pointer, mask or offset tensor of the store's shape, in `enc`, by
-/// cloning its producers before `at`. Only cheap index ops are followed. Null when the
-/// chain holds anything else.
-static Value retypeChain(Value v, Attribute enc, Operation *at,
-                         llvm::DenseMap<Value, Value> &memo) {
-  auto t = dyn_cast<RankedTensorType>(v.getType());
-  if (!t)
-    return v;
-  if (t.getEncoding() == enc)
-    return v;
-  if (auto it = memo.find(v); it != memo.end())
-    return it->second;
-  Operation *d = v.getDefiningOp();
-  if (!d || d->getNumResults() != 1)
-    return {};
-  if (auto c = dyn_cast<ttg::ConvertLayoutOp>(d))
-    return memo[v] = retypeChain(c.getSrc(), enc, at, memo);
-  auto nt = RankedTensorType::get(t.getShape(), t.getElementType(), enc);
-  OpBuilder b(at);
-  if (auto cst = dyn_cast<arith::ConstantOp>(d)) {
-    auto de = dyn_cast<DenseElementsAttr>(cst.getValue());
-    if (!de || !de.isSplat())
-      return {};
-    return memo[v] = arith::ConstantOp::create(
-                         b, d->getLoc(), nt,
-                         DenseElementsAttr::get(nt, de.getSplatValue<Attribute>()));
-  }
-  if (!isa<triton::AddPtrOp, triton::SplatOp, triton::MakeRangeOp>(d) &&
-      d->getDialect()->getNamespace() != "arith")
-    return {};
-  SmallVector<Value> ops;
-  for (Value o : d->getOperands()) {
-    Value r = retypeChain(o, enc, at, memo);
-    if (!r)
-      return {};
-    ops.push_back(r);
-  }
-  Operation *n = b.clone(*d);
-  n->setOperands(ops);
-  n->getResult(0).setType(nt);
-  return memo[v] = n->getResult(0);
-}
-
-/// Keeps the pair reduce's sum on the reduce's own slice layout downstream, which leaves
-/// lane bit 0 free. A blocked layout of the lower rank cannot, so the convert into one
-/// would move the sum between lanes. Converts are dropped, in-lane reduces and
-/// elementwise ops re-typed. A store keeps its operand, retyped by its owner pass.
-static LogicalResult keepSliced(Value sum) {
-  SmallVector<Value> work{sum};
-  llvm::DenseSet<Value> seen;
-  while (!work.empty()) {
-    Value cur = work.pop_back_val();
-    if (!seen.insert(cur).second)
-      continue;
-    auto curTy = cast<RankedTensorType>(cur.getType());
-    for (Operation *u : llvm::make_early_inc_range(cur.getUsers())) {
-      if (auto c = dyn_cast<ttg::ConvertLayoutOp>(u)) {
-        c.getResult().replaceAllUsesWith(cur);
-        c.erase();
-        seen.erase(cur);
-        work.push_back(cur);
-        continue;
-      }
-      if (auto r = dyn_cast<triton::ReduceOp>(u)) {
-        auto parent = cast<ttg::DistributedEncodingTrait>(curTy.getEncoding());
-        auto enc = ttg::SliceEncodingAttr::get(cur.getContext(), r.getAxis(), parent);
-        for (Value res : r.getResults()) {
-          auto rt = cast<RankedTensorType>(res.getType());
-          res.setType(RankedTensorType::get(rt.getShape(), rt.getElementType(), enc));
-          work.push_back(res);
-        }
-        continue;
-      }
-      if (isa<triton::StoreOp>(u))
-        continue;
-      StringRef dialect = u->getName().getDialectNamespace();
-      if (u->getNumResults() == 1 && (dialect == "arith" || dialect == "math")) {
-        auto rt = dyn_cast<RankedTensorType>(u->getResult(0).getType());
-        if (!rt || rt.getShape() != curTy.getShape())
-          return failure();
-        llvm::DenseMap<Value, Value> memo;
-        for (OpOperand &o : u->getOpOperands())
-          if (o.get() != cur) {
-            Value r = retypeChain(o.get(), curTy.getEncoding(), u, memo);
-            if (!r)
-              return failure();
-            o.set(r);
-          }
-        u->getResult(0).setType(
-            RankedTensorType::get(rt.getShape(), rt.getElementType(), curTy.getEncoding()));
-        work.push_back(u->getResult(0));
-        continue;
-      }
-      // Anything else is refused by the user walk that follows.
-    }
-  }
-  return success();
-}
-
-/// Result i of an scf.for whose iter_arg i starts at zero and only ever has a value added to
-/// it: a MAC accumulation, which GRF_B keeps from the even pass into the odd one.
-static bool isGrfBAccumulation(Value v) {
-  auto res = dyn_cast<OpResult>(v);
-  auto loop = res ? dyn_cast<scf::ForOp>(res.getOwner()) : scf::ForOp();
-  if (!loop)
-    return false;
-  unsigned i = res.getResultNumber();
-  Value carried = loop.getRegionIterArg(i);
-  Operation *upd = cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperand(i)
-                       .getDefiningOp();
-  if (!upd || !isa<arith::AddFOp, arith::AddIOp>(upd) ||
-      (upd->getOperand(0) != carried && upd->getOperand(1) != carried))
-    return false;
-  for (Operation *u : carried.getUsers())
-    if (u != upd)
-      return false;
-  DenseElementsAttr init;
-  if (!matchPattern(loop.getInitArgs()[i], m_Constant(&init)) || !init.isSplat())
-    return false;
-  if (isa<FloatType>(init.getElementType()))
-    return init.getSplatValue<APFloat>().isZero();
-  return init.getSplatValue<APInt>().isZero();
-}
-
-static bool isSingleAdd(Region &combine) {
-  Block &blk = combine.front();
-  if (blk.getOperations().size() != 2)
-    return false;
-  Operation &op = blk.front();
-  return isa<arith::AddFOp, arith::AddIOp>(op) && op.getOperand(0) == blk.getArgument(0) &&
-         op.getOperand(1) == blk.getArgument(1);
-}
-
-/// im.pcu_pair_accumulate. A reduce over lane bit 0 alone, the two banks of one PCU, is
-/// the PCU accumulating both passes into one GRF_B entry. Stamp it and its stores, which
-/// only the odd bank performs, and refuse every other reduce over lanes.
-static LogicalResult applyPcuPair(ModuleOp mod, int64_t pcuLanes) {
-  MLIRContext *ctx = mod.getContext();
-  auto kLane = StringAttr::get(ctx, "lane"), kReg = StringAttr::get(ctx, "register"),
-       kWarp = StringAttr::get(ctx, "warp");
-  Type i64 = IntegerType::get(ctx, 64);
-  bool bad = false;
-  SmallVector<std::pair<triton::StoreOp, int64_t>> owners;
-  int64_t stamped = 0;
-  auto onAxis = [](const triton::LinearLayout &ll, StringAttr dim, unsigned axis) {
-    SmallVector<unsigned> bits;
-    if (ll.hasInDim(dim))
-      for (auto [i, basis] : llvm::enumerate(ll.getBases().lookup(dim)))
-        if (basis[axis] != 0)
-          bits.push_back(i);
-    return bits;
-  };
-  // Collected first: keepSliced erases the converts after a pair reduce.
-  SmallVector<triton::ReduceOp> reduces;
-  mod.walk([&](triton::ReduceOp red) { reduces.push_back(red); });
-  for (triton::ReduceOp red : reduces) {
-    if (bad)
-      break;
-    [&] {
-      auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
-      if (!ty || !ty.getEncoding())
-        return;
-      unsigned axis = red.getAxis();
-      triton::LinearLayout ll = ttg::toLinearLayout(ty);
-      SmallVector<unsigned> lanes = onAxis(ll, kLane, axis);
-      if (lanes.empty())
-        return;
-      auto fail = [&](const Twine &why) {
-        red.emitError() << "im.pcu_pair_accumulate: this reduce runs over lanes, but " << why;
-        bad = true;
-      };
-      if (lanes.size() != 1 || lanes[0] != 0)
-        return fail("not over lane bit 0 alone, the two banks of one PCU. Put the pair "
-                    "axis fastest among the lane axes in the tile's order.");
-      if (ty.getShape()[axis] != pcuLanes)
-        return fail("its axis is not the PCU's " + Twine(pcuLanes) + " banks");
-      for (auto [d, x] : llvm::enumerate(ll.getBases().lookup(kLane)[0]))
-        if (d != axis && x != 0)
-          return fail("lane bit 0 also moves another axis");
-      if (!onAxis(ll, kReg, axis).empty() || !onAxis(ll, kWarp, axis).empty())
-        return fail("its axis also spans registers or warps");
-      if (red.getNumOperands() != 1 || !isSingleAdd(red.getCombineOp()))
-        return fail("its combine is not one add, the only thing a MAC into GRF_B does");
-      if (ty.getElementType().getIntOrFloatBitWidth() > 32)
-        return fail("its elements are wider than the carry's 32 bits");
-      if (red->getParentOfType<scf::ForOp>() || red->getParentOfType<scf::WhileOp>())
-        return fail("it sits in a loop, and GRF_B carries one sum per dispatch");
-      Value src = red.getOperands()[0];
-      while (auto c = src.getDefiningOp<ttg::ConvertLayoutOp>())
-        src = c.getSrc();
-      if (!isGrfBAccumulation(src))
-        return fail("its operand is not a loop that adds into a zeroed accumulator, which "
-                    "is the only thing GRF_B carries from one pass into the next");
-      if (failed(keepSliced(red->getResult(0))))
-        return fail("its sum reaches an op whose layout cannot follow it");
-      // The pair's sum lives in the PCU, so only the owner may observe it.
-      SmallVector<Value> work(red.getResults().begin(), red.getResults().end());
-      llvm::DenseSet<Value> seen;
-      SmallVector<triton::StoreOp> mine;
-      while (!work.empty() && !bad) {
-        Value v = work.pop_back_val();
-        if (!seen.insert(v).second)
-          continue;
-        for (Operation *u : v.getUsers()) {
-          if (auto st = dyn_cast<triton::StoreOp>(u)) {
-            if (st.getValue() != v || st.getPtr() == v || st.getMask() == v)
-              return fail("its sum is used as an address or mask");
-            mine.push_back(st);
-            continue;
-          }
-          if (auto r = dyn_cast<triton::ReduceOp>(u)) {
-            auto rt = cast<RankedTensorType>(r.getOperands()[0].getType());
-            if (!onAxis(ttg::toLinearLayout(rt), kLane, r.getAxis()).empty())
-              return fail("its sum feeds a second reduce over lanes");
-            work.append(r.getResults().begin(), r.getResults().end());
-            continue;
-          }
-          StringRef dialect = u->getName().getDialectNamespace();
-          if (u->getNumResults() == 1 &&
-              (isa<ttg::ConvertLayoutOp, triton::ExpandDimsOp>(u) || dialect == "arith" ||
-               dialect == "math")) {
-            work.push_back(u->getResult(0));
-            continue;
-          }
-          return fail("its sum reaches an op that is not elementwise, an in-lane reduce or "
-                      "its store");
-        }
-      }
-      if (bad)
-        return;
-      if (mine.empty())
-        return fail("its sum is never stored");
-      if (mine.size() > 1)
-        return fail("its sum reaches more than one store, and the PCU holds one");
-      // GRF_B cells the PCU carries from the even pass into the odd one.
-      int64_t cells = ttg::getTotalElemsPerThread(ty);
-      red->setAttr("im.pcu-pair", IntegerAttr::get(i64, cells));
-      ++stamped;
-      for (triton::StoreOp st : mine)
-        owners.push_back({st, cells});
-    }();
-  }
-  if (bad)
-    return failure();
-  if (!stamped)
-    return mod.emitError() << "im.pcu_pair_accumulate is set, but no reduce sums the two "
-                              "banks of a PCU";
-
-  // Every owner store takes its value's encoding, lane bit 0 free, with its pointer and
-  // mask rebuilt in it. Converting the value to a blocked pointer layout would move it
-  // between lanes, since no blocked layout leaves lane bit 0 free.
-  for (auto [st, cells] : owners) {
-    Value val = st.getValue();
-    while (auto c = val.getDefiningOp<ttg::ConvertLayoutOp>())
-      val = c.getSrc();
-    Attribute enc = cast<RankedTensorType>(val.getType()).getEncoding();
-    llvm::DenseMap<Value, Value> memo;
-    Value ptr = retypeChain(st.getPtr(), enc, st, memo);
-    Value mask = st.getMask() ? retypeChain(st.getMask(), enc, st, memo) : Value();
-    if (!ptr || (st.getMask() && !mask)) {
-      st.emitError() << "im.pcu_pair_accumulate: this store's address is not built from "
-                        "ranges, splats and arithmetic, so it cannot take its value's layout";
-      return failure();
-    }
-    st.getPtrMutable().assign(ptr);
-    st.getValueMutable().assign(val);
-    if (mask)
-      st.getMaskMutable().assign(mask);
-    // [owner side, carried cells]. The odd bank owns it: GRF_B writes back to the odd
-    // bank, and the odd pass is the last MAC into the entry.
-    st->setAttr("im.pcu-owner", DenseI64ArrayAttr::get(ctx, {1, cells}));
-  }
-
-  // Only the odd bank stores, so anything traced after the owner store would sit at
-  // different access ordinals on the PCU's two banks and the lockstep collapse would record
-  // it twice. The owner stores are the function's last traced ops, outside any loop.
-  for (auto [st, cells] : owners) {
-    if (!isa<triton::FuncOp>(st->getParentOp()))
-      return st.emitError() << "im.pcu_pair_accumulate: the owner store sits inside a loop "
-                               "or branch, where later traced ops would follow it";
-    for (Operation *n = st->getNextNode(); n; n = n->getNextNode()) {
-      bool traced = false;
-      n->walk([&](Operation *o) {
-        traced |= isa<triton::LoadOp, triton::ReduceOp, triton::AtomicRMWOp,
-                      triton::AtomicCASOp>(o) ||
-                  (isa<triton::StoreOp>(o) && !o->hasAttr("im.pcu-owner"));
-      });
-      if (traced)
-        return n->emitError() << "im.pcu_pair_accumulate: this follows an owner store, which "
-                                 "only the odd bank of each PCU performs";
-    }
-  }
-  return success();
-}
-
 // -----------------------------------------------------------------------
 // Pass implementation
 // -----------------------------------------------------------------------
@@ -592,16 +294,9 @@ struct RewriteIMLayoutPass
       }
     });
 
-    // A pair kernel reduces over its split's pair axis by design. applyPcuPair checks every
-    // reduce over lanes on the final layout instead.
-    int64_t pcuLanes = 0;
-    if (auto a = mod->getAttrOfType<IntegerAttr>("im.pcu_lanes"))
-      pcuLanes = a.getInt();
-    const bool pairOpt = mod->hasAttr("im.pcu_pair_accumulate");
-
     // A split over an axis something reduces IS the cross-bank reduction. Refuse it
     // here, naming the fix, rather than asserting in Casting.h three passes later.
-    if (!pairOpt && !bankSplit.empty() && !reduceAmbiguous && reduceAxis >= 0 &&
+    if (!bankSplit.empty() && !reduceAmbiguous && reduceAxis >= 0 &&
         reduceRank == (int)bankSplit.size() && bankSplit[reduceAxis] > 1) {
       mod.emitError()
           << "im.bank_split puts " << bankSplit[reduceAxis] << " banks on axis "
@@ -635,7 +330,7 @@ struct RewriteIMLayoutPass
       // Two reduces disagree. Deriving would be a guess, so leave the upstream
       // choice and record that we declined.
       mod->setAttr("im.bank-axis-ambiguous-reduce", UnitAttr::get(mod.getContext()));
-    } else if (reduceAxis >= 0 && reduceRank == 2 && !(pairOpt && !bankSplit.empty())) {
+    } else if (reduceAxis >= 0 && reduceRank == 2) {
       bankAxis = 1 - reduceAxis; // banks on the non-reduced axis, only meaningful at rank 2
       mod->setAttr("im.bank-axis-from-reduce",
                    IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
@@ -777,15 +472,10 @@ struct RewriteIMLayoutPass
       }
     }
 
-    if (pairOpt && failed(applyPcuPair(mod, pcuLanes)))
-      return signalPassFailure();
-
     // Walk all memory ops and compute the IM-optimal encoding.
     llvm::MapVector<Operation *, Attribute> layoutMap;
 
     mod.walk([&](Operation *op) {
-      if (op->hasAttr("im.pcu-owner"))
-        return;
       Value ptr = getMemAccessPtr(op);
       if (!ptr)
         return;

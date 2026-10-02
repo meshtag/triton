@@ -45,7 +45,6 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
@@ -80,29 +79,13 @@ namespace ttg_ = mlir::triton::gpu;
 /// along another. Returning only the first axis called such a value partitioned and
 /// made its replication free, which is the delivery charge going missing. Identical to
 /// the old single-axis form whenever only one dim carries lanes.
-/// The dims a lane basis moves, read off the linear layout. A zero basis is the pair
-/// lane bit a PCU-paired store leaves free, not a replication.
-static uint32_t laneAxisMaskLL(RankedTensorType tt) {
-  auto lane = StringAttr::get(tt.getContext(), "lane");
-  triton::LinearLayout ll = ttg_::toLinearLayout(tt);
-  uint32_t m = 0u;
-  if (ll.hasInDim(lane))
-    for (const auto &basis : ll.getBases().lookup(lane))
-      for (int d = 0; d < tt.getRank(); ++d)
-        if (basis[d] != 0 && tt.getShape()[d] > 1)
-          m |= 1u << d;
-  return m;
-}
-
-/// `viaLinear` (im.pcu_pair_accumulate) reads a non-blocked encoding through its linear
-/// layout. Off, such an encoding carries no lanes, as before.
-static uint32_t laneAxisMask(Type ty, bool viaLinear = false) {
+static uint32_t laneAxisMask(Type ty) {
   auto tt = dyn_cast<RankedTensorType>(ty);
   if (!tt)
     return 0u;
   auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
   if (!blocked)
-    return viaLinear && tt.getEncoding() ? laneAxisMaskLL(tt) : 0u;
+    return 0u;
   auto tpw = blocked.getThreadsPerWarp();
   uint32_t m = 0u;
   for (int d = 0; d < tt.getRank(); ++d)
@@ -118,28 +101,11 @@ static uint32_t laneAxisMask(Type ty, bool viaLinear = false) {
 /// like 2 on M and 16 on N has a value occupying N replicated over only the 2 M lanes, and
 /// calling that "replicated" charged it to all 32. Measured on OptiPIM's own mapping for
 /// matmul 128x128x64: B cost 16,384 operand writes where 1,024 is the delivery it needs.
-static int64_t laneReplicationFactor(Type ty, uint32_t occ, bool viaLinear = false) {
+static int64_t laneReplicationFactor(Type ty, uint32_t occ) {
   auto tt = dyn_cast<RankedTensorType>(ty);
   if (!tt)
     return 1;
   auto blocked = dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding());
-  if (!blocked && viaLinear && tt.getEncoding()) {
-    auto lane = StringAttr::get(tt.getContext(), "lane");
-    triton::LinearLayout ll = ttg_::toLinearLayout(tt);
-    int64_t f = 1;
-    if (ll.hasInDim(lane))
-      for (const auto &basis : ll.getBases().lookup(lane)) {
-        bool moves = false, occupied = false;
-        for (int d = 0; d < tt.getRank(); ++d)
-          if (basis[d] != 0) {
-            moves = true;
-            occupied |= (occ >> d) & 1u;
-          }
-        if (moves && !occupied)
-          f *= 2;
-      }
-    return f;
-  }
   if (!blocked)
     return 1;
   auto tpw = blocked.getThreadsPerWarp();
@@ -162,11 +128,11 @@ static int64_t laneReplicationFactor(Type ty, uint32_t occ, bool viaLinear = fal
 /// so an operand feeding F cells must be written into F columns; charging it once per
 /// bank was a 64x discount on matmul (review 2026-09-12). The largest fanout over the
 /// stores a value reaches wins, for the same reason replicated wins below.
-static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout, bool viaLinear) {
+static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
   if (cellFanout)
     *cellFanout = 1;
   if (auto st = dyn_cast<triton::StoreOp>(memOp))
-    return laneAxisMask(st.getValue().getType(), viaLinear) != 0u ? 0 : 1;
+    return laneAxisMask(st.getValue().getType()) != 0u ? 0 : 1;
   if (memOp->getNumResults() != 1)
     return -1;
   Value v0 = memOp->getResult(0);
@@ -194,7 +160,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout, bool viaLine
       if (auto st = dyn_cast<triton::StoreOp>(u)) {
         if (st.getValue() != cur)
           continue; // reached through the pointer or mask, not the stored value
-        uint32_t laneM = laneAxisMask(st.getValue().getType(), viaLinear);
+        uint32_t laneM = laneAxisMask(st.getValue().getType());
         if (laneM == 0u)
           return -1;
         // Partitioned only if the value occupies EVERY lane axis. Miss one and it is
@@ -204,7 +170,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout, bool viaLine
         } else {
           anyRep = true;
           // The largest over the stores a value reaches, matching "replicated wins".
-          int64_t f = laneReplicationFactor(st.getValue().getType(), occ, viaLinear);
+          int64_t f = laneReplicationFactor(st.getValue().getType(), occ);
           if (f > repFactor)
             repFactor = f;
         }
@@ -243,12 +209,6 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout, bool viaLine
       }
       if (auto rd = dyn_cast<triton::ReduceOp>(u)) {
         unsigned a = rd.getAxis();
-        // A value the PCU pair reduce sums without occupying the pair axis is the same in
-        // both banks of the PCU, a copy each.
-        if (viaLinear && rd->hasAttr("im.pcu-pair") && !((occ >> a) & 1u)) {
-          anyRep = true;
-          repFactor = std::max<int64_t>(repFactor, 2);
-        }
         uint32_t lo = occ & ((1u << a) - 1), hi = occ >> (a + 1);
         for (Value r : rd.getResults())
           work.push_back({r, lo | (hi << a)});
@@ -988,7 +948,6 @@ struct IMOperandResidencyLayoutPass
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     OpBuilder b(mod.getContext());
-    const bool pairLL = mod->hasAttr("im.pcu_pair_accumulate");
 
     // Step 4 user schedule, validated up front so a malformed one fails before
     // any classification rather than half way through it.
@@ -1121,7 +1080,7 @@ struct IMOperandResidencyLayoutPass
       // encoding rather than letting the host assert it.
       // scalarSplat is itself a positive determination of replication.
       int64_t cellFanout = 1;
-      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op, &cellFanout, pairLL);
+      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op, &cellFanout);
 
       SmallVector<NamedAttribute> fields;
       fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
