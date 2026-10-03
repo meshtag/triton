@@ -112,13 +112,9 @@ class IMOptions:
     # operand hoisted out of the loop loads after that tile's accumulator reset, as DCC
     # orders a round. Off by default: other paths were measured with the prologue apart.
     im_tile_prologue_first: bool = False
-    # Placement policy, stated so the artifact records it instead of the runtime picking
-    # one. "interleaved" spreads consecutive elements across banks, "striped" keeps a
-    # small tensor in one bank.
-    im_layout_scheme: str = "interleaved"
     # Where each tensor starts. "dq" packs tensors into shared rows on different banks,
-    # "global-row" starts every tensor at bank 0, and "row-pack" gives each lane its exact
-    # share of one column space (honoured by the dcc-parity runtime).
+    # and "row-pack" gives each lane its exact share of one column space (honoured by the
+    # dcc-parity runtime).
     im_placement_align: str = "dq"
     # Bits one column command moves, which is what a vector access is sized against.
     # Differs by target: HBM-PIM moves prefetch*dq = 256, SIMDRAM's column is a
@@ -163,7 +159,7 @@ class IMOptions:
         return (f"im-{self.arch}-b{self.num_banks}-c{self.num_ctas}"
                 f"-skip:{skip_tag}-sched:{sched_tag}-bax:{self.im_bank_axis}"
                 f"-bgi:{int(self.im_bg_interleave)}"
-                f"-lay:{self.im_layout_scheme}-align:{self.im_placement_align}"
+                f"-align:{self.im_placement_align}"
                 f"-persist:{int(self.im_persistent)}"
                 f"-dq:{int(self.im_dq_bits)}-split:{self.im_bank_split or 'none'}"
                 f"-fold:{int(self.im_price_folds)}-dax:{int(self.im_derive_bank_axis)}"
@@ -315,18 +311,15 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_mac_addressing", builder.parse_attr("1 : i64"))
         if options.im_dcc_return_from_input:
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
-        _SCHEMES = {"striped": 1, "interleaved": 2}
-        _ALIGNS = {"dq": 1, "global-row": 2, "row-pack": 3}
-        if options.im_layout_scheme not in _SCHEMES:
-            raise ValueError(
-                f"im_layout_scheme={options.im_layout_scheme!r}; "
-                f"expected one of {sorted(_SCHEMES)}")
+        # The record word keeps its old numbering, 2 was global-row.
+        _ALIGNS = {"dq": 1, "row-pack": 3}
         if options.im_placement_align not in _ALIGNS:
             raise ValueError(
                 f"im_placement_align={options.im_placement_align!r}; "
                 f"expected one of {sorted(_ALIGNS)}")
-        mod.set_attr("im.layout_scheme",
-                     builder.parse_attr(f"{_SCHEMES[options.im_layout_scheme]} : i64"))
+        # Interleaved, the only placement anything compiles for. Still stated, so every
+        # artifact is unchanged and the default runtime still warns on a PIM_LAYOUT override.
+        mod.set_attr("im.layout_scheme", builder.parse_attr("2 : i64"))
         mod.set_attr("im.placement_align",
                      builder.parse_attr(f"{_ALIGNS[options.im_placement_align]} : i64"))
         if options.im_dq_bits:

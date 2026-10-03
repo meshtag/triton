@@ -847,20 +847,14 @@ static LogicalResult checkSchedule(DictionaryAttr d, Location loc,
   return success();
 }
 
-/// Overlay `d`, which checkSchedule accepted, on `fields`.
+/// Overlay `d` on `fields`. checkSchedule admits only bank_replicated, as a bool.
 static void applySchedule(OpBuilder &b, DictionaryAttr d,
                           SmallVectorImpl<NamedAttribute> &fields) {
-  for (NamedAttribute e : d) {
-    if (!findForcible(e.getName()))
-      continue; // checkSchedule rejected it already
-    // The classifier writes bank_replicated as a receiver count, so a forced bool is
-    // stamped the same way, true as every bank.
-    if (e.getName() == "bank_replicated" && isa<BoolAttr>(e.getValue()))
-      setField(b, fields, e.getName(),
-               b.getI32IntegerAttr(cast<BoolAttr>(e.getValue()).getValue() ? 1 : 0));
-    else
-      setField(b, fields, e.getName(), e.getValue());
-  }
+  // The classifier writes bank_replicated as a receiver count, so a forced bool is
+  // stamped the same way, true as every bank.
+  for (NamedAttribute e : d)
+    setField(b, fields, e.getName(),
+             b.getI32IntegerAttr(cast<BoolAttr>(e.getValue()).getValue() ? 1 : 0));
 }
 
 } // namespace
