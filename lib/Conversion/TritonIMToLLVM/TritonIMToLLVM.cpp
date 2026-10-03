@@ -995,13 +995,28 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
     auto v = res ? res.getAs<IntegerAttr>(name) : IntegerAttr();
     return v ? v.getInt() : dflt;
   };
+  // A store of a reduce im-lane-fold marked folds a column's lanes too. A slice shorter than
+  // its loop step leaves no loop, so live_split, which reads a carried accumulator, misses it.
+  auto foldsColumn = [](Value v) {
+    for (int hops = 0; v && hops < 8; ++hops) {
+      Operation *def = v.getDefiningOp();
+      if (!def)
+        return false;
+      if (isa<triton::ReduceOp>(def))
+        return def->hasAttr("im.lane-fold");
+      if (def->getNumOperands() != 1)
+        return false;
+      v = def->getOperand(0);
+    }
+    return false;
+  };
   llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> acc;
   bool conflict = false;
   mod.walk([&](triton::StoreOp st) {
     int64_t arg = field(st, "operand_arg", -1);
     if (arg < 0)
       return;
-    bool result = accCells == 0 || field(st, "live_split", 1) > 1;
+    bool result = accCells == 0 || field(st, "live_split", 1) > 1 || foldsColumn(st.getValue());
     std::pair<int32_t, int32_t> c = result ? std::make_pair(0, 2) : std::make_pair(1, 1);
     auto it = acc.find(arg);
     if (it != acc.end() && it->second != c)
