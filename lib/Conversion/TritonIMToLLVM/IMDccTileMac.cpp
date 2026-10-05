@@ -15,6 +15,7 @@
  * addresses a MAC by, [head stride, reduce stride, reduce extent] in elements, read off the
  * load's pointer arithmetic, so the runtime can issue each tile at their address.
  */
+#include "IMContraction.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Matchers.h"
@@ -35,6 +36,7 @@ namespace im {
 } // namespace mlir
 
 using namespace mlir;
+using namespace mlir::triton::im::contraction;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
@@ -45,95 +47,6 @@ constexpr llvm::StringLiteral kMarkedAttr = "im.dcc-tile-mac";
 constexpr llvm::StringLiteral kAddrGateAttr = "im.dcc_mac_addressing";
 /// [head stride, reduce stride, reduce extent] of a selected load, in elements.
 constexpr llvm::StringLiteral kAddrAttr = "im.dcc-mac-addr";
-
-static Value skipConvert(Value v) {
-  while (auto c = v.getDefiningOp<ttg::ConvertLayoutOp>())
-    v = c.getSrc();
-  return v;
-}
-
-static bool isBroadcastOperand(Value v) {
-  v = skipConvert(v);
-  Operation *d = v.getDefiningOp();
-  return d && isa<triton::BroadcastOp, triton::ExpandDimsOp>(d);
-}
-
-static Value baseArg(Value p) {
-  while (true) {
-    if (auto ba = dyn_cast<BlockArgument>(p))
-      return isa<triton::FuncOp>(ba.getOwner()->getParentOp()) ? p : Value();
-    Operation *d = p.getDefiningOp();
-    if (!d)
-      return {};
-    if (auto a = dyn_cast<triton::AddPtrOp>(d)) {
-      p = a.getPtr();
-      continue;
-    }
-    if (isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp,
-            triton::ReshapeOp, ttg::ConvertLayoutOp>(d)) {
-      p = d->getOperand(0);
-      continue;
-    }
-    return {};
-  }
-}
-
-static std::optional<int64_t> constSplat(Value v) {
-  v = skipConvert(v);
-  if (auto s = v.getDefiningOp<triton::SplatOp>())
-    v = s.getSrc();
-  APInt c;
-  if (matchPattern(v, m_ConstantInt(&c)))
-    return c.getSExtValue();
-  return std::nullopt;
-}
-
-/// Element stride per dim of a pointer tensor, when each term is an arange along one dim
-/// times a constant, plus terms that are uniform across the tensor.
-static std::optional<SmallVector<int64_t>> elemStrides(Value v) {
-  auto ty = dyn_cast<RankedTensorType>(v.getType());
-  if (!ty)
-    return SmallVector<int64_t>{};  // a scalar is uniform
-  SmallVector<int64_t> zero(ty.getRank(), 0);
-  if (isa<BlockArgument>(v))
-    return std::nullopt;
-  Operation *d = v.getDefiningOp();
-  if (!d)
-    return std::nullopt;
-  if (isa<triton::SplatOp, arith::ConstantOp>(d))
-    return zero;
-  if (auto r = dyn_cast<triton::MakeRangeOp>(d))
-    return SmallVector<int64_t>{1};
-  if (isa<ttg::ConvertLayoutOp, triton::BroadcastOp, arith::ExtSIOp, arith::ExtUIOp,
-          arith::TruncIOp, arith::IndexCastOp>(d))
-    return elemStrides(d->getOperand(0));
-  if (auto e = dyn_cast<triton::ExpandDimsOp>(d)) {
-    auto in = elemStrides(e.getSrc());
-    if (!in)
-      return std::nullopt;
-    in->insert(in->begin() + e.getAxis(), 0);
-    return in;
-  }
-  if (isa<triton::AddPtrOp, arith::AddIOp>(d)) {
-    auto a = elemStrides(d->getOperand(0)), b = elemStrides(d->getOperand(1));
-    if (!a || !b || a->size() != b->size())
-      return std::nullopt;
-    for (size_t i = 0; i < a->size(); ++i)
-      (*a)[i] += (*b)[i];
-    return a;
-  }
-  if (isa<arith::MulIOp>(d))
-    for (int side = 0; side < 2; ++side)
-      if (auto c = constSplat(d->getOperand(side))) {
-        auto o = elemStrides(d->getOperand(1 - side));
-        if (!o)
-          return std::nullopt;
-        for (auto &x : *o)
-          x *= *c;
-        return o;
-      }
-  return std::nullopt;
-}
 
 /// [head stride, reduce stride, reduce extent] of a DCC tile load, when A is laid out as
 /// their generator reads it, mat[head][k][out] with 16 outputs to a column.

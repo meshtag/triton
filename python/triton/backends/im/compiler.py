@@ -155,6 +155,9 @@ class IMOptions:
     # their tensor index fixes and the iteration points per lane per step, written into
     # the artifact for the optipim-parity runtime's PIM_OPT_NATIVE replay.
     im_optipim_conv: bool = False
+    # A contraction's first product initialises its accumulator, a MUL into GRF_B, so the
+    # reset before it goes (im-acc-init-fold). Needs im_dcc_acc_grf, which states it.
+    im_acc_init_fold: bool = False
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -173,7 +176,8 @@ class IMOptions:
                 f"-accgrf:{int(self.im_dcc_acc_grf)}"
                 f"-macaddr:{int(self.im_dcc_mac_addressing)}"
                 f"-retfrom:{int(self.im_dcc_return_from_input)}"
-                f"-optconv:{int(self.im_optipim_conv)}")
+                f"-optconv:{int(self.im_optipim_conv)}"
+                f"-accinit:{int(self.im_acc_init_fold)}")
 
 
 class IMBackend(BaseBackend):
@@ -318,6 +322,11 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
         if options.im_optipim_conv:
             mod.set_attr("im.optipim_conv", builder.parse_attr("1 : i64"))
+        if options.im_acc_init_fold:
+            if not options.im_dcc_acc_grf:
+                raise ValueError("im_acc_init_fold is stated through the accumulator "
+                                 "convention, set im_dcc_acc_grf too")
+            mod.set_attr("im.acc_init_fold", builder.parse_attr("1 : i64"))
         # The record word keeps its old numbering, 2 was global-row.
         _ALIGNS = {"dq": 1, "row-pack": 3}
         if options.im_placement_align not in _ALIGNS:
@@ -412,6 +421,7 @@ class IMBackend(BaseBackend):
             "im-tile-boundary",
             "im-lane-fold",
             "im-dcc-tile-mac",
+            "im-acc-init-fold",
             "im-relu-opcode",
             "convert-scf-to-cf",
             "convert-triton-im-to-llvm",
@@ -440,6 +450,8 @@ class IMBackend(BaseBackend):
             passes.convert.add_im_lane_fold(pm)
         if "im-dcc-tile-mac" not in skip:
             passes.convert.add_im_dcc_tile_mac(pm)
+        if "im-acc-init-fold" not in skip:
+            passes.convert.add_im_acc_init_fold(pm)
         if "im-relu-opcode" not in skip:
             passes.convert.add_im_relu_opcode(pm)
         passes.convert.add_scf_to_cf(pm)

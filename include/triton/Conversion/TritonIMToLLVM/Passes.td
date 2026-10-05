@@ -154,4 +154,17 @@ def IMDccTileMac : Pass<"im-dcc-tile-mac", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
 }
 
+def IMAccInitFold : Pass<"im-acc-init-fold", "mlir::ModuleOp"> {
+  let summary = "State that a contraction's first product initialises its accumulator";
+  let description = [{
+    Only runs when the module carries `im.acc_init_fold`. A reduce over load * broadcast
+    has no init, so the load's read at reduce coordinate 0 writes each accumulator entry,
+    a MUL into GRF_B in the HBM-PIM ISA, and the entry needs no reset. The load is stamped
+    with its reduce stride and extent in elements and the store of the result with
+    `im.acc-init-fold`. One contraction per module, whose product is its argument's only
+    load and whose store is its argument's only store, or nothing is stamped.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

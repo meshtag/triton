@@ -1014,13 +1014,17 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
     return false;
   };
   llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> acc;
-  bool conflict = false;
+  bool conflict = false, foldOnResult = false;
   mod.walk([&](triton::StoreOp st) {
     int64_t arg = field(st, "operand_arg", -1);
     if (arg < 0)
       return;
     bool result = accCells == 0 || field(st, "live_split", 1) > 1 || foldsColumn(st.getValue());
-    std::pair<int32_t, int32_t> c = result ? std::make_pair(0, 2) : std::make_pair(1, 1);
+    // reset 2: im-acc-init-fold, the first product writes the entry, so no reset.
+    bool folded = st->hasAttr("im.acc-init-fold");
+    foldOnResult |= folded && result;
+    std::pair<int32_t, int32_t> c =
+        result ? std::make_pair(0, 2) : std::make_pair(folded ? 2 : 1, 1);
     auto it = acc.find(arg);
     if (it != acc.end() && it->second != c)
       conflict = true;
@@ -1046,6 +1050,22 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
   if (conflict)
     return mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result "
                               "and as an accumulator, which no single DCC convention covers";
+  if (foldOnResult)
+    return mod.emitError() << "im-acc-init-fold folded a store that DCC's convention drains "
+                              "as a result, which has no reset to fold";
+  // [operand_arg, reduce stride, reduce extent] of each folded contraction's product.
+  llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> first;
+  bool anyFolded = llvm::any_of(acc, [](auto &kv) { return kv.second.first == 2; });
+  if (anyFolded)
+    mod.walk([&](triton::LoadOp ld) {
+      auto g = ld->getAttrOfType<DenseI64ArrayAttr>("im.mac-first");
+      int64_t arg = field(ld, "operand_arg", -1);
+      if (g && arg >= 0)
+        first[arg] = {(int32_t)g.asArrayRef()[0], (int32_t)g.asArrayRef()[1]};
+    });
+  if (anyFolded && first.empty())
+    return mod.emitError() << "im-acc-init-fold: a folded accumulator's product load has no "
+                              "operand argument, so the runtime could not find its MUL";
   OpBuilder b(mod.getBodyRegion());
   b.setInsertionPointToStart(mod.getBody());
   Location loc = mod.getLoc();
@@ -1073,6 +1093,13 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
   table("__pim_dcc_grf_a", grf);
   scalar("__pim_dcc_grf_a_count", (int32_t)grf.size());
   scalar("__pim_dcc_decided", 1);
+  if (mod->hasAttr("im.acc_init_fold")) {
+    SmallVector<int32_t> flatFirst;
+    for (auto &kv : first)
+      flatFirst.append({(int32_t)kv.first, kv.second.first, kv.second.second});
+    table("__pim_mac_first", flatFirst);
+    scalar("__pim_mac_first_count", (int32_t)first.size());
+  }
   return success();
 }
 

@@ -146,6 +146,7 @@ void init_triton_passes_convert(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_im_relu_opcode", triton::im::createIMReluOpcodePass);
   ADD_PASS_WRAPPER_0("add_im_load_cluster", triton::im::createIMLoadClusterPass);
   ADD_PASS_WRAPPER_0("add_im_dcc_tile_mac", triton::im::createIMDccTileMacPass);
+  ADD_PASS_WRAPPER_0("add_im_acc_init_fold", triton::im::createIMAccInitFoldPass);
   ADD_PASS_WRAPPER_0("add_im_operand_residency_layout",
                      triton::im::createIMOperandResidencyLayoutPass);
 }
