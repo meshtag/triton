@@ -136,8 +136,8 @@ class IMOptions:
     # which their simulator does not space on the command bus. Only the dcc-parity runtime
     # defines the call, so it is off unless a DCC harness asks for it.
     im_dcc_relu_opcode: bool = False
-    # Group a two-tensor loop's loads by tensor (im-load-cluster), in strips that fit this
-    # many register-file entries per lane. 0 leaves loop bodies as written.
+    # Unroll and jam a loop, its loads grouped by tensor (im-load-cluster), in strips that
+    # fit this many register-file entries per lane. 0 leaves loop bodies as written.
     im_cluster_loads: int = 0
     # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
     # issues one command per tile, their ISA's pricing, a convention of the DCC path.

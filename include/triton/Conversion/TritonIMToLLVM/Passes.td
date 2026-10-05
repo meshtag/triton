@@ -130,14 +130,15 @@ def IMReluOpcode : Pass<"im-relu-opcode", "mlir::ModuleOp"> {
 
 // Groups a loop's loads by tensor, n unrolled iterations at a time.
 def IMLoadCluster : Pass<"im-load-cluster", "mlir::ModuleOp"> {
-  let summary = "Unroll a two-tensor loop and group each strip's loads by argument";
+  let summary = "Unroll and jam a loop, grouping each strip's loads by argument";
   let description = [{
     Only runs when the module carries `im.cluster_loads = n`, the register-file entries
     per lane. An innermost scf.for with a constant trip count whose body loads two or
-    more kernel arguments, stores none of them and touches memory no other way is
-    unrolled by G, the largest proper divisor of its trip count whose G iterations of
-    any one argument fit n entries. Each strip's loads are grouped by argument, so a
-    DRAM row stays open for G loads. Reads the lane layout.
+    more kernel arguments (or one, when it also stores), stores none of them and touches
+    memory no other way is unrolled by G, the largest proper divisor of its trip count
+    whose G iterations of any one argument fit n entries. Each strip's loads are grouped
+    by argument, so a DRAM row stays open for G loads. Reads the lane layout. Stamps the
+    widest strip of a storing loop as `im.map_strip_entries`.
   }];
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
 }

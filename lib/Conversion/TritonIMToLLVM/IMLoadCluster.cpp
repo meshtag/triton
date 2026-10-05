@@ -5,12 +5,16 @@
  * fills its own DRAM row per bank, every load switches rows. DCC's generator walks n_grf
  * columns of one operand before the next (gen_trace_HBMPIM_VA.py:118-131), so a row stays
  * open for G commands. This unrolls such a loop by G and moves its loads up, grouped by
- * the kernel argument they read.
+ * the kernel argument they read. A map that loads one tensor alternates between its load
+ * and store rows the same way.
  *
  * A strip's first group stays live until its last is loaded, so G iterations of any one
  * argument must fit `im.cluster_loads` register-file entries per lane. That count reads
  * the lane layout, which is why this runs after rewrite-im-layout. G is a proper divisor
- * of the trip count, so no epilogue loop and no promotion to straight-line code.
+ * of the trip count, so no epilogue loop and no promotion to straight-line code. The
+ * widest strip of a loop that stores is stamped as `im.map_strip_entries`: wider than
+ * GRF_B, its results must stay in place over the operand registers, and the runtime checks
+ * it against both files.
  *
  * Only loads and ops free of memory effects move, and a load never moves above a store
  * to the argument it reads. Moving a load past a store
@@ -91,9 +95,9 @@ static int64_t entriesPerLane(triton::LoadOp ld, int64_t dqBits) {
   return (bits + dqBits - 1) / dqBits;
 }
 
-/// Loads read two or more arguments, none of them stored, and nothing else in the body
-/// touches memory. `widest` gets the most entries per lane one iteration loads of any
-/// one argument.
+/// Loads read two or more arguments, or one when the body also stores, none of them
+/// stored, and nothing else in the body touches memory. `widest` gets the most entries per
+/// lane one iteration loads of any one argument.
 static bool qualifies(scf::ForOp f, int64_t dqBits, int64_t &widest) {
   llvm::MapVector<Value, int64_t> loaded;
   llvm::SetVector<Value> stored;
@@ -115,7 +119,8 @@ static bool qualifies(scf::ForOp f, int64_t dqBits, int64_t &widest) {
       return false;
     }
   }
-  if (loaded.size() < 2)
+  // A map's one loaded tensor and its stores take turns on two rows, as two loads do.
+  if (loaded.size() < 2 && (loaded.empty() || stored.empty()))
     return false;
   widest = 0;
   for (auto &kv : loaded) {
@@ -190,6 +195,7 @@ struct IMLoadClusterPass
         loops.push_back({f, widest});
     });
     MLIRContext *ctx = mod.getContext();
+    int64_t strip = 0;
     for (auto [f, widest] : loops) {
       auto trip = tripCount(f);
       if (!trip)
@@ -204,12 +210,20 @@ struct IMLoadClusterPass
         continue;
       for (Operation &op : f.getBody()->without_terminator())
         op.setAttr(kBodyAttr, UnitAttr::get(ctx));
+      bool stores = false;
+      f.getBody()->walk([&](triton::StoreOp) { stores = true; });
       auto res = loopUnrollByFactor(f, g);
-      if (succeeded(res) && res->mainLoopOp && clusterLoads(*res->mainLoopOp->getBody()))
+      if (succeeded(res) && res->mainLoopOp && clusterLoads(*res->mainLoopOp->getBody())) {
         (*res->mainLoopOp)->setAttr(kMarkedAttr,
                                     IntegerAttr::get(IntegerType::get(ctx, 64), g));
+        if (stores)
+          strip = std::max(strip, g * widest);
+      }
     }
     mod.walk([&](Operation *op) { op->removeAttr(kBodyAttr); });
+    if (strip)
+      mod->setAttr("im.map_strip_entries",
+                   IntegerAttr::get(IntegerType::get(ctx, 64), strip));
   }
 };
 
