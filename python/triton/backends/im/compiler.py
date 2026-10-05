@@ -151,6 +151,10 @@ class IMOptions:
     # A lane-folded partial's return stage is sized from its one input, as DCC's RED does,
     # for the dcc-parity runtime's RET bit.
     im_dcc_return_from_input: bool = False
+    # OptiPIM's codegen_new conventions for the kernel's one contraction: the operand roles
+    # their tensor index fixes and the iteration points per lane per step, written into
+    # the artifact for the optipim-parity runtime's PIM_OPT_NATIVE replay.
+    im_optipim_conv: bool = False
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -168,7 +172,8 @@ class IMOptions:
                 f"-prologue:{int(self.im_tile_prologue_first)}"
                 f"-accgrf:{int(self.im_dcc_acc_grf)}"
                 f"-macaddr:{int(self.im_dcc_mac_addressing)}"
-                f"-retfrom:{int(self.im_dcc_return_from_input)}")
+                f"-retfrom:{int(self.im_dcc_return_from_input)}"
+                f"-optconv:{int(self.im_optipim_conv)}")
 
 
 class IMBackend(BaseBackend):
@@ -311,6 +316,8 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_mac_addressing", builder.parse_attr("1 : i64"))
         if options.im_dcc_return_from_input:
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
+        if options.im_optipim_conv:
+            mod.set_attr("im.optipim_conv", builder.parse_attr("1 : i64"))
         # The record word keeps its old numbering, 2 was global-row.
         _ALIGNS = {"dq": 1, "row-pack": 3}
         if options.im_placement_align not in _ALIGNS:

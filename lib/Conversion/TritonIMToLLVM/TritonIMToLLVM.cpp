@@ -53,6 +53,7 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -1122,6 +1123,232 @@ static void emitDccReturnFrom(ModuleOp mod) {
                          b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
 }
 
+// OptiPIM's codegen_new conventions for the kernel's one contraction (im.optipim_conv):
+// the role their tensor index fixes for each operand, Inputs1 written over the bus,
+// Inputs2/Filters bank-read, Outputs read back, and the product's elements per lane, the
+// iteration points one step charges by position. Their roles are positional, so ours are
+// too: the product's first factor is the input and its second the weight.
+static LogicalResult emitOptiPimConv(ModuleOp mod) {
+  if (!mod->hasAttr("im.optipim_conv"))
+    return success();
+  auto argOf = [](Operation *op, Value ptr) -> int64_t {
+    if (auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency")))
+      if (auto a = res.getAs<IntegerAttr>("operand_arg"); a && a.getInt() >= 0)
+        return a.getInt();
+    for (Value p = ptr;;) {
+      if (auto ba = dyn_cast<BlockArgument>(p))
+        return isa<triton::FuncOp>(ba.getOwner()->getParentOp()) ? ba.getArgNumber() : -1;
+      Operation *d = p.getDefiningOp();
+      if (!d)
+        return -1;
+      if (auto a = dyn_cast<triton::AddPtrOp>(d))
+        p = a.getPtr();
+      else if (isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp,
+                   triton::ReshapeOp, triton::gpu::ConvertLayoutOp>(d))
+        p = d->getOperand(0);
+      else
+        return -1;
+    }
+  };
+  auto loadOf = [](Value v) -> triton::LoadOp {
+    while (Operation *d = v.getDefiningOp()) {
+      if (auto ld = dyn_cast<triton::LoadOp>(d))
+        return ld;
+      if (!isa<triton::BroadcastOp, triton::ExpandDimsOp, triton::ReshapeOp,
+               triton::gpu::ConvertLayoutOp, arith::ExtFOp, arith::TruncFOp>(d))
+        return {};
+      v = d->getOperand(0);
+    }
+    return {};
+  };
+  SmallVector<std::pair<triton::ReduceOp, arith::MulFOp>> found;
+  mod.walk([&](triton::ReduceOp red) {
+    if (red.getNumOperands() != 1)
+      return;
+    Value src = red.getOperands()[0];
+    while (auto cvt = src.getDefiningOp<triton::gpu::ConvertLayoutOp>())
+      src = cvt.getSrc();
+    bool adds = false;
+    red.getCombineOp().walk([&](Operation *op) {
+      adds |= isa<arith::AddFOp>(op);
+    });
+    if (auto mul = src.getDefiningOp<arith::MulFOp>(); mul && adds)
+      found.push_back({red, mul});
+  });
+  if (found.size() != 1)
+    return mod.emitError() << "im.optipim_conv needs exactly one contraction, a sum over a "
+                              "product, and this kernel has " << found.size();
+  auto [red, mul] = found.front();
+  triton::LoadOp in = loadOf(mul.getLhs()), wt = loadOf(mul.getRhs());
+  int64_t inArg = in ? argOf(in, in.getPtr()) : -1;
+  int64_t wtArg = wt ? argOf(wt, wt.getPtr()) : -1;
+  int64_t outArg = -1;
+  SmallVector<Value> work{red.getResult()[0]};
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *u : v.getUsers()) {
+      if (!seen.insert(u).second)
+        continue;
+      if (auto st = dyn_cast<triton::StoreOp>(u)) {
+        if (st.getValue() == v)
+          outArg = argOf(st, st.getPtr());
+        continue;
+      }
+      if (u->getNumResults() == 1 && isa<RankedTensorType>(u->getResult(0).getType()))
+        work.push_back(u->getResult(0));
+    }
+  }
+  if (inArg < 0 || wtArg < 0 || outArg < 0 || inArg == wtArg)
+    return mod.emitError() << "im.optipim_conv cannot name the contraction's operands: "
+                           << "input arg " << inArg << ", weight arg " << wtArg
+                           << ", output arg " << outArg;
+  // Iteration points per lane: the product's elements in one lane, less those a padding
+  // mask switches off. A conjunct `make_range < constant` on a dimension the lane holds
+  // whole bounds that dimension; masks on lane dimensions only idle whole lanes.
+  auto prodTy = cast<RankedTensorType>(mul.getType());
+  auto blocked = dyn_cast<triton::gpu::BlockedEncodingAttr>(prodTy.getEncoding());
+  if (!blocked)
+    return mod.emitError() << "im.optipim_conv needs a blocked product layout";
+  SmallVector<int64_t> active(blocked.getSizePerThread().begin(),
+                              blocked.getSizePerThread().end());
+  auto tpw = blocked.getThreadsPerWarp();
+  auto constOf = [](Value v) -> std::optional<int64_t> {
+    while (auto bc = v.getDefiningOp<triton::BroadcastOp>())
+      v = bc.getSrc();
+    if (auto sp = v.getDefiningOp<triton::SplatOp>())
+      return getConstantIntValue(sp.getSrc());
+    if (auto k = v.getDefiningOp<arith::ConstantOp>())
+      if (auto dense = dyn_cast<SplatElementsAttr>(k.getValue()))
+        if (dense.getElementType().isInteger())
+          return dense.getSplatValue<llvm::APInt>().getSExtValue();
+    return getConstantIntValue(v);
+  };
+  // Replay expand_dims applied in this order (nearest the range first) on a rank-1 range.
+  auto replay = [](ArrayRef<int64_t> axes, int64_t pos) {
+    for (int64_t a : axes)
+      if (a <= pos)
+        ++pos;
+    return pos;
+  };
+  // The dimension of a value that is one make_range carried to `rank` by expand_dims,
+  // broadcast, layout conversions and integer arithmetic with constants. `pure` stays true
+  // only without arithmetic. -1 when it is anything else.
+  auto rangeDim = [&](Value v, int64_t rank, bool &pure) -> int64_t {
+    SmallVector<int64_t> inserted; // outermost first
+    pure = true;
+    while (Operation *d = v.getDefiningOp()) {
+      if (auto ex = dyn_cast<triton::ExpandDimsOp>(d)) {
+        inserted.push_back(ex.getAxis());
+        v = ex.getSrc();
+      } else if (isa<triton::BroadcastOp, triton::gpu::ConvertLayoutOp>(d)) {
+        v = d->getOperand(0);
+      } else if (auto mr = dyn_cast<triton::MakeRangeOp>(d)) {
+        pure &= mr.getStart() == 0;
+        SmallVector<int64_t> fwd(inserted.rbegin(), inserted.rend());
+        return 1 + (int64_t)inserted.size() == rank ? replay(fwd, 0) : -1;
+      } else if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+                     arith::RemSIOp, arith::DivUIOp, arith::RemUIOp>(d)) {
+        Value a = d->getOperand(0), b = d->getOperand(1);
+        if (constOf(b))
+          v = a;
+        else if (constOf(a))
+          v = b;
+        else
+          return -1;
+        pure = false;
+      } else {
+        return -1;
+      }
+    }
+    return -1;
+  };
+  LogicalResult counted = success();
+  auto bound = [&](triton::LoadOp ld) {
+    Value mask = ld.getMask();
+    auto ldTy = dyn_cast<RankedTensorType>(ld.getType());
+    if (!mask || !ldTy)
+      return;
+    if (ldTy.getRank() != prodTy.getRank()) {
+      counted = ld.emitError() << "im.optipim_conv counts a masked operand only when it is "
+                                  "loaded at the product's rank";
+      return;
+    }
+    // Each conjunct with the expand_dims applied after it, outermost first.
+    SmallVector<std::pair<Value, SmallVector<int64_t>>> terms{{mask, {}}};
+    while (!terms.empty()) {
+      auto [v, outer] = terms.pop_back_val();
+      Operation *d = v.getDefiningOp();
+      if (!d)
+        continue;
+      if (isa<arith::AndIOp>(d)) {
+        for (Value o : d->getOperands())
+          terms.push_back({o, outer});
+        continue;
+      }
+      if (auto ex = dyn_cast<triton::ExpandDimsOp>(d)) {
+        auto o = outer;
+        o.push_back(ex.getAxis());
+        terms.push_back({ex.getSrc(), o});
+        continue;
+      }
+      if (isa<triton::BroadcastOp, triton::gpu::ConvertLayoutOp>(d)) {
+        terms.push_back({d->getOperand(0), outer});
+        continue;
+      }
+      if (constOf(v))
+        continue; // an all-true or all-false constant mask
+      auto cmp = dyn_cast<arith::CmpIOp>(d);
+      bool pure = false;
+      int64_t dim = -1;
+      if (cmp) {
+        auto cmpTy = dyn_cast<RankedTensorType>(cmp.getLhs().getType());
+        int64_t inner = cmpTy ? rangeDim(cmp.getLhs(), cmpTy.getRank(), pure) : -1;
+        if (inner >= 0) {
+          SmallVector<int64_t> fwd(outer.rbegin(), outer.rend());
+          dim = cmpTy.getRank() + (int64_t)outer.size() == ldTy.getRank()
+                    ? replay(fwd, inner) : -1;
+        }
+      }
+      if (dim >= 0 && tpw[dim] != 1)
+        continue; // on a lane axis: idles whole lanes, counts nothing in one
+      auto c = cmp ? constOf(cmp.getRhs()) : std::nullopt;
+      if (dim < 0 || !pure || !c || cmp.getPredicate() != arith::CmpIPredicate::slt) {
+        counted = ld.emitError() << "im.optipim_conv cannot count a mask term on a "
+                                    "dimension the lane holds whole; write it as "
+                                    "`range < extent` on that dimension";
+        return;
+      }
+      active[dim] = std::min<int64_t>(active[dim], std::max<int64_t>(*c, 0));
+    }
+  };
+  bound(in);
+  bound(wt);
+  if (failed(counted))
+    return failure();
+  int64_t cells64 = 1;
+  for (int64_t v : active)
+    cells64 *= v;
+  int32_t cells = (int32_t)cells64;
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  SmallVector<int32_t> flat{(int32_t)inArg, 1, (int32_t)wtArg, 2, (int32_t)outArg, 3};
+  auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
+  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+  LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_role",
+                         DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_role_count", b.getI32IntegerAttr(3));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_cells", b.getI32IntegerAttr(cells));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_decided", b.getI32IntegerAttr(1));
+  return success();
+}
+
 // Banks are lanes, and a bank cannot read another bank's registers, so the target's shuffles
 // return their input (TargetInfo.cpp). Anything that would move a value between lanes then
 // lowers to a wrong value with no error: a reduce with banks on its axis adds each lane to
@@ -1209,6 +1436,8 @@ struct ConvertTritonIMToLLVM
     if (failed(emitDccAccGrf(mod)))
       return signalPassFailure();
     emitDccReturnFrom(mod);
+    if (failed(emitOptiPimConv(mod)))
+      return signalPassFailure();
 
     triton::im::TargetInfo targetInfo;
 
