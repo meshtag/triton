@@ -30,8 +30,6 @@ inline Value baseArg(Value p) {
     if (auto ba = dyn_cast<BlockArgument>(p))
       return isa<triton::FuncOp>(ba.getOwner()->getParentOp()) ? p : Value();
     Operation *d = p.getDefiningOp();
-    if (!d)
-      return {};
     if (auto a = dyn_cast<triton::AddPtrOp>(d)) {
       p = a.getPtr();
       continue;
@@ -65,11 +63,9 @@ inline std::optional<SmallVector<int64_t>> elemStrides(Value v) {
   if (isa<BlockArgument>(v))
     return std::nullopt;
   Operation *d = v.getDefiningOp();
-  if (!d)
-    return std::nullopt;
   if (isa<triton::SplatOp, arith::ConstantOp>(d))
     return zero;
-  if (auto r = dyn_cast<triton::MakeRangeOp>(d))
+  if (isa<triton::MakeRangeOp>(d))
     return SmallVector<int64_t>{1};
   if (isa<gpu::ConvertLayoutOp, triton::BroadcastOp, arith::ExtSIOp, arith::ExtUIOp,
           arith::TruncIOp, arith::IndexCastOp>(d))

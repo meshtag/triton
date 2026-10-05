@@ -68,9 +68,7 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
     SmallVector<Mark> marks;
     bool unknown = false;
     mod.walk([&](triton::ReduceOp red) {
-      auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
-      if (!ty)
-        return;
+      auto ty = cast<RankedTensorType>(red.getOperands()[0].getType());
       auto enc = dyn_cast_or_null<ttg::BlockedEncodingAttr>(ty.getEncoding());
       if (!enc) {
         unknown = true;

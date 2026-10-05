@@ -932,7 +932,7 @@ static void emitDccTileMac(ModuleOp mod) {
     auto res = dyn_cast_or_null<DictionaryAttr>(ld->getDiscardableAttr("im.residency"));
     auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
     if (stamp && arg && arg.getInt() >= 0)
-      byArg[arg.getInt()] = (int32_t)stamp.asArrayRef()[2];
+      byArg[arg.getInt()] = (int32_t)stamp.asArrayRef()[0];
   });
   OpBuilder b(mod.getBodyRegion());
   b.setInsertionPointToStart(mod.getBody());

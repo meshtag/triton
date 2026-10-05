@@ -17,14 +17,11 @@
  */
 #include "IMContraction.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 
 namespace mlir {
 namespace triton {
@@ -42,7 +39,7 @@ namespace ttg = mlir::triton::gpu;
 namespace {
 
 constexpr llvm::StringLiteral kGateAttr = "im.dcc_tile_mac";
-/// Stamped on a selected load as [k per tile, outputs per tile, reads per MAC].
+/// Stamped on a selected load as [reads per MAC].
 constexpr llvm::StringLiteral kMarkedAttr = "im.dcc-tile-mac";
 constexpr llvm::StringLiteral kAddrGateAttr = "im.dcc_mac_addressing";
 /// [head stride, reduce stride, reduce extent] of a selected load, in elements.
@@ -154,7 +151,7 @@ struct IMDccTileMacPass : public triton::im::impl::IMDccTileMacBase<IMDccTileMac
       if (!uniform || loadsOf[kv.first] != (int64_t)kv.second.size())
         continue;
       for (auto &p : kv.second) {
-        p.first->setAttr(kMarkedAttr, DenseI64ArrayAttr::get(mod.getContext(), {r, r, r}));
+        p.first->setAttr(kMarkedAttr, DenseI64ArrayAttr::get(mod.getContext(), {r}));
         if (geometry.count(p.first))
           p.first->setAttr(kAddrAttr,
                            DenseI64ArrayAttr::get(mod.getContext(), geometry[p.first]));

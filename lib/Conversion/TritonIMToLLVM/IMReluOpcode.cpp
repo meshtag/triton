@@ -35,7 +35,6 @@ namespace {
 
 constexpr llvm::StringLiteral kOpFn = "__pim_trace_op";
 constexpr llvm::StringLiteral kGateAttr = "im.dcc_relu_opcode";
-constexpr llvm::StringLiteral kMarkedAttr = "im.relu-opcode";
 constexpr int32_t kOpNone = 0, kOpRelu = 1;
 
 static bool isZero(Value v) {
@@ -109,7 +108,6 @@ struct IMReluOpcodePass
       call(b, ld.getLoc(), kOpRelu);
       b.setInsertionPointAfter(ld);
       call(b, ld.getLoc(), kOpNone);
-      ld->setAttr(kMarkedAttr, b.getUnitAttr());
     }
   }
 };

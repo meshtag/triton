@@ -16,7 +16,6 @@
  */
 #include "IMContraction.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
