@@ -167,4 +167,19 @@ def IMAccInitFold : Pass<"im-acc-init-fold", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
 }
 
+def IMOptiPimMac : Pass<"im-optipim-mac", "mlir::ModuleOp"> {
+  let summary = "Lower the contraction to MACs of the PE OptiPIM's machine declares";
+  let description = [{
+    Only runs when the module carries `im.optipim_mac`. Their PE takes 16 values of 16
+    bits per MAC and has one register and no accumulator, so a lane runs ceil(cells / 16)
+    MACs per contraction, its cells being the product's elements its operand masks leave
+    on, lane terms included. A loop of `__pim_opt_mac(j)` calls goes where the contraction
+    executes. The per-lane counts, the arranged slot of MAC j in step t and t as an affine
+    map of the program ids and the tile index are stated as globals.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
+                           "mlir::gpu::GPUDialect", "mlir::LLVM::LLVMDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 #endif // TRITONIM_CONVERSION_PASSES

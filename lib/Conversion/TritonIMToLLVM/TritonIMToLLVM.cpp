@@ -45,6 +45,7 @@
 /// When vec==1 (e.g. non-contiguous access or sub-byte elements),
 /// this gracefully degrades to scalar behavior.
 
+#include "IMContraction.h"
 #include "TargetInfo.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
@@ -1240,56 +1241,6 @@ static LogicalResult emitOptiPimConv(ModuleOp mod) {
   SmallVector<int64_t> active(blocked.getSizePerThread().begin(),
                               blocked.getSizePerThread().end());
   auto tpw = blocked.getThreadsPerWarp();
-  auto constOf = [](Value v) -> std::optional<int64_t> {
-    while (auto bc = v.getDefiningOp<triton::BroadcastOp>())
-      v = bc.getSrc();
-    if (auto sp = v.getDefiningOp<triton::SplatOp>())
-      return getConstantIntValue(sp.getSrc());
-    if (auto k = v.getDefiningOp<arith::ConstantOp>())
-      if (auto dense = dyn_cast<SplatElementsAttr>(k.getValue()))
-        if (dense.getElementType().isInteger())
-          return dense.getSplatValue<llvm::APInt>().getSExtValue();
-    return getConstantIntValue(v);
-  };
-  // Replay expand_dims applied in this order (nearest the range first) on a rank-1 range.
-  auto replay = [](ArrayRef<int64_t> axes, int64_t pos) {
-    for (int64_t a : axes)
-      if (a <= pos)
-        ++pos;
-    return pos;
-  };
-  // The dimension of a value that is one make_range carried to `rank` by expand_dims,
-  // broadcast, layout conversions and integer arithmetic with constants. `pure` stays true
-  // only without arithmetic. -1 when it is anything else.
-  auto rangeDim = [&](Value v, int64_t rank, bool &pure) -> int64_t {
-    SmallVector<int64_t> inserted; // outermost first
-    pure = true;
-    while (Operation *d = v.getDefiningOp()) {
-      if (auto ex = dyn_cast<triton::ExpandDimsOp>(d)) {
-        inserted.push_back(ex.getAxis());
-        v = ex.getSrc();
-      } else if (isa<triton::BroadcastOp, triton::gpu::ConvertLayoutOp>(d)) {
-        v = d->getOperand(0);
-      } else if (auto mr = dyn_cast<triton::MakeRangeOp>(d)) {
-        pure &= mr.getStart() == 0;
-        SmallVector<int64_t> fwd(inserted.rbegin(), inserted.rend());
-        return 1 + (int64_t)inserted.size() == rank ? replay(fwd, 0) : -1;
-      } else if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
-                     arith::RemSIOp, arith::DivUIOp, arith::RemUIOp>(d)) {
-        Value a = d->getOperand(0), b = d->getOperand(1);
-        if (constOf(b))
-          v = a;
-        else if (constOf(a))
-          v = b;
-        else
-          return -1;
-        pure = false;
-      } else {
-        return -1;
-      }
-    }
-    return -1;
-  };
   LogicalResult counted = success();
   auto bound = [&](triton::LoadOp ld) {
     Value mask = ld.getMask();
@@ -1301,52 +1252,19 @@ static LogicalResult emitOptiPimConv(ModuleOp mod) {
                                   "loaded at the product's rank";
       return;
     }
-    // Each conjunct with the expand_dims applied after it, outermost first.
-    SmallVector<std::pair<Value, SmallVector<int64_t>>> terms{{mask, {}}};
-    while (!terms.empty()) {
-      auto [v, outer] = terms.pop_back_val();
-      Operation *d = v.getDefiningOp();
-      if (!d)
-        continue;
-      if (isa<arith::AndIOp>(d)) {
-        for (Value o : d->getOperands())
-          terms.push_back({o, outer});
-        continue;
-      }
-      if (auto ex = dyn_cast<triton::ExpandDimsOp>(d)) {
-        auto o = outer;
-        o.push_back(ex.getAxis());
-        terms.push_back({ex.getSrc(), o});
-        continue;
-      }
-      if (isa<triton::BroadcastOp, triton::gpu::ConvertLayoutOp>(d)) {
-        terms.push_back({d->getOperand(0), outer});
-        continue;
-      }
-      if (constOf(v))
-        continue; // an all-true or all-false constant mask
-      auto cmp = dyn_cast<arith::CmpIOp>(d);
-      bool pure = false;
-      int64_t dim = -1;
-      if (cmp) {
-        auto cmpTy = dyn_cast<RankedTensorType>(cmp.getLhs().getType());
-        int64_t inner = cmpTy ? rangeDim(cmp.getLhs(), cmpTy.getRank(), pure) : -1;
-        if (inner >= 0) {
-          SmallVector<int64_t> fwd(outer.rbegin(), outer.rend());
-          dim = cmpTy.getRank() + (int64_t)outer.size() == ldTy.getRank()
-                    ? replay(fwd, inner) : -1;
-        }
-      }
-      if (dim >= 0 && tpw[dim] != 1)
+    for (auto t : triton::im::contraction::maskTerms(mask, ldTy.getRank())) {
+      if (t.opaque || t.constant)
+        continue; // a constant conjunct, or a block argument it cannot see into
+      if (t.dim >= 0 && tpw[t.dim] != 1)
         continue; // on a lane axis: idles whole lanes, counts nothing in one
-      auto c = cmp ? constOf(cmp.getRhs()) : std::nullopt;
-      if (dim < 0 || !pure || !c || cmp.getPredicate() != arith::CmpIPredicate::slt) {
+      if (t.dim < 0 || !t.pure || !t.bound ||
+          t.cmp.getPredicate() != arith::CmpIPredicate::slt) {
         counted = ld.emitError() << "im.optipim_conv cannot count a mask term on a "
                                     "dimension the lane holds whole; write it as "
                                     "`range < extent` on that dimension";
         return;
       }
-      active[dim] = std::min<int64_t>(active[dim], std::max<int64_t>(*c, 0));
+      active[t.dim] = std::min<int64_t>(active[t.dim], std::max<int64_t>(*t.bound, 0));
     }
   };
   bound(in);

@@ -34,9 +34,11 @@
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -44,6 +46,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 #include <cstdlib>
 #include <utility>
 
@@ -82,6 +85,22 @@ static uint32_t laneAxisMask(Type ty) {
   return m;
 }
 
+/// The lane id decomposed over a store tile's dims, fastest first, as [dim, lanes] pairs.
+/// Every dim with tpw > 1 is in it, so the extents multiply to the lane count.
+static std::optional<SmallVector<std::pair<int32_t, int32_t>>> laneAxes(Type ty) {
+  auto tt = dyn_cast<RankedTensorType>(ty);
+  auto blocked = tt ? dyn_cast_or_null<ttg_::BlockedEncodingAttr>(tt.getEncoding())
+                    : ttg_::BlockedEncodingAttr();
+  if (!blocked)
+    return std::nullopt;
+  SmallVector<std::pair<int32_t, int32_t>> out;
+  auto tpw = blocked.getThreadsPerWarp();
+  for (unsigned d : blocked.getOrder())
+    if (tpw[d] > 1)
+      out.push_back({(int32_t)d, (int32_t)tpw[d]});
+  return out;
+}
+
 /// How many banks receive a copy of one value: the product of the lane extents over the
 /// lane axes the value does NOT occupy. 1 means bank-partitioned. This is the MAGNITUDE
 /// that the replicated/partitioned verdict below was missing: with a single-axis split the
@@ -104,6 +123,46 @@ static int64_t laneReplicationFactor(Type ty, uint32_t occ) {
   return f;
 }
 
+/// Dims of a tensor of pointers along which the address varies. A mask broadcasts a load
+/// over dims its address ignores, so the load's shape alone says it occupies them. Anything
+/// unrecognised occupies every dim of extent > 1.
+static uint32_t addressDims(Value v, llvm::DenseMap<Value, uint32_t> &memo,
+                            int depth = 0) {
+  auto tt = dyn_cast<RankedTensorType>(v.getType());
+  if (!tt)
+    return 0u;
+  if (auto it = memo.find(v); it != memo.end())
+    return it->second;
+  uint32_t full = 0u;
+  for (int d = 0; d < tt.getRank(); ++d)
+    if (tt.getShape()[d] > 1)
+      full |= 1u << d;
+  uint32_t occ = full;
+  Operation *def = depth > 64 ? nullptr : v.getDefiningOp();
+  if (!def) {
+    // a block argument, or too deep to follow
+  } else if (isa<triton::SplatOp>(def)) {
+    occ = 0u;
+  } else if (auto c = dyn_cast<arith::ConstantOp>(def)) {
+    auto de = dyn_cast<DenseElementsAttr>(c.getValue());
+    occ = de && de.isSplat() ? 0u : full;
+  } else if (auto ed = dyn_cast<triton::ExpandDimsOp>(def)) {
+    uint32_t src = addressDims(ed.getSrc(), memo, depth + 1);
+    unsigned a = ed.getAxis();
+    occ = (src & ((1u << a) - 1)) | ((src >> a) << (a + 1));
+  } else if (isa<triton::BroadcastOp, triton::gpu::ConvertLayoutOp>(def)) {
+    occ = addressDims(def->getOperand(0), memo, depth + 1) & full;
+  } else if (isa<triton::AddPtrOp>(def) ||
+             def->getName().getDialectNamespace() == "arith") {
+    occ = 0u;
+    for (Value o : def->getOperands())
+      occ |= addressDims(o, memo, depth + 1);
+    occ &= full;
+  }
+  memo[v] = occ;
+  return occ;
+}
+
 /// >1 replicated over that many banks, 0 bank-partitioned, -1 undetermined.
 /// A load's own type is never read (see laneAxisMask). Track the dims the loaded value
 /// OCCUPIES through the dataflow to the store and ask whether the store's lane dim is
@@ -116,9 +175,14 @@ static int64_t laneReplicationFactor(Type ty, uint32_t occ) {
 /// so an operand feeding F cells must be written into F columns; charging it once per
 /// bank was a 64x discount on matmul (review 2026-09-12). The largest fanout over the
 /// stores a value reaches wins, for the same reason replicated wins below.
-static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
+/// `repLanes` (out) is the store dims with lanes that the value does not occupy, ORed over
+/// the stores it reaches. `occMask` narrows what the loaded value occupies at the start.
+static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
+                             uint32_t *repLanes = nullptr, uint32_t occMask = ~0u) {
   if (cellFanout)
     *cellFanout = 1;
+  if (repLanes)
+    *repLanes = 0u;
   if (auto st = dyn_cast<triton::StoreOp>(memOp))
     return laneAxisMask(st.getValue().getType()) != 0u ? 0 : 1;
   if (memOp->getNumResults() != 1)
@@ -132,6 +196,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
     for (int d = 0; d < tt0.getRank(); ++d)
       if (tt0.getShape()[d] > 1)
         occ0 |= 1u << d;
+  occ0 &= occMask;
   SmallVector<std::pair<Value, uint32_t>, 16> work{{v0, occ0}};
   llvm::DenseSet<Value> seen;
   int hops = 0;
@@ -151,6 +216,11 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout) {
         uint32_t laneM = laneAxisMask(st.getValue().getType());
         if (laneM == 0u)
           return -1;
+        if (repLanes)
+          if (auto axes = laneAxes(st.getValue().getType()))
+            for (auto [d, n] : *axes)
+              if (!((occ >> d) & 1u))
+                *repLanes |= 1u << d;
         // Partitioned only if the value occupies EVERY lane axis. Miss one and it is
         // replicated along it, so every bank on that axis is delivered the value.
         if ((occ & laneM) == laneM) {
@@ -859,6 +929,321 @@ static void applySchedule(OpBuilder &b, DictionaryAttr d,
 
 } // namespace
 
+/// OptiPIM's lanes under im.optipim_conv, beside the layout record so it does not change:
+/// __pim_opt_lane_rep holds [arg, replicated lane dims] pairs and __pim_opt_lane_ext the
+/// store's lane id as [dim, lanes] pairs, fastest first. Dims number the store tile.
+static LogicalResult emitOptiPimLanes(ModuleOp mod,
+                                      const llvm::MapVector<int64_t, int64_t> &rep) {
+  std::optional<SmallVector<std::pair<int32_t, int32_t>>> ext;
+  LogicalResult ok = success();
+  mod.walk([&](triton::StoreOp st) {
+    auto axes = laneAxes(st.getValue().getType());
+    if (!axes || failed(ok))
+      return;
+    if (!ext)
+      ext = axes;
+    else if (*ext != *axes)
+      ok = st.emitError() << "im.optipim_conv states one lane decomposition, and this "
+                             "store's differs from the kernel's first store";
+  });
+  if (failed(ok))
+    return failure();
+  if (!mod.getContext()->getLoadedDialect<LLVM::LLVMDialect>())
+    return mod.emitError() << "im.optipim_conv emits LLVM globals here, load the LLVM "
+                              "dialect first";
+  uint32_t all = 0u;
+  SmallVector<int32_t> extFlat;
+  for (auto [d, n] : ext.value_or(SmallVector<std::pair<int32_t, int32_t>>{})) {
+    all |= 1u << d;
+    extFlat.append({d, n});
+  }
+  SmallVector<int32_t> repFlat;
+  for (auto [arg, m] : rep)
+    repFlat.append({(int32_t)arg, (int32_t)(m < 0 ? all : (uint32_t)m)});
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  auto table = [&](StringRef name, ArrayRef<int32_t> v) {
+    if (v.empty())
+      return;
+    auto dataTy = RankedTensorType::get({(int64_t)v.size()}, i32);
+    LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, v.size()),
+                           /*isConstant=*/true, LLVM::Linkage::External, name,
+                           DenseElementsAttr::get(dataTy, v));
+  };
+  auto scalar = [&](StringRef name, int32_t v) {
+    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                           name, b.getI32IntegerAttr(v));
+  };
+  table("__pim_opt_lane_rep", repFlat);
+  scalar("__pim_opt_lane_rep_count", (int32_t)(repFlat.size() / 2));
+  table("__pim_opt_lane_ext", extFlat);
+  scalar("__pim_opt_lane_ext_count", (int32_t)(extFlat.size() / 2));
+  return success();
+}
+
+/// Residency by place in the kernel's one contraction (im.optipim_roles): the product's
+/// first factor is delivered to the PE (1), its second is resident in the bank (2), and
+/// the stored sum is drained by read-out (3). Their codegen fixes roles by position too.
+static FailureOr<llvm::MapVector<int64_t, int64_t>> optiPimResidency(ModuleOp mod) {
+  auto loadOf = [](Value v) -> triton::LoadOp {
+    while (Operation *d = v.getDefiningOp()) {
+      if (auto ld = dyn_cast<triton::LoadOp>(d))
+        return ld;
+      if (!isa<triton::BroadcastOp, triton::ExpandDimsOp, triton::ReshapeOp,
+               triton::gpu::ConvertLayoutOp, arith::ExtFOp, arith::TruncFOp>(d))
+        return {};
+      v = d->getOperand(0);
+    }
+    return {};
+  };
+  SmallVector<std::pair<triton::ReduceOp, arith::MulFOp>> found;
+  mod.walk([&](triton::ReduceOp red) {
+    if (red.getNumOperands() != 1)
+      return;
+    Value src = red.getOperands()[0];
+    while (auto cvt = src.getDefiningOp<triton::gpu::ConvertLayoutOp>())
+      src = cvt.getSrc();
+    bool adds = false;
+    red.getCombineOp().walk([&](Operation *op) { adds |= isa<arith::AddFOp>(op); });
+    if (auto mul = src.getDefiningOp<arith::MulFOp>(); mul && adds)
+      found.push_back({red, mul});
+  });
+  if (found.size() != 1)
+    return mod.emitError() << "im.optipim_roles states residency for exactly one "
+                              "contraction, a sum over a product, and this kernel has "
+                           << found.size();
+  auto [red, mul] = found.front();
+  triton::LoadOp in = loadOf(mul.getLhs()), wt = loadOf(mul.getRhs());
+  int64_t inArg = in ? resolveOperandArg(in.getPtr()) : -1;
+  int64_t wtArg = wt ? resolveOperandArg(wt.getPtr()) : -1;
+  int64_t outArg = -1;
+  SmallVector<Value> work{red.getResult()[0]};
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *u : v.getUsers()) {
+      if (!seen.insert(u).second)
+        continue;
+      if (auto st = dyn_cast<triton::StoreOp>(u)) {
+        if (st.getValue() == v)
+          outArg = resolveOperandArg(st.getPtr());
+        continue;
+      }
+      if (u->getNumResults() == 1 && isa<RankedTensorType>(u->getResult(0).getType()))
+        work.push_back(u->getResult(0));
+    }
+  }
+  if (inArg < 0 || wtArg < 0 || outArg < 0 || inArg == wtArg || outArg == inArg ||
+      outArg == wtArg)
+    return mod.emitError() << "im.optipim_roles cannot name the contraction's operands: "
+                           << "input arg " << inArg << ", weight arg " << wtArg
+                           << ", output arg " << outArg;
+  llvm::MapVector<int64_t, int64_t> res;
+  res.insert({inArg, 1});
+  res.insert({wtArg, 2});
+  res.insert({outArg, 3});
+  return res;
+}
+
+/// __pim_opt_residency holds [arg, residency] pairs, beside the layout record so it does
+/// not change. bank_replicated stays the placement fact.
+static LogicalResult emitOptiPimResidency(ModuleOp mod,
+                                          const llvm::MapVector<int64_t, int64_t> &res) {
+  if (!mod.getContext()->getLoadedDialect<LLVM::LLVMDialect>())
+    return mod.emitError() << "im.optipim_roles emits LLVM globals here, load the LLVM "
+                              "dialect first";
+  SmallVector<int32_t> flat;
+  for (auto [arg, r] : res)
+    flat.append({(int32_t)arg, (int32_t)r});
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, flat.size()),
+                         /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_residency",
+                         DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_residency_count",
+                         b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
+  return success();
+}
+
+/// The digits a program id is decoded into, [digit, radix] fastest first, from a chain of
+/// `% R` and `/ R` ending in a lone `% R`. Fails when a use reads the id as a number.
+static FailureOr<SmallVector<std::pair<Value, int64_t>>> pidDigits(Value pid) {
+  SmallVector<std::pair<Value, int64_t>> out;
+  for (Value v = pid; v && !v.use_empty();) {
+    std::optional<int64_t> radix;
+    Value digit, quot;
+    for (Operation *u : v.getUsers()) {
+      bool isRem = isa<arith::RemSIOp, arith::RemUIOp>(u);
+      bool isDiv = isa<arith::DivSIOp, arith::DivUIOp>(u);
+      std::optional<int64_t> r;
+      if ((isRem || isDiv) && u->getOperand(0) == v)
+        r = constIntOf(u->getOperand(1));
+      if (!r || *r < 1 || (radix && *radix != *r) || (isRem && digit) || (isDiv && quot))
+        return failure();
+      radix = r;
+      (isRem ? digit : quot) = u->getResult(0);
+    }
+    if (!digit)
+      return failure();
+    out.push_back({digit, *radix});
+    v = quot;
+  }
+  return out;
+}
+
+/// The program ids `v` derives from, each value on the way added to `seen`. Unlike
+/// reachesProgramId it fails where a def chain hides a dependence: a non-kernel block
+/// argument (loop induction variable, iter_arg), a region op's result or a memory read.
+static FailureOr<unsigned> pidDependence(Value v, llvm::DenseSet<Value> &seen) {
+  unsigned mask = 0;
+  SmallVector<Value> work{v};
+  while (!work.empty()) {
+    Value cur = work.pop_back_val();
+    if (!seen.insert(cur).second)
+      continue;
+    if (auto barg = dyn_cast<BlockArgument>(cur)) {
+      Block *owner = barg.getOwner();
+      if (owner->isEntryBlock() && isa<triton::FuncOp>(owner->getParentOp()))
+        continue;
+      return emitError(cur.getLoc()) << "im.optipim_hold_input follows the input's "
+                                        "address through def chains, and it meets a loop "
+                                        "or region block argument";
+    }
+    Operation *def = cur.getDefiningOp();
+    if (auto pid = dyn_cast<triton::GetProgramIdOp>(def)) {
+      mask |= 1u << pid.getAxisAsInt();
+      continue;
+    }
+    if (def->getNumRegions() || !isMemoryEffectFree(def))
+      return def->emitError() << "im.optipim_hold_input follows the input's address "
+                                 "through def chains, and it meets "
+                              << (def->getNumRegions() ? "a region op's result"
+                                                       : "a read of memory");
+    llvm::append_range(work, def->getOperands());
+  }
+  return mask;
+}
+
+/// OptiPIM's unbounded input memo, THEIR bug reproduced on purpose and disclosed: their
+/// codegen never re-sends an input element the leader once held, though their PE declares
+/// reg_per_pe 1. Record [arg, held ids, bound x, y, z (-1 none), tiles held].
+static FailureOr<SmallVector<int32_t>>
+optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
+  int64_t inArg = -1;
+  for (auto [arg, r] : res)
+    if (r == 1)
+      inArg = arg;
+  std::array<triton::GetProgramIdOp, 3> pids{};
+  bool twice = false;
+  mod.walk([&](triton::GetProgramIdOp op) {
+    if (op->use_empty())
+      return;
+    twice |= (bool)pids[op.getAxisAsInt()];
+    pids[op.getAxisAsInt()] = op;
+  });
+  if (twice)
+    return mod.emitError() << "im.optipim_hold_input reads each program id once";
+  // What the input delivers is its address, mask and other. A load in a loop or branch can
+  // run a pid-dependent number of times, which a hold per program instance cannot state.
+  SmallVector<Value> sources;
+  bool stored = false, nested = false;
+  mod.walk([&](Operation *op) {
+    Value ptr = getMemAccessPtr(op);
+    if (!ptr || inArg < 0 || resolveOperandArg(ptr) != inArg)
+      return;
+    auto ld = dyn_cast<triton::LoadOp>(op);
+    stored |= !ld;
+    nested |= !isa<triton::FuncOp>(op->getParentOp());
+    sources.push_back(ptr);
+    if (ld && ld.getMask())
+      sources.push_back(ld.getMask());
+    if (ld && ld.getOther())
+      sources.push_back(ld.getOther());
+  });
+  if (sources.empty() || stored)
+    return mod.emitError() << "im.optipim_hold_input holds an input the kernel only loads, "
+                              "and arg " << inArg << " is "
+                           << (stored ? "stored to" : "never loaded");
+  llvm::DenseSet<Value> seen;
+  unsigned reach = 0u, used = 0u;
+  for (Value s : sources) {
+    auto m = pidDependence(s, seen);
+    if (failed(m))
+      return failure();
+    reach |= *m;
+  }
+  if (nested)
+    return mod.emitError() << "im.optipim_hold_input holds an input loaded once per program "
+                              "instance, and arg " << inArg << " is loaded in a loop or branch";
+  for (int a = 0; a < 3; ++a)
+    if (pids[a])
+      used |= 1u << a;
+  unsigned held = used & ~reach;
+  if (!held)
+    return mod.emitError() << "im.optipim_hold_input holds the input across the program ids "
+                              "it ignores, and arg " << inArg
+                           << " reaches every program id the kernel reads";
+  // Their memo needs the statement only across ids slower than all the input reaches, as
+  // conv's K. Held on a faster id, a persistent loop with triton-licm holds it (gemm, matvec).
+  if (!reach || llvm::countr_zero(held) < llvm::Log2_32(reach)) {
+    auto diag = mod.emitError() << "im.optipim_hold_input holds the input only across "
+                                   "program ids slower than every one it reaches, and arg "
+                                << inArg << " is held across program id "
+                                << llvm::countr_zero(held);
+    if (reach)
+      diag << " but reaches program id " << llvm::Log2_32(reach);
+    else
+      diag << " and reaches none";
+    return diag;
+  }
+  // tiles counts the digit tuples of the reached ids. It is the distinct tiles only when the
+  // launch covers every tuple and the address is injective in them, neither checked here.
+  int64_t tiles = 1;
+  for (int a = 0; a < 3; ++a) {
+    if (!((reach >> a) & 1u))
+      continue;
+    auto digits = pidDigits(pids[a].getResult());
+    if (failed(digits))
+      return pids[a].emitError() << "im.optipim_hold_input counts the tiles held from the "
+                                    "decode of program id " << a
+                                 << ", which is not a chain of `% R` and `/ R`";
+    for (auto [d, r] : *digits) {
+      if (r > 1 && !seen.contains(d))
+        return pids[a].emitError() << "im.optipim_hold_input: the input ignores a digit of "
+                                      "program id " << a << ", so it is reused inside that id";
+      if (tiles > INT32_MAX / r)
+        return pids[a].emitError() << "im.optipim_hold_input: the tiles held overflow i32";
+      tiles *= r;
+    }
+  }
+  SmallVector<int32_t> rec{(int32_t)inArg, (int32_t)held};
+  for (int a = 0; a < 3; ++a)
+    rec.push_back((held >> a) & 1u ? 1 : -1);
+  rec.push_back((int32_t)tiles);
+  return rec;
+}
+
+/// __pim_opt_hold is that record, beside the layout record so it does not change.
+static void emitOptiPimHold(ModuleOp mod, ArrayRef<int32_t> rec) {
+  OpBuilder b(mod.getBodyRegion());
+  b.setInsertionPointToStart(mod.getBody());
+  Location loc = mod.getLoc();
+  Type i32 = b.getI32Type();
+  auto dataTy = RankedTensorType::get({(int64_t)rec.size()}, i32);
+  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, rec.size()),
+                         /*isConstant=*/true, LLVM::Linkage::External, "__pim_opt_hold",
+                         DenseElementsAttr::get(dataTy, rec));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_hold_count", b.getI32IntegerAttr(1));
+}
+
 // -----------------------------------------------------------------------
 // Pass implementation
 // -----------------------------------------------------------------------
@@ -910,9 +1295,32 @@ struct IMOperandResidencyLayoutPass
       }
     });
 
+    llvm::MapVector<int64_t, int64_t> optResidency;
+    const bool optipimRoles = mod->hasAttr("im.optipim_roles");
+    if (optipimRoles) {
+      auto res = optiPimResidency(mod);
+      if (failed(res))
+        return signalPassFailure();
+      optResidency = std::move(*res);
+    }
+    SmallVector<int32_t> optHold;
+    if (mod->hasAttr("im.optipim_hold_input")) {
+      if (!optipimRoles) {
+        mod.emitError() << "im.optipim_hold_input holds the input im.optipim_roles names";
+        return signalPassFailure();
+      }
+      auto hold = optiPimHold(mod, optResidency);
+      if (failed(hold))
+        return signalPassFailure();
+      optHold = std::move(*hold);
+    }
+
     // Pass B, classify each memory-access op and stamp im.residency.
     int64_t numAnalyzed = 0, numClassified = 0, numForced = 0;
     bool scheduleError = false;
+    const bool optipimConv = mod->hasAttr("im.optipim_conv");
+    // arg -> replicated lane dims, -1 for a scalar splat (every lane dim).
+    llvm::MapVector<int64_t, int64_t> optLaneRep;
     mod.walk([&](Operation *op) {
       Value ptr = getMemAccessPtr(op);
       if (!ptr)
@@ -994,6 +1402,14 @@ struct IMOperandResidencyLayoutPass
             b.getNamedAttr("cell_fanout", b.getI64IntegerAttr(cellFanout)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
+      // The residency stamp on each access, like every fact here. The runtime reads the
+      // global instead.
+      if (auto it = optResidency.find(operandArg); it != optResidency.end())
+        fields.push_back(
+            b.getNamedAttr("opt_residency", b.getI32IntegerAttr((int32_t)it->second)));
+      if (!optHold.empty() && operandArg == optHold[0])
+        fields.push_back(b.getNamedAttr(
+            "opt_hold", b.getDenseI32ArrayAttr(ArrayRef<int32_t>(optHold).drop_front())));
       // Is the contraction axis TILED INTO the access shape? A rank-1 load inside
       // the reduction loop takes ONE value out of each DQ word, so the operand bus
       // memo cannot fire (matmul measured 0 skips of 1,048,576); tiling the
@@ -1077,6 +1493,17 @@ struct IMOperandResidencyLayoutPass
               return;
             }
 
+      // A forced verdict is not the layout's, so it states no lane mask. The mask reads the
+      // address, not the load's shape, which a mask operand can broadcast.
+      if (optipimConv && operandArg >= 0 && bankRep >= 0 && !forced) {
+        uint32_t repLanes = 0u;
+        llvm::DenseMap<Value, uint32_t> memo;
+        if (!scalarSplat && isa<triton::LoadOp>(op))
+          bankReplicatedTri(op, nullptr, &repLanes, addressDims(ptr, memo));
+        int64_t &m = optLaneRep.insert({operandArg, 0}).first->second;
+        m = (scalarSplat || m < 0) ? -1 : (m | repLanes);
+      }
+
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
       ++numClassified;
     });
@@ -1103,6 +1530,13 @@ struct IMOperandResidencyLayoutPass
     });
     if (accCells > 0)
       mod->setAttr("im.acc_cells_per_lane", b.getI64IntegerAttr(accCells));
+
+    if (optipimConv && failed(emitOptiPimLanes(mod, optLaneRep)))
+      return signalPassFailure();
+    if (optipimRoles && failed(emitOptiPimResidency(mod, optResidency)))
+      return signalPassFailure();
+    if (!optHold.empty())
+      emitOptiPimHold(mod, optHold);
 
     // Provenance. A reported number has to be able to say whether it came from
     // the classifier or from a forced schedule.

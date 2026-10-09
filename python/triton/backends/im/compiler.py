@@ -106,11 +106,13 @@ class IMOptions:
     # Persistent kernel: the grid stops being the work decomposition and one program
     # instance loops over several tiles. Marks the module so im-tile-boundary knows
     # which loop to signal; without it the trace runtime sees the whole replay as one
-    # dispatch and cross-tile re-reads collapse to nothing.
+    # dispatch and cross-tile re-reads collapse to nothing. Also sets im.noalias_args, which
+    # the optipim-parity runtime does not check, so its caller must pass distinct buffers.
     im_persistent: bool = False
     # Work hoisted above the tile loop belongs to the first tile (im-tile-boundary), so an
     # operand hoisted out of the loop loads after that tile's accumulator reset, as DCC
-    # orders a round. Off by default: other paths were measured with the prologue apart.
+    # orders a round, and OptiPIM's parity kernel issues its input on step 0 only, not in
+    # a step of its own. Off by default: other paths were measured with the prologue apart.
     im_tile_prologue_first: bool = False
     # Where each tensor starts. "dq" packs tensors into shared rows on different banks,
     # and "row-pack" gives each lane its exact share of one column space (honoured by the
@@ -155,6 +157,19 @@ class IMOptions:
     # their tensor index fixes and the iteration points per lane per step, written into
     # the artifact for the optipim-parity runtime's PIM_OPT_NATIVE replay.
     im_optipim_conv: bool = False
+    # Residency by place in that contraction (im-operand-residency-layout): the first
+    # factor is delivered to the PE, the second is resident in the bank and the stored sum
+    # is drained by read-out. The optipim-parity runtime numbers a replicated resident
+    # tensor's slots per lane.
+    im_optipim_roles: bool = False
+    # The contraction lowered to MACs of the PE their config declares, 16 values each, a
+    # loop of calls per lane where it executes (im-optipim-mac). Only the optipim-parity
+    # runtime defines the call. Needs im_optipim_roles.
+    im_optipim_mac: bool = False
+    # OptiPIM's unbounded input memo on conv, THEIR bug, reproduced and disclosed: the input
+    # held across the program ids it ignores, though their PE declares reg_per_pe 1. Stated
+    # by im-operand-residency-layout, needs im_optipim_roles.
+    im_optipim_hold_input: bool = False
     # A contraction's first product initialises its accumulator, a MUL into GRF_B, so the
     # reset before it goes (im-acc-init-fold). Needs im_dcc_acc_grf, which states it.
     im_acc_init_fold: bool = False
@@ -177,6 +192,9 @@ class IMOptions:
                 f"-macaddr:{int(self.im_dcc_mac_addressing)}"
                 f"-retfrom:{int(self.im_dcc_return_from_input)}"
                 f"-optconv:{int(self.im_optipim_conv)}"
+                f"-optroles:{int(self.im_optipim_roles)}"
+                f"-optmac:{int(self.im_optipim_mac)}"
+                f"-opthold:{int(self.im_optipim_hold_input)}"
                 f"-accinit:{int(self.im_acc_init_fold)}")
 
 
@@ -322,6 +340,29 @@ class IMBackend(BaseBackend):
             mod.set_attr("im.dcc_return_from_input", builder.parse_attr("1 : i64"))
         if options.im_optipim_conv:
             mod.set_attr("im.optipim_conv", builder.parse_attr("1 : i64"))
+        if options.im_optipim_roles:
+            if not options.im_optipim_conv:
+                raise ValueError("im_optipim_roles states residency for OptiPIM's "
+                                 "contraction, set im_optipim_conv too")
+            mod.set_attr("im.optipim_roles", builder.parse_attr("1 : i64"))
+        if options.im_optipim_mac:
+            if not options.im_optipim_roles:
+                raise ValueError("im_optipim_mac lowers the contraction im_optipim_roles "
+                                 "states, set im_optipim_roles too")
+            mod.set_attr("im.optipim_mac", builder.parse_attr("1 : i64"))
+        if options.im_optipim_hold_input:
+            if not options.im_optipim_roles:
+                raise ValueError("im_optipim_hold_input holds the input im_optipim_roles "
+                                 "names, set im_optipim_roles too")
+            if options.im_persistent:
+                raise ValueError("im_optipim_hold_input holds an input across program "
+                                 "instances, and a persistent kernel such as the gemm and "
+                                 "matvec parity kernels holds it by hoisting it out of the "
+                                 "tile loop instead")
+            if "im-operand-residency-layout" in options.skip_passes:
+                raise ValueError("im_optipim_hold_input is stated by "
+                                 "im-operand-residency-layout, which skip_passes skips")
+            mod.set_attr("im.optipim_hold_input", builder.parse_attr("1 : i64"))
         if options.im_acc_init_fold:
             if not options.im_dcc_acc_grf:
                 raise ValueError("im_acc_init_fold is stated through the accumulator "
@@ -421,6 +462,7 @@ class IMBackend(BaseBackend):
             "im-tile-boundary",
             "im-lane-fold",
             "im-dcc-tile-mac",
+            "im-optipim-mac",
             "im-acc-init-fold",
             "im-relu-opcode",
             "convert-scf-to-cf",
@@ -450,6 +492,9 @@ class IMBackend(BaseBackend):
             passes.convert.add_im_lane_fold(pm)
         if "im-dcc-tile-mac" not in skip:
             passes.convert.add_im_dcc_tile_mac(pm)
+        # After im-tile-boundary, which marks the tile loop that the step index reads.
+        if "im-optipim-mac" not in skip:
+            passes.convert.add_im_optipim_mac(pm)
         if "im-acc-init-fold" not in skip:
             passes.convert.add_im_acc_init_fold(pm)
         if "im-relu-opcode" not in skip:
