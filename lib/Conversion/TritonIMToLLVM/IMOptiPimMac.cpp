@@ -55,8 +55,8 @@ constexpr llvm::StringLiteral kMacFn = "__pim_opt_mac";
 /// Stamped on each MAC loop, so the IR shows where the calls are.
 constexpr llvm::StringLiteral kMarkedAttr = "im.optipim-mac";
 constexpr llvm::StringLiteral kTileLoopAttr = "im.tile-boundary";
-/// Their word, dq over pe_bits (fimdram.cpp:25), as the shared config sets them.
-constexpr int64_t kWordBits = 256, kValueBits = 16, kValuesPerMac = kWordBits / kValueBits;
+/// Their PE's value width. Their word is the module's dq over it (fimdram.cpp:25).
+constexpr int64_t kValueBits = 16;
 
 static triton::LoadOp loadOf(Value v) {
   while (Operation *d = v.getDefiningOp()) {
@@ -126,10 +126,14 @@ static LLVM::LLVMFuncOp getOrDeclareMacFn(ModuleOp mod) {
 
 static LogicalResult lowerMacs(ModuleOp mod) {
   MLIRContext *ctx = mod.getContext();
-  if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"); a && a.getInt() != kWordBits)
-    return mod.emitError() << "im.optipim_mac packs " << kValuesPerMac << " values into their "
-                           << kWordBits << "-bit word, and this module states a "
-                           << a.getInt() << "-bit bus";
+  auto dq = mod->getAttrOfType<IntegerAttr>("im.dq_bits");
+  if (!dq || dq.getInt() < kValueBits || dq.getInt() % kValueBits)
+    return mod.emitError() << "im.optipim_mac packs their word, dq over pe_bits, and needs "
+                              "the module's bus width (im.dq_bits) in multiples of "
+                           << kValueBits << " bits";
+  // Their SIMDRAM stands each value pe_bits rows tall in one bitline, so a word holds dq.
+  const bool vertical = mod->hasAttr("im.optipim_vertical");
+  const int64_t kValuesPerMac = vertical ? dq.getInt() : dq.getInt() / kValueBits;
 
   SmallVector<std::pair<triton::ReduceOp, arith::MulFOp>> found;
   mod.walk([&](triton::ReduceOp red) {
@@ -355,6 +359,8 @@ static LogicalResult lowerMacs(ModuleOp mod) {
   LLVM::GlobalOp::create(g, mod.getLoc(), i32, /*isConstant=*/true, LLVM::Linkage::External,
                          "__pim_opt_macs_count", g.getI32IntegerAttr(nLanes));
   table("__pim_opt_mac_geom", {(int32_t)kValuesPerMac, 1, 0, 0, 1});
+  LLVM::GlobalOp::create(g, mod.getLoc(), i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_vertical", g.getI32IntegerAttr(vertical ? kValueBits : 0));
   SmallVector<int32_t> stepFlat(step.begin(), step.end());
   table("__pim_opt_step", stepFlat);
   return success();

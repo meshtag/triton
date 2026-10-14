@@ -170,10 +170,11 @@ def IMAccInitFold : Pass<"im-acc-init-fold", "mlir::ModuleOp"> {
 def IMOptiPimMac : Pass<"im-optipim-mac", "mlir::ModuleOp"> {
   let summary = "Lower the contraction to MACs of the PE OptiPIM's machine declares";
   let description = [{
-    Only runs when the module carries `im.optipim_mac`. Their PE takes 16 values of 16
-    bits per MAC and has one register and no accumulator, so a lane runs ceil(cells / 16)
-    MACs per contraction, its cells being the product's elements its operand masks leave
-    on, lane terms included. A loop of `__pim_opt_mac(j)` calls goes where the contraction
+    Only runs when the module carries `im.optipim_mac`. Their PE takes one word of
+    `im.dq_bits` per MAC, n values of 16 bits, and has one register and no accumulator, so a
+    lane runs ceil(cells / n) MACs per contraction, its cells being the product's elements
+    its operand masks leave on, lane terms included. Under `im.optipim_vertical`, their SIMDRAM,
+    a word is `im.dq_bits` bitlines each holding one value 16 rows tall. A loop of `__pim_opt_mac(j)` calls goes where the contraction
     executes. The per-lane counts, the arranged slot of MAC j in step t and t as an affine
     map of the program ids and the tile index are stated as globals.
   }];

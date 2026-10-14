@@ -162,14 +162,25 @@ class IMOptions:
     # is drained by read-out. The optipim-parity runtime numbers a replicated resident
     # tensor's slots per lane.
     im_optipim_roles: bool = False
-    # The contraction lowered to MACs of the PE their config declares, 16 values each, a
-    # loop of calls per lane where it executes (im-optipim-mac). Only the optipim-parity
-    # runtime defines the call. Needs im_optipim_roles.
+    # The contraction lowered to MACs of the PE their config declares, one im_dq_bits word
+    # each, a loop of calls per lane where it executes (im-optipim-mac). Only the
+    # optipim-parity runtime defines the call. Needs im_optipim_roles.
     im_optipim_mac: bool = False
-    # OptiPIM's unbounded input memo on conv, THEIR bug, reproduced and disclosed: the input
-    # held across the program ids it ignores, though their PE declares reg_per_pe 1. Stated
-    # by im-operand-residency-layout, needs im_optipim_roles.
+    # OptiPIM's unbounded input memo, THEIR bug, reproduced and disclosed: the input held
+    # across the program ids it ignores (conv), or wherever im_optipim_memo's hash repeats,
+    # though their PE declares reg_per_pe 1. Stated by im-operand-residency-layout, needs
+    # im_optipim_roles.
     im_optipim_hold_input: bool = False
+    # Their SIMDRAM's vertical layout for im_optipim_mac: a word is im_dq_bits bitlines, one value
+    # each, pe_bits rows tall, not im_dq_bits / 16 values side by side.
+    im_optipim_vertical: bool = False
+    # Their memo's hash of a step, as their simulator reads the MILP's coefficients: "b:w,..."
+    # per temporal loop, slowest first. THEIR bug, reproduced and disclosed: on a window axis
+    # it reads the temporal bound as the stride. Needs im_optipim_hold_input.
+    im_optipim_memo: str = ""
+    # Active lanes per tensor axis where their mapping leaves lanes of im_bank_split idle, as
+    # "1,3,4,3,1"; the runtime gives the active lanes banks 0..S-1, their codegen's PU order.
+    im_bank_active: str = ""
     # A contraction's first product initialises its accumulator, a MUL into GRF_B, so the
     # reset before it goes (im-acc-init-fold). Needs im_dcc_acc_grf, which states it.
     im_acc_init_fold: bool = False
@@ -195,6 +206,9 @@ class IMOptions:
                 f"-optroles:{int(self.im_optipim_roles)}"
                 f"-optmac:{int(self.im_optipim_mac)}"
                 f"-opthold:{int(self.im_optipim_hold_input)}"
+                f"-optmemo:{self.im_optipim_memo or 'none'}"
+                f"-optvert:{int(self.im_optipim_vertical)}"
+                f"-active:{self.im_bank_active or 'none'}"
                 f"-accinit:{int(self.im_acc_init_fold)}")
 
 
@@ -354,15 +368,46 @@ class IMBackend(BaseBackend):
             if not options.im_optipim_roles:
                 raise ValueError("im_optipim_hold_input holds the input im_optipim_roles "
                                  "names, set im_optipim_roles too")
-            if options.im_persistent:
-                raise ValueError("im_optipim_hold_input holds an input across program "
-                                 "instances, and a persistent kernel such as the gemm and "
-                                 "matvec parity kernels holds it by hoisting it out of the "
-                                 "tile loop instead")
+            if options.im_persistent and not options.im_optipim_memo:
+                raise ValueError("im_optipim_hold_input on a persistent kernel such as the "
+                                 "gemm and matvec parity kernels needs im_optipim_memo: the "
+                                 "hoist out of the tile loop already holds the input, and "
+                                 "only their hash holds more")
             if "im-operand-residency-layout" in options.skip_passes:
                 raise ValueError("im_optipim_hold_input is stated by "
                                  "im-operand-residency-layout, which skip_passes skips")
             mod.set_attr("im.optipim_hold_input", builder.parse_attr("1 : i64"))
+        if options.im_optipim_vertical:
+            if not options.im_optipim_mac:
+                raise ValueError("im_optipim_vertical lays out im_optipim_mac's words, set "
+                                 "im_optipim_mac too")
+            mod.set_attr("im.optipim_vertical", builder.parse_attr("1 : i64"))
+        if options.im_optipim_memo:
+            if not options.im_optipim_hold_input:
+                raise ValueError("im_optipim_memo hashes the input im_optipim_hold_input "
+                                 "holds, set im_optipim_hold_input too")
+            try:
+                memo = [int(v) for pair in str(options.im_optipim_memo).split(",")
+                        for v in pair.split(":")]
+            except ValueError:
+                memo = []
+            if (not memo or len(memo) % 2 or min(memo[0::2]) < 1 or min(memo[1::2]) < 0
+                    or max(memo) >= 2 ** 31):
+                raise ValueError(f"im_optipim_memo={options.im_optipim_memo!r}; want "
+                                 "bound:weight pairs of 32-bit integers, bounds positive")
+            mod.set_attr("im.optipim_memo",
+                         builder.parse_attr("array<i64: " + ", ".join(map(str, memo)) + ">"))
+        if options.im_bank_active:
+            if not options.im_bank_split:
+                raise ValueError("im_bank_active names the active lanes of im_bank_split, "
+                                 "set im_bank_split too")
+            act = [int(v) for v in str(options.im_bank_active).split(",") if v != ""]
+            split = [int(v) for v in str(options.im_bank_split).split(",") if v != ""]
+            if len(act) != len(split) or any(not 1 <= a <= s for a, s in zip(act, split)):
+                raise ValueError(f"im_bank_active={options.im_bank_active!r} must give "
+                                 f"1..lanes per axis of im_bank_split={options.im_bank_split!r}")
+            mod.set_attr("im.bank_active",
+                         builder.parse_attr("array<i64: " + ", ".join(map(str, act)) + ">"))
         if options.im_acc_init_fold:
             if not options.im_dcc_acc_grf:
                 raise ValueError("im_acc_init_fold is stated through the accumulator "

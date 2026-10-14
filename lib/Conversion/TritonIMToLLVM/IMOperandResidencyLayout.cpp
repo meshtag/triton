@@ -980,6 +980,41 @@ static LogicalResult emitOptiPimLanes(ModuleOp mod,
   scalar("__pim_opt_lane_rep_count", (int32_t)(repFlat.size() / 2));
   table("__pim_opt_lane_ext", extFlat);
   scalar("__pim_opt_lane_ext_count", (int32_t)(extFlat.size() / 2));
+  // __pim_opt_lane_on, the active lanes of each lane axis where their mapping leaves some idle,
+  // as [dim, active] pairs in __pim_opt_lane_ext's order. im.bank_active numbers im.bank_split's
+  // dims, the store tile's lane dims are those dims with the reduced one, never a lane axis,
+  // dropped, so the two pair up in dim order.
+  auto activeAttr = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_active");
+  auto splitAttr = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_split");
+  if (!activeAttr)
+    return success();
+  if (!splitAttr || splitAttr.size() != activeAttr.size())
+    return mod.emitError() << "im.bank_active names the active lanes of im.bank_split, which "
+                              "this module lacks or sizes differently";
+  ArrayRef<int64_t> active = activeAttr.asArrayRef(), split = splitAttr.asArrayRef();
+  SmallVector<int64_t> splitDims;
+  for (int64_t d = 0; d < (int64_t)split.size(); ++d)
+    if (split[d] > 1)
+      splitDims.push_back(d);
+  auto lanes = ext.value_or(SmallVector<std::pair<int32_t, int32_t>>{});
+  SmallVector<int32_t> storeDims;
+  for (auto [d, n] : lanes)
+    storeDims.push_back(d);
+  llvm::sort(storeDims);
+  if (storeDims.size() != splitDims.size())
+    return mod.emitError() << "im.bank_active: the store tile has " << storeDims.size()
+                           << " lane axes and im.bank_split " << splitDims.size();
+  SmallVector<int32_t> onFlat;
+  for (auto [d, n] : lanes) {
+    int64_t p = splitDims[llvm::find(storeDims, d) - storeDims.begin()];
+    if (split[p] != n || active[p] < 1 || active[p] > n)
+      return mod.emitError() << "im.bank_active gives " << active[p] << " active lanes on "
+                             << "split dim " << p << " of " << split[p] << ", stored on dim " << d
+                             << " with " << n;
+    onFlat.append({d, (int32_t)active[p]});
+  }
+  table("__pim_opt_lane_on", onFlat);
+  scalar("__pim_opt_lane_on_count", (int32_t)(onFlat.size() / 2));
   return success();
 }
 
@@ -1072,32 +1107,6 @@ static LogicalResult emitOptiPimResidency(ModuleOp mod,
   return success();
 }
 
-/// The digits a program id is decoded into, [digit, radix] fastest first, from a chain of
-/// `% R` and `/ R` ending in a lone `% R`. Fails when a use reads the id as a number.
-static FailureOr<SmallVector<std::pair<Value, int64_t>>> pidDigits(Value pid) {
-  SmallVector<std::pair<Value, int64_t>> out;
-  for (Value v = pid; v && !v.use_empty();) {
-    std::optional<int64_t> radix;
-    Value digit, quot;
-    for (Operation *u : v.getUsers()) {
-      bool isRem = isa<arith::RemSIOp, arith::RemUIOp>(u);
-      bool isDiv = isa<arith::DivSIOp, arith::DivUIOp>(u);
-      std::optional<int64_t> r;
-      if ((isRem || isDiv) && u->getOperand(0) == v)
-        r = constIntOf(u->getOperand(1));
-      if (!r || *r < 1 || (radix && *radix != *r) || (isRem && digit) || (isDiv && quot))
-        return failure();
-      radix = r;
-      (isRem ? digit : quot) = u->getResult(0);
-    }
-    if (!digit)
-      return failure();
-    out.push_back({digit, *radix});
-    v = quot;
-  }
-  return out;
-}
-
 /// The program ids `v` derives from, each value on the way added to `seen`. Unlike
 /// reachesProgramId it fails where a def chain hides a dependence: a non-kernel block
 /// argument (loop induction variable, iter_arg), a region op's result or a memory read.
@@ -1133,7 +1142,7 @@ static FailureOr<unsigned> pidDependence(Value v, llvm::DenseSet<Value> &seen) {
 
 /// OptiPIM's unbounded input memo, THEIR bug reproduced on purpose and disclosed: their
 /// codegen never re-sends an input element the leader once held, though their PE declares
-/// reg_per_pe 1. Record [arg, held ids, bound x, y, z (-1 none), tiles held].
+/// reg_per_pe 1. Record [arg, held ids, bound x, y, z (-1 none)].
 static FailureOr<SmallVector<int32_t>>
 optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
   int64_t inArg = -1;
@@ -1186,13 +1195,15 @@ optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
     if (pids[a])
       used |= 1u << a;
   unsigned held = used & ~reach;
-  if (!held)
+  // A stated hash (im.optipim_memo) can also hold steps the input reaches: their misread
+  // strides alias them, on a gemm too.
+  if (!held && !mod->hasAttr("im.optipim_memo"))
     return mod.emitError() << "im.optipim_hold_input holds the input across the program ids "
                               "it ignores, and arg " << inArg
                            << " reaches every program id the kernel reads";
   // Their memo needs the statement only across ids slower than all the input reaches, as
   // conv's K. Held on a faster id, a persistent loop with triton-licm holds it (gemm, matvec).
-  if (!reach || llvm::countr_zero(held) < llvm::Log2_32(reach)) {
+  if (held && (!reach || llvm::countr_zero(held) < llvm::Log2_32(reach))) {
     auto diag = mod.emitError() << "im.optipim_hold_input holds the input only across "
                                    "program ids slower than every one it reaches, and arg "
                                 << inArg << " is held across program id "
@@ -1203,30 +1214,9 @@ optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
       diag << " and reaches none";
     return diag;
   }
-  // tiles counts the digit tuples of the reached ids. It is the distinct tiles only when the
-  // launch covers every tuple and the address is injective in them, neither checked here.
-  int64_t tiles = 1;
-  for (int a = 0; a < 3; ++a) {
-    if (!((reach >> a) & 1u))
-      continue;
-    auto digits = pidDigits(pids[a].getResult());
-    if (failed(digits))
-      return pids[a].emitError() << "im.optipim_hold_input counts the tiles held from the "
-                                    "decode of program id " << a
-                                 << ", which is not a chain of `% R` and `/ R`";
-    for (auto [d, r] : *digits) {
-      if (r > 1 && !seen.contains(d))
-        return pids[a].emitError() << "im.optipim_hold_input: the input ignores a digit of "
-                                      "program id " << a << ", so it is reused inside that id";
-      if (tiles > INT32_MAX / r)
-        return pids[a].emitError() << "im.optipim_hold_input: the tiles held overflow i32";
-      tiles *= r;
-    }
-  }
   SmallVector<int32_t> rec{(int32_t)inArg, (int32_t)held};
   for (int a = 0; a < 3; ++a)
     rec.push_back((held >> a) & 1u ? 1 : -1);
-  rec.push_back((int32_t)tiles);
   return rec;
 }
 
@@ -1242,6 +1232,17 @@ static void emitOptiPimHold(ModuleOp mod, ArrayRef<int32_t> rec) {
                          DenseElementsAttr::get(dataTy, rec));
   LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
                          "__pim_opt_hold_count", b.getI32IntegerAttr(1));
+  // __pim_opt_memo, their memo's hash of a step as (bound, weight) pairs, slowest loop first.
+  auto memo = mod->getAttrOfType<DenseI64ArrayAttr>("im.optipim_memo");
+  if (!memo)
+    return;
+  SmallVector<int32_t> flat(memo.asArrayRef().begin(), memo.asArrayRef().end());
+  auto memoTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
+  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, flat.size()),
+                         /*isConstant=*/true, LLVM::Linkage::External, "__pim_opt_memo",
+                         DenseElementsAttr::get(memoTy, ArrayRef<int32_t>(flat)));
+  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
+                         "__pim_opt_memo_count", b.getI32IntegerAttr((int32_t)flat.size() / 2));
 }
 
 // -----------------------------------------------------------------------
