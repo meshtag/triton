@@ -341,6 +341,9 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+    // A volatile read of a just-stored value is the kernel asking for the bank read, which
+    // LLVM's GVN otherwise forwards from the store.
+    bool vol = op.getIsVolatile();
 
     // ---- Operands ----
     Value ptr = op.getPtr();   // original Triton ptr (tensor of pointers)
@@ -384,7 +387,7 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 
       if (!mask) {
         // ---- Unconditional vector load ----
-        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr);
+        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr, 0, vol);
 
         if (vec > 1) {
           for (unsigned j = 0; j < vec; ++j) {
@@ -414,7 +417,7 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 
         rewriter.setInsertionPointToStart(loadBlock);
         Value loaded =
-            LLVM::LoadOp::create(rewriter, loc, valueElemTy, basePtr);
+            LLVM::LoadOp::create(rewriter, loc, valueElemTy, basePtr, 0, vol);
         LLVM::BrOp::create(rewriter, loc, ValueRange{loaded}, afterBlock);
 
         rewriter.setInsertionPointToStart(afterBlock);
@@ -458,7 +461,7 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 
         // loadBlock: vector load → extract → per-element select.
         rewriter.setInsertionPointToStart(loadBlock);
-        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr);
+        Value loaded = LLVM::LoadOp::create(rewriter, loc, vecTy, basePtr, 0, vol);
 
         SmallVector<Value> selectedVals;
         for (unsigned j = 0; j < vec; ++j) {
