@@ -10,6 +10,10 @@
  * further arithmetic keeps its MAC, since that read also carries the arithmetic. The
  * marker calls bracket the load, so every access it lowers to carries the opcode.
  *
+ * A ReLU of a value already in the register file, stored, is HBM-PIM's MOV with the ReLU
+ * bit from GRF to GRF (Lee et al. ISCA'21 Table II), one command per register. The store
+ * is bracketed with kOpRegRelu and the runtime issues that MOV before the write-back.
+ *
  * Runs only when the module carries `im.dcc_relu_opcode`, because only the dcc-parity
  * runtime defines `__pim_trace_op`. Must run before scf-to-cf.
  */
@@ -35,7 +39,7 @@ namespace {
 
 constexpr llvm::StringLiteral kOpFn = "__pim_trace_op";
 constexpr llvm::StringLiteral kGateAttr = "im.dcc_relu_opcode";
-constexpr int32_t kOpNone = 0, kOpRelu = 1;
+constexpr int32_t kOpNone = 0, kOpRelu = 1, kOpRegRelu = 2;
 
 static bool isZero(Value v) {
   if (auto s = v.getDefiningOp<triton::SplatOp>())
@@ -74,6 +78,24 @@ static bool feedsReluOnly(Value v) {
          onlyStored(u->getResult(0));
 }
 
+/// The stored value, through float casts, is max(v, 0) of a v no ReLU-only load gives.
+static bool storesRegRelu(triton::StoreOp st) {
+  Value v = st.getValue();
+  while (auto c = v.getDefiningOp())
+    if (isa<arith::ExtFOp, arith::TruncFOp>(c) && c->getResult(0).hasOneUse())
+      v = c->getOperand(0);
+    else
+      break;
+  Operation *m = v.getDefiningOp();
+  if (!m || !isa<arith::MaxNumFOp, arith::MaximumFOp>(m) || !v.hasOneUse())
+    return false;
+  Value a = m->getOperand(0), b = m->getOperand(1);
+  Value x = isZero(b) ? a : isZero(a) ? b : Value();
+  while (x && x.getDefiningOp() && isa<arith::ExtFOp, arith::TruncFOp>(x.getDefiningOp()))
+    x = x.getDefiningOp()->getOperand(0);
+  return x && !(x.getDefiningOp<triton::LoadOp>() && feedsReluOnly(x));
+}
+
 static LLVM::LLVMFuncOp getOrDeclareOpFn(ModuleOp mod) {
   if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(kOpFn))
     return fn;
@@ -96,7 +118,12 @@ struct IMReluOpcodePass
       if (feedsReluOnly(ld.getResult()))
         loads.push_back(ld);
     });
-    if (loads.empty())
+    SmallVector<triton::StoreOp> stores;
+    mod.walk([&](triton::StoreOp st) {
+      if (storesRegRelu(st))
+        stores.push_back(st);
+    });
+    if (loads.empty() && stores.empty())
       return;
     LLVM::LLVMFuncOp fn = getOrDeclareOpFn(mod);
     auto call = [&](OpBuilder &b, Location loc, int32_t op) {
@@ -108,6 +135,12 @@ struct IMReluOpcodePass
       call(b, ld.getLoc(), kOpRelu);
       b.setInsertionPointAfter(ld);
       call(b, ld.getLoc(), kOpNone);
+    }
+    for (triton::StoreOp st : stores) {
+      OpBuilder b(st);
+      call(b, st.getLoc(), kOpRegRelu);
+      b.setInsertionPointAfter(st);
+      call(b, st.getLoc(), kOpNone);
     }
   }
 };
