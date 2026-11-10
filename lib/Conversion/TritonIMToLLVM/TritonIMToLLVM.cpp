@@ -21,8 +21,9 @@
 /// The vector width formula is:
 ///
 ///     contiguity = axisInfoAnalysis.getContiguity(ptr)
-///     vec = min(128 / pointeeBitWidth, contiguity)
+///     vec = min(dqBits / pointeeBitWidth, contiguity)
 ///
+/// where dqBits is the column width the harness states as `im.dq_bits`.
 /// For a simple AXPY kernel (`ptr = base + pid*BLOCK + arange(0,BLOCK)`)
 /// AxisInfo computes contiguity = sizePerThread, yielding full
 /// vectorization.  For indirect patterns like `A + offs * K + k`,
@@ -172,10 +173,10 @@ struct IMBarrierOpErase
 ///
 /// The vector width formula is:
 ///
-///     vec = min(128 / pointeeBitWidth, contiguity)
+///     vec = min(dqBits / pointeeBitWidth, contiguity)
 ///
-/// - 128 bits is the maximum LLVM vector width we emit (matches GPU
-///   backends; yields <4 x i32>, <8 x i16>, <16 x i8>, etc.).
+/// - `dqBits` is the bits one column command moves: `im.dq_bits` when the
+///   module states it (256 on HBM-PIM, so 16 FP16), kImDqBits otherwise.
 /// - `contiguity` is the number of consecutive elements accessed per
 ///   thread in the fastest-varying dimension, derived from Triton's
 ///   AxisInfo dataflow analysis.  After RewriteIMLayout sets

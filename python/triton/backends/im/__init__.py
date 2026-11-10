@@ -9,8 +9,9 @@ def IMTarget(arch: str = "hbm-pim", num_banks: int = 16,
     """Create a compile target for the In-Memory (IM) backend.
 
     Args:
-        arch: Architecture identifier.  ``"hbm-pim"`` for Samsung HBM-PIM
-              (the only supported architecture so far).
+        arch: Architecture identifier.  ``"hbm-pim"`` is the only one. SIMDRAM
+              kernels compile with it too, and the harness states that
+              machine's column width as the ``im_dq_bits`` option.
         num_banks: Number of PIM banks that execute in SIMD lock-step.
               For HBM-PIM this equals ``bank_groups × banks_per_group``
               from the Ramulator2 config (default 4 × 4 = 16).
