@@ -52,8 +52,6 @@ namespace {
 
 constexpr llvm::StringLiteral kGateAttr = "im.optipim_mac";
 constexpr llvm::StringLiteral kMacFn = "__pim_opt_mac";
-/// Stamped on each MAC loop, so the IR shows where the calls are.
-constexpr llvm::StringLiteral kMarkedAttr = "im.optipim-mac";
 constexpr llvm::StringLiteral kTileLoopAttr = "im.tile-boundary";
 /// Their PE's value width. Their word is the module's dq over it (fimdram.cpp:25).
 constexpr int64_t kValueBits = 16;
@@ -336,13 +334,12 @@ static LogicalResult lowerMacs(ModuleOp mod) {
       cst(kValuesPerMac));
   LLVM::LLVMFuncOp fn = getOrDeclareMacFn(mod);
   b.setInsertionPointAfter(red);
-  auto loop = scf::ForOp::create(
+  scf::ForOp::create(
       b, loc, cst(0), macs, cst(1), ValueRange{},
       [&](OpBuilder &nb, Location l, Value j, ValueRange) {
         LLVM::CallOp::create(nb, l, TypeRange{}, SymbolRefAttr::get(fn), ValueRange{j});
         scf::YieldOp::create(nb, l);
       });
-  loop->setAttr(kMarkedAttr, b.getUnitAttr());
 
   OpBuilder g(mod.getBodyRegion());
   g.setInsertionPointToStart(mod.getBody());

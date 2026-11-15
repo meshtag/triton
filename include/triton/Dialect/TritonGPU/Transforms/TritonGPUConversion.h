@@ -10,8 +10,6 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/StringRef.h"
 
-#include <string>
-
 namespace mlir {
 
 class TritonGPUTypeConverter : public TypeConverter {
@@ -33,14 +31,12 @@ public:
   int getNumWarps() const { return numWarps; }
   int getThreadsPerWarp() const { return threadsPerWarp; }
   int getNumCTAs() const { return numCTAs; }
-  llvm::StringRef getTarget() const { return target; }
 
 private:
   MLIRContext *context;
   int numWarps;
   int threadsPerWarp;
   int numCTAs;
-  std::string target;
 };
 
 class TritonGPUConversionTarget : public ConversionTarget {

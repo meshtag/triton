@@ -76,7 +76,7 @@ def _dump_commands(stages: list[dict]) -> None:
 
 @dataclass(frozen=True)
 class IMOptions:
-    num_banks: int = 16   # parallel PIM banks (HBM-PIM default: 4 BG × 4 banks)
+    num_banks: int = 16   # lanes in lockstep, overridden by the target's warp_size
     num_warps: int = 1    # always 1 for IM (no warp hierarchy)
     num_ctas: int = 1
     num_stages: int = 2
@@ -90,7 +90,8 @@ class IMOptions:
     backend_name: str = "im"
     instrumentation_mode: str = ""
     arch: str = "hbm-pim"
-    skip_passes: tuple[str, ...] = ()  # pass names to skip (for ablation)
+    # Only "triton-licm" can be skipped, so __post_init__ refuses any other name.
+    skip_passes: tuple[str, ...] = ()
     # User schedule for im-operand-residency-layout, as MLIR dictionary text
     # keyed by kernel operand index, e.g. '{arg1 = {bank_replicated = true}}'.
     # Empty means the classifier decides everything.
@@ -100,9 +101,6 @@ class IMOptions:
     # MACs*banks/BLOCK[bank_axis], so a shape whose bank axis is small can never
     # amortise however the tile is picked.
     im_bank_axis: int = -1
-    # Bank-group interleave (whole-kernel address mapping). Compiler-emitted so the
-    # decision lives in the artifact rather than a runtime env var.
-    im_bg_interleave: bool = False
     # Persistent kernel: the grid stops being the work decomposition and one program
     # instance loops over several tiles. Marks the module so im-tile-boundary knows
     # which loop to signal; without it the trace runtime sees the whole replay as one
@@ -181,9 +179,11 @@ class IMOptions:
     # Active lanes per tensor axis where their mapping leaves lanes of im_bank_split idle, as
     # "1,3,4,3,1"; the runtime gives the active lanes banks 0..S-1, their codegen's PU order.
     im_bank_active: str = ""
-    # A contraction's first product initialises its accumulator, a MUL into GRF_B, so the
-    # reset before it goes (im-acc-init-fold). Needs im_dcc_acc_grf, which states it.
-    im_acc_init_fold: bool = False
+
+    def __post_init__(self):
+        bad = set(self.skip_passes) - {"triton-licm"}
+        if bad:
+            raise ValueError(f"skip_passes={sorted(bad)!r}: only 'triton-licm' can be skipped")
 
     def hash(self):
         skip_tag = ",".join(sorted(self.skip_passes)) if self.skip_passes else "none"
@@ -191,7 +191,6 @@ class IMOptions:
         sched_tag = self.im_schedule or "none"
         return (f"im-{self.arch}-b{self.num_banks}-c{self.num_ctas}"
                 f"-skip:{skip_tag}-sched:{sched_tag}-bax:{self.im_bank_axis}"
-                f"-bgi:{int(self.im_bg_interleave)}"
                 f"-align:{self.im_placement_align}"
                 f"-persist:{int(self.im_persistent)}"
                 f"-dq:{int(self.im_dq_bits)}-split:{self.im_bank_split or 'none'}"
@@ -208,8 +207,7 @@ class IMOptions:
                 f"-opthold:{int(self.im_optipim_hold_input)}"
                 f"-optmemo:{self.im_optipim_memo or 'none'}"
                 f"-optvert:{int(self.im_optipim_vertical)}"
-                f"-active:{self.im_bank_active or 'none'}"
-                f"-accinit:{int(self.im_acc_init_fold)}")
+                f"-active:{self.im_bank_active or 'none'}")
 
 
 class IMBackend(BaseBackend):
@@ -299,12 +297,10 @@ class IMBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         # triton-combine is left out of this stage. Its CombineBroadcastMulReducePattern
         # folds reduce_add(broadcast(a)*broadcast(b)) into tt.dot, which IM cannot lower.
-        if "triton-reorder-broadcast" not in skip:
-            passes.ttir.add_reorder_broadcast(pm)
+        passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        if "triton-loop-unroll" not in skip:
-            passes.ttir.add_loop_unroll(pm)
+        passes.ttir.add_loop_unroll(pm)
         if "triton-licm" not in skip:
             passes.ttir.add_triton_licm(pm)
             passes.ttir.add_loop_aware_cse(pm)
@@ -313,18 +309,11 @@ class IMBackend(BaseBackend):
         pm.run(mod, "make_ttir")
 
         builder = ir.builder(mod.context)
-        # ── IM-specific module attributes (clean, readable names) ──
-        # Documentation only, for IR dumps: the lowering takes the bank count
-        # from ttg.threads-per-warp, nothing reads this attribute.
-        mod.set_attr("im.num-banks", builder.get_int32_attr(options.num_banks))
-        mod.set_attr("im.arch", builder.get_string_attr(options.arch))
         # Step 4 schedule channel. The pass rejects a malformed or unmatched
         # schedule, so a typo fails the compile instead of quietly measuring the
         # classifier's default.
         if options.im_schedule:
             mod.set_attr("im.schedule", builder.parse_attr(options.im_schedule))
-        if options.im_bg_interleave:
-            mod.set_attr("im.bg_interleave", builder.parse_attr("1 : i64"))
         if options.im_persistent:
             # im.noalias_args is NOT re-stamped here: it has to be set before
             # make_ttir (above) because triton-licm reads it there, and the
@@ -373,9 +362,6 @@ class IMBackend(BaseBackend):
                                  "gemm and matvec parity kernels needs im_optipim_memo: the "
                                  "hoist out of the tile loop already holds the input, and "
                                  "only their hash holds more")
-            if "im-operand-residency-layout" in options.skip_passes:
-                raise ValueError("im_optipim_hold_input is stated by "
-                                 "im-operand-residency-layout, which skip_passes skips")
             mod.set_attr("im.optipim_hold_input", builder.parse_attr("1 : i64"))
         if options.im_optipim_vertical:
             if not options.im_optipim_mac:
@@ -408,19 +394,14 @@ class IMBackend(BaseBackend):
                                  f"1..lanes per axis of im_bank_split={options.im_bank_split!r}")
             mod.set_attr("im.bank_active",
                          builder.parse_attr("array<i64: " + ", ".join(map(str, act)) + ">"))
-        if options.im_acc_init_fold:
-            if not options.im_dcc_acc_grf:
-                raise ValueError("im_acc_init_fold is stated through the accumulator "
-                                 "convention, set im_dcc_acc_grf too")
-            mod.set_attr("im.acc_init_fold", builder.parse_attr("1 : i64"))
         # The record word keeps its old numbering, 2 was global-row.
         _ALIGNS = {"dq": 1, "row-pack": 3}
         if options.im_placement_align not in _ALIGNS:
             raise ValueError(
                 f"im_placement_align={options.im_placement_align!r}; "
                 f"expected one of {sorted(_ALIGNS)}")
-        # Interleaved, the only placement anything compiles for. Still stated, so every
-        # artifact is unchanged and the default runtime still warns on a PIM_LAYOUT override.
+        # Interleaved, the only placement anything compiles for. Still stated, so a runtime
+        # can refuse a kernel placed for another.
         mod.set_attr("im.layout_scheme", builder.parse_attr("2 : i64"))
         mod.set_attr("im.placement_align",
                      builder.parse_attr(f"{_ALIGNS[options.im_placement_align]} : i64"))
@@ -449,8 +430,6 @@ class IMBackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
-        skip = set(options.skip_passes)
-
         ttgir_passes = [
             f"convert-triton-to-tritongpu{{target=im:{options.arch} "
             f"num-warps={options.num_warps} "
@@ -476,23 +455,17 @@ class IMBackend(BaseBackend):
             options.num_banks,     # threads_per_warp ← num_banks
             options.num_ctas,
         )
-        if "rewrite-im-layout" not in skip:
-            passes.convert.add_rewrite_im_layout(pm)
+        passes.convert.add_rewrite_im_layout(pm)
         # It places against the lane layout, so it follows rewrite-im-layout.
-        if "im-load-cluster" not in skip:
-            passes.convert.add_im_load_cluster(pm)
-        if "im-operand-residency-layout" not in skip:
-            passes.convert.add_im_operand_residency_layout(pm)
-        if "tritongpu-remove-layout-conversions" not in skip:
-            passes.ttgpuir.add_remove_layout_conversions(pm)
-        if "tritongpu-reduce-data-duplication" not in skip:
-            passes.ttgpuir.add_reduce_data_duplication(pm)
+        passes.convert.add_im_load_cluster(pm)
+        passes.convert.add_im_operand_residency_layout(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
-        if "mlir-licm" not in skip:
-            passes.common.add_licm(pm)
-            passes.common.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
+        passes.common.add_licm(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
         pm.run(mod, "make_ttgir")
 
         if _im_debug():
@@ -508,7 +481,6 @@ class IMBackend(BaseBackend):
             "im-lane-fold",
             "im-dcc-tile-mac",
             "im-optipim-mac",
-            "im-acc-init-fold",
             "im-relu-opcode",
             "convert-scf-to-cf",
             "convert-triton-im-to-llvm",
@@ -521,29 +493,20 @@ class IMBackend(BaseBackend):
 
         mod = src
         metadata["name"] = mod.get_entry_func_name()
-        skip = set(getattr(options, "skip_passes", ()) or ())
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        if "mlir-licm" not in skip:
-            passes.common.add_licm(pm)
+        passes.common.add_licm(pm)
         # BEFORE scf-to-cf: afterwards the tile loop's back edge is a branch and
         # finding it means recovering the structure that conversion discards. No-op
         # unless the module is marked persistent. The call it inserts used to blow
         # the stack in the IM conversion's membar analysis, which is fixed in
         # Membar.cpp, so persistent cycle numbers are quotable again.
-        if "im-tile-boundary" not in skip:
-            passes.convert.add_im_tile_boundary(pm)
-        if "im-lane-fold" not in skip:
-            passes.convert.add_im_lane_fold(pm)
-        if "im-dcc-tile-mac" not in skip:
-            passes.convert.add_im_dcc_tile_mac(pm)
+        passes.convert.add_im_tile_boundary(pm)
+        passes.convert.add_im_lane_fold(pm)
+        passes.convert.add_im_dcc_tile_mac(pm)
         # After im-tile-boundary, which marks the tile loop that the step index reads.
-        if "im-optipim-mac" not in skip:
-            passes.convert.add_im_optipim_mac(pm)
-        if "im-acc-init-fold" not in skip:
-            passes.convert.add_im_acc_init_fold(pm)
-        if "im-relu-opcode" not in skip:
-            passes.convert.add_im_relu_opcode(pm)
+        passes.convert.add_im_optipim_mac(pm)
+        passes.convert.add_im_relu_opcode(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_convert_triton_im_to_llvm(pm)
         passes.convert.add_index_to_llvmir(pm)
@@ -578,8 +541,8 @@ class IMBackend(BaseBackend):
             _dump_commands([
                 {
                     "title": "Stage 1 — TTIR",
-                    "note": "Module attributes (im.num-banks etc.) are set "
-                            "after this pipeline in Python; ttir.mlir already "
+                    "note": "Module attributes (im.bank_axis etc.) are set "
+                            "after this pipeline in Python, and ttir.mlir already "
                             "has them.",
                     "input": "im_debug/ttir_input.mlir",
                     "output": "im_debug/ttir.mlir",

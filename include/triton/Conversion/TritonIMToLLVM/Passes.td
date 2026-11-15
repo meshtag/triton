@@ -28,28 +28,21 @@ def ConvertTritonIMToLLVM
                            "mlir::triton::gpu::TritonGPUDialect"];
 }
 
-// Layout rewrite pass: changes the BlockedEncodingAttr so that each PIM
-// bank owns a *consecutive* chunk of elements (register-innermost
-// layout) instead of the default GPU-style interleaved layout
-// (lane-innermost / coalesced).
-//
-// GPU default (sizePerThread=1):
-//   bank 0 → {0, 16, 32, 48}  (stride = threadsPerWarp)
-// IM layout (sizePerThread = shape / threadsPerWarp):
-//   bank 0 → {0, 1, 2, 3}     (consecutive)
+// Places the banks on the axis the module states. Each PIM bank owns a
+// consecutive chunk of elements (sizePerThread = shape / threadsPerWarp), so
+// bank 0 holds {0, 1, 2, 3} rather than the GPU-coalesced {0, 16, 32, 48}.
 //
 // This pass replaces tritongpu-coalesce in the IM pipeline.
 def RewriteIMLayout : Pass<"rewrite-im-layout", "mlir::ModuleOp"> {
   let summary = "Rewrite tensor layout for bank-consecutive PIM access";
   let description = [{
-    Rewrites BlockedEncodingAttr on tensor-typed memory operations so
-    that each PIM bank (= one TritonGPU "lane") owns a consecutive
-    slice of elements rather than an interleaved slice.  The pass
-    reads ttg.threads-per-warp and ttg.num-warps from the module and computes
-    sizePerThread = tensorShape / (threadsPerWarp × warpsPerCTA) for
-    each dimension.  ConvertLayoutOps are inserted around load/store
-    operations; the downstream tritongpu-remove-layout-conversions
-    pass propagates the new encoding through the rest of the IR.
+    For im: targets convert-triton-to-tritongpu already emits the bank-consecutive
+    encoding with the lanes on the innermost axis. This pass rebuilds it with the
+    banks on the axis the module states (im.bank_axis, im.bank_split, or one derived
+    from a reduce or from im.derive_bank_axis) and refuses a choice that would put
+    lanes on a reduced axis. ConvertLayoutOps are inserted around load/store
+    operations, and the downstream tritongpu-remove-layout-conversions pass
+    propagates the new encoding through the rest of the IR.
   }];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
@@ -65,8 +58,8 @@ def IMOperandResidencyLayout
     Stamps each tensor-of-pointer load or store, and each scalar load splatted
     across the lanes, with an im.residency dictionary. Its fields include the reuse
     class, how many banks receive a copy (bank_replicated), the kernel argument read
-    and the footprint of one program instance. im.schedule and
-    im.residency.force can override bank_replicated.
+    and the footprint of one program instance. im.schedule can override
+    bank_replicated.
   }];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
@@ -96,6 +89,9 @@ def IMTileBoundary : Pass<"im-tile-boundary", "mlir::ModuleOp"> {
 
     Ordering. Must run BEFORE scf-to-cf: afterwards the back edge is a branch and
     identifying the tile loop means recovering the structure just discarded.
+
+    Under `im.tile_prologue_first` the first iteration skips the call, so work
+    hoisted above the loop shares tile 0 with it.
   }];
 
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::LLVM::LLVMDialect"];
@@ -123,7 +119,9 @@ def IMReluOpcode : Pass<"im-relu-opcode", "mlir::ModuleOp"> {
     through float casts, is a max against zero is bracketed by
     `__pim_trace_op(1)` and `__pim_trace_op(0)`, so the runtime issues its reads as
     DCC's PIM_RELU. This adopts DCC's pricing of ReLU, which their simulator does not
-    space on the command bus.
+    space on the command bus. A stored ReLU of a value already in the register file
+    has its store bracketed with a register-ReLU opcode, and the runtime issues
+    HBM-PIM's GRF-to-GRF MOV with the ReLU bit before the write-back.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::LLVM::LLVMDialect"];
 }
@@ -135,10 +133,11 @@ def IMLoadCluster : Pass<"im-load-cluster", "mlir::ModuleOp"> {
     Only runs when the module carries `im.cluster_loads = n`, the register-file entries
     per lane. An innermost scf.for with a constant trip count whose body loads two or
     more kernel arguments (or one, when it also stores), stores none of them and touches
-    memory no other way is unrolled by G, the largest proper divisor of its trip count
-    whose G iterations of any one argument fit n entries. Each strip's loads are grouped
-    by argument, so a DRAM row stays open for G loads. Reads the lane layout. Stamps the
-    widest strip of a storing loop as `im.map_strip_entries`.
+    memory no other way is unrolled in strips of G, as many iterations as fit n entries
+    for any one argument, and the remainder of the trip count is a shorter strip of its
+    own. Each strip's loads are grouped by argument, so a DRAM row stays open for G
+    loads. Reads the lane layout. Stamps the widest strip of a storing loop as
+    `im.map_strip_entries`.
   }];
   let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
 }
@@ -150,19 +149,6 @@ def IMDccTileMac : Pass<"im-dcc-tile-mac", "mlir::ModuleOp"> {
     whose load keeps one column of outputs lane-fastest and whole tiles of the reduce axis
     next is stamped with the column reads one DCC MAC_OP1 covers. Every load of that
     argument must qualify. Adopts DCC's ISA pricing, a convention of the DCC path.
-  }];
-  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
-}
-
-def IMAccInitFold : Pass<"im-acc-init-fold", "mlir::ModuleOp"> {
-  let summary = "State that a contraction's first product initialises its accumulator";
-  let description = [{
-    Only runs when the module carries `im.acc_init_fold`. A reduce over load * broadcast
-    has no init, so the load's read at reduce coordinate 0 writes each accumulator entry,
-    a MUL into GRF_B in the HBM-PIM ISA, and the entry needs no reset. The load is stamped
-    with its reduce stride and extent in elements and the store of the result with
-    `im.acc-init-fold`. One contraction per module, whose product is its argument's only
-    load and whose store is its argument's only store, or nothing is stamped.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::triton::TritonDialect"];
 }

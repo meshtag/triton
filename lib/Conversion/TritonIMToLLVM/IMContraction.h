@@ -1,5 +1,5 @@
 // Matching helpers for a contraction, reduce(load * broadcast(operand)), shared by the
-// passes that stamp it (im-dcc-tile-mac, im-acc-init-fold, im-optipim-mac) and by the
+// passes that stamp it (im-dcc-tile-mac, im-optipim-mac) and by the
 // OptiPIM cell count in the IM lowering.
 #ifndef TRITONIM_CONVERSION_IMCONTRACTION_H
 #define TRITONIM_CONVERSION_IMCONTRACTION_H

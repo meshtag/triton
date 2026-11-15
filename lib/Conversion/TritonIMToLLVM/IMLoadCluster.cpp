@@ -52,8 +52,6 @@ namespace ttg = mlir::triton::gpu;
 namespace {
 
 constexpr llvm::StringLiteral kGateAttr = "im.cluster_loads";
-/// Stamped on the unrolled loop as G.
-constexpr llvm::StringLiteral kMarkedAttr = "im.load-cluster";
 /// Marks the body's own ops while this pass runs. Clones copy it and the index arithmetic
 /// the unroll adds has none, so that arithmetic is placed only as a dependency or last.
 constexpr llvm::StringLiteral kBodyAttr = "im.load-cluster.body";
@@ -199,7 +197,7 @@ static scf::ForOp splitAfter(scf::ForOp f, int64_t n) {
 
 /// Unrolls `f`, whose trip count is a multiple of g, in strips of g and clusters each
 /// strip. A loop of one strip is promoted to straight-line code, clustered where it lands.
-static bool unrollStrips(scf::ForOp f, int64_t g, int64_t trip, MLIRContext *ctx) {
+static bool unrollStrips(scf::ForOp f, int64_t g, int64_t trip) {
   if (trip > g) {
     auto res = loopUnrollByFactor(f, g);
     if (failed(res) || !res->mainLoopOp)
@@ -208,10 +206,7 @@ static bool unrollStrips(scf::ForOp f, int64_t g, int64_t trip, MLIRContext *ctx
     SmallVector<Operation *> ops;
     for (Operation &op : body.without_terminator())
       ops.push_back(&op);
-    if (!clusterLoads(ops, body.getTerminator()))
-      return false;
-    (*res->mainLoopOp)->setAttr(kMarkedAttr, IntegerAttr::get(IntegerType::get(ctx, 64), g));
-    return true;
+    return clusterLoads(ops, body.getTerminator());
   }
   Operation *prev = f->getPrevNode(), *next = f->getNextNode();
   Block *block = f->getBlock();
@@ -260,9 +255,9 @@ struct IMLoadClusterPass
       f.getBody()->walk([&](triton::StoreOp) { stores = true; });
       int64_t whole = *trip - *trip % g, rest = *trip % g;
       scf::ForOp tail = rest ? splitAfter(f, whole) : scf::ForOp();
-      bool done = unrollStrips(f, g, whole, ctx);
+      bool done = unrollStrips(f, g, whole);
       if (tail && rest > 1)
-        done = unrollStrips(tail, rest, rest, ctx) && done;
+        done = unrollStrips(tail, rest, rest) && done;
       if (done && stores)
         strip = std::max(strip, g * widest);
     }

@@ -11,7 +11,8 @@ class IMDriver(DriverBase):
         return ty
 
     def get_current_target(self):
-        # arch="hbm-pim", num_banks=16 (default HBM-PIM config)
+        # Placeholder, since the driver is never active. Harnesses compile against
+        # IMTarget with their own lane count.
         return GPUTarget("im", "hbm-pim", 16)
 
     def get_active_torch_device(self):

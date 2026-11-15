@@ -160,6 +160,26 @@ struct IMBarrierOpErase
   }
 };
 
+/// Data-bus width in bits, the number of values one column command moves once
+/// divided by the element width. Must equal the runtime's cfg_dq_bits.
+/// Default only: the harness states the machine's width as `im.dq_bits`, and the two
+/// targets differ (HBM-PIM moves prefetch*dq = 256 bits per column command, SIMDRAM's
+/// column is a bit-serial slot whose width is dq itself).
+static constexpr unsigned kImDqBits = 128;
+
+/// The bus width this module's vector widths are being chosen for.
+static unsigned imDqBits(Value anchor) {
+  Operation *op = anchor.getDefiningOp();
+  if (!op && anchor.getParentBlock())
+    op = anchor.getParentBlock()->getParentOp();
+  if (op)
+    if (auto mod = op->getParentOfType<ModuleOp>())
+      if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
+        if (a.getInt() > 0)
+          return (unsigned)a.getInt();
+  return kImDqBits;
+}
+
 // --------------------------------------------------------------------------
 // Base class for vectorized load/store conversions
 // --------------------------------------------------------------------------
@@ -189,26 +209,6 @@ struct IMBarrierOpErase
 ///
 ///     vec = min(vec, maskAlignment)
 ///
-/// Data-bus width in bits, the number of values one column command moves once
-/// divided by the element width. Must equal the runtime's cfg_dq_bits.
-/// Default only: the harness states the machine's width as `im.dq_bits`, and the two
-/// targets differ (HBM-PIM moves prefetch*dq = 256 bits per column command, SIMDRAM's
-/// column is a bit-serial slot whose width is dq itself).
-static constexpr unsigned kImDqBits = 128;
-
-/// The bus width this module's vector widths are being chosen for.
-static unsigned imDqBits(Value anchor) {
-  Operation *op = anchor.getDefiningOp();
-  if (!op && anchor.getParentBlock())
-    op = anchor.getParentBlock()->getParentOp();
-  if (op)
-    if (auto mod = op->getParentOfType<ModuleOp>())
-      if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-        if (a.getInt() > 0)
-          return (unsigned)a.getInt();
-  return kImDqBits;
-}
-
 /// This ensures that within each vector group, either all elements are
 /// active or all are inactive, so we can use a single predicate bit
 /// for the whole vector load/store.
@@ -225,7 +225,7 @@ struct IMLoadStoreConversionBase {
 
   /// Compute the vector width for a pointer-typed tensor operand.
   ///
-  /// vec = min(kImDqBits / pointeeBitWidth, contiguity)
+  /// vec = min(imDqBits / pointeeBitWidth, contiguity)
   ///
   /// AxisInfo tracks pointer arithmetic (make_range, splat, addptr,
   /// muli, etc.) and correctly reports contiguity=1 for non-contiguous
@@ -723,12 +723,8 @@ public:
 
 
 /// Emit the residency descriptor as module globals the PIM runtime reads at
-/// link time:
-///   @__pim_layout_count : i32                entry count N
-///   @__pim_layout_table : [kRecWords*N x i32]
-///       { operand_arg, num_axes,
-///         then kMaxAxes copies of
-///         { extent, stride factor, arg, arg, arg } }
+/// link time: @__pim_layout_count (i32, the entry count N) and
+/// @__pim_layout_table ([kRecWords*N x i32], each record laid out at kRecWords).
 ///
 /// The address footprint is logical on purpose. How many register slots it
 /// needs depends on the bank/row/column interleaving, which only the runtime
@@ -871,19 +867,6 @@ static void emitPimLayoutTable(ModuleOp mod) {
                          LLVM::Linkage::External, "__pim_layout_rec_words",
                          b.getI32IntegerAttr((int32_t)kRecWords));
 
-  // Bank-group interleave: a whole-kernel address-mapping choice, so it travels as a
-  // module-level global rather than a per-tensor record field. Placing the bankgroup
-  // bits below the column bits makes consecutive elements round-robin the bank groups,
-  // so consecutive column commands are spaced by nCCDS rather than nCCDL. Bijective
-  // over power-of-two dimensions, hence correctness-invariant. Emitted so the decision
-  // is the compiler's; the runtime env var remains only for ablation.
-  int32_t bgi = 0;
-  if (auto a = mod->getAttrOfType<IntegerAttr>("im.bg_interleave"))
-    bgi = (int32_t)(a.getInt() != 0);
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
-                         LLVM::Linkage::External, "__pim_bg_interleave",
-                         b.getI32IntegerAttr(bgi));
-
   // The bus width this artifact's vector widths were chosen for. The runtime holds
   // the same quantity as cfg_dq_bits and used to decide it independently, so a
   // machine configured with a different bus silently priced vectors the compiler
@@ -896,11 +879,9 @@ static void emitPimLayoutTable(ModuleOp mod) {
                          LLVM::Linkage::External, "__pim_dq_bits",
                          b.getI32IntegerAttr(dqBits));
 
-  // Placement policy. Where a tensor lands, and therefore which tensors collide on a
-  // bank, was decided entirely by the runtime: a bump allocator in registration order
-  // under a hardcoded alignment rule, with the scheme itself a runtime default plus an
-  // env var. The runtime still executes the policy against sizes it only learns at
-  // registration, but it no longer CHOOSES it. 0 = the kernel said nothing.
+  // Placement policy, 0 = the kernel said nothing. The dcc-parity runtime places row-pack
+  // when asked, and the default and optipim-parity runtimes refuse anything but
+  // interleaved at DQ alignment.
   auto emitPolicy = [&](const char *attr, const char *sym) {
     int32_t v = 0;
     if (auto a = mod->getAttrOfType<IntegerAttr>(attr))
@@ -908,8 +889,6 @@ static void emitPimLayoutTable(ModuleOp mod) {
     LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
                            LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
   };
-  // Always 0 now that no option sets it. Kept for runtimes that link the symbol.
-  emitPolicy("im.row_values", "__pim_row_values");
   emitPolicy("im.persistent", "__pim_persistent");
   emitPolicy("im.layout_scheme", "__pim_layout_scheme");
   emitPolicy("im.placement_align", "__pim_placement_align");
@@ -1044,7 +1023,7 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
   llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> acc;
   // A map's store beside a reduction, which the runtime cannot tell from the module.
   llvm::SetVector<int64_t> maps;
-  bool conflict = false, foldOnResult = false;
+  bool conflict = false;
   mod.walk([&](triton::StoreOp st) {
     int64_t arg = field(st, "operand_arg", -1);
     if (arg < 0)
@@ -1054,11 +1033,7 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
       maps.insert(arg);
     bool result = accCells == 0 || field(st, "live_split", 1) > 1 ||
                   foldsColumn(st.getValue()) || map;
-    // reset 2: im-acc-init-fold, the first product writes the entry, so no reset.
-    bool folded = st->hasAttr("im.acc-init-fold");
-    foldOnResult |= folded && result;
-    std::pair<int32_t, int32_t> c =
-        result ? std::make_pair(0, 2) : std::make_pair(folded ? 2 : 1, 1);
+    std::pair<int32_t, int32_t> c = result ? std::make_pair(0, 2) : std::make_pair(1, 1);
     auto it = acc.find(arg);
     if (it != acc.end() && it->second != c)
       conflict = true;
@@ -1084,22 +1059,6 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
   if (conflict)
     return mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result "
                               "and as an accumulator, which no single DCC convention covers";
-  if (foldOnResult)
-    return mod.emitError() << "im-acc-init-fold folded a store that DCC's convention drains "
-                              "as a result, which has no reset to fold";
-  // [operand_arg, reduce stride, reduce extent] of each folded contraction's product.
-  llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> first;
-  bool anyFolded = llvm::any_of(acc, [](auto &kv) { return kv.second.first == 2; });
-  if (anyFolded)
-    mod.walk([&](triton::LoadOp ld) {
-      auto g = ld->getAttrOfType<DenseI64ArrayAttr>("im.mac-first");
-      int64_t arg = field(ld, "operand_arg", -1);
-      if (g && arg >= 0)
-        first[arg] = {(int32_t)g.asArrayRef()[0], (int32_t)g.asArrayRef()[1]};
-    });
-  if (anyFolded && first.empty())
-    return mod.emitError() << "im-acc-init-fold: a folded accumulator's product load has no "
-                              "operand argument, so the runtime could not find its MUL";
   OpBuilder b(mod.getBodyRegion());
   b.setInsertionPointToStart(mod.getBody());
   Location loc = mod.getLoc();
@@ -1130,13 +1089,6 @@ static LogicalResult emitDccAccGrf(ModuleOp mod) {
   table("__pim_dcc_map", flatMaps);
   scalar("__pim_dcc_map_count", (int32_t)flatMaps.size());
   scalar("__pim_dcc_decided", 1);
-  if (mod->hasAttr("im.acc_init_fold")) {
-    SmallVector<int32_t> flatFirst;
-    for (auto &kv : first)
-      flatFirst.append({(int32_t)kv.first, kv.second.first, kv.second.second});
-    table("__pim_mac_first", flatFirst);
-    scalar("__pim_mac_first_count", (int32_t)first.size());
-  }
   return success();
 }
 

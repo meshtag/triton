@@ -77,7 +77,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
                                                bool enableSourceRemat,
                                                llvm::StringRef target)
     : context(context), numWarps(numWarps), threadsPerWarp(threadsPerWarp),
-      numCTAs(numCTAs), target(target.str()) {
+      numCTAs(numCTAs) {
   addConversion([](Type type) { return type; });
 
   // Add encoding for tensor.
@@ -86,7 +86,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   // convert_layout ops produced by `rewrite-im-layout` are no-ops and
   // get folded by `tritongpu-remove-layout-conversions`. This is what
   // unblocks tile shapes like 32×64 on the IM target.
-  bool isIM = targetIsIM(this->target);
+  bool isIM = targetIsIM(target);
   addConversion([this, isIM](RankedTensorType tensorType) -> RankedTensorType {
     if (tensorType.getEncoding())
       return tensorType;

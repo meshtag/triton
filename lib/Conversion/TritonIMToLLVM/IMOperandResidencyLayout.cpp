@@ -24,12 +24,10 @@
 ///
 /// Phase 2 (footprint): the element offsets one program instance touches, as
 /// (extent, stride) axes over the tl.arange axes and the reduction induction
-/// variable. It stays logical. The register-slot count those offsets need
-/// depends on the bank/row/column interleaving, which lives in the runtime, and
-/// a stride the pass cannot fold (conv's CI*R*S weight pitch) travels as a
-/// product of kernel argument indices for the runtime to resolve. Resolving at
-/// all requires a constant trip count, so an untiled reduction gets no
-/// footprint and the host allocator still sizes it.
+/// variable. It stays logical, and a stride the pass cannot fold (conv's CI*R*S
+/// weight pitch) travels as a product of kernel argument indices. Only a constant
+/// trip count gives a footprint, so an untiled reduction gets none. The runtimes
+/// read only the extents.
 
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
@@ -45,9 +43,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
-#include "llvm/Support/raw_ostream.h"
 #include <array>
-#include <cstdlib>
 #include <utility>
 
 // -----------------------------------------------------------------------
@@ -317,7 +313,7 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
 
 namespace {
 // Footprint descriptor limits. The layout table record is fixed width, so
-// these must match PIM_MAX_FP_AXES / PIM_MAX_STRIDE_ARGS in pim_runtime.c.
+// these must match PIM_MAX_FP_AXES / PIM_MAX_STRIDE_ARGS in pim_layout_table.h.
 static constexpr int64_t kMaxFpAxes = 3;
 static constexpr int64_t kMaxStrideArgs = 3;
 
@@ -401,9 +397,6 @@ static int64_t resolveOperandArg(Value ptr) {
   return -1;
 }
 
-// Is `op` a scalar tt.load whose (scalar) result feeds a tt.splat?  This is the
-// matvec `x_val = tl.load(x + k)` operand, invisible to the tensor-pointer
-// walk because its pointer is a plain !tt.ptr, not a tensor of pointers.
 /// Constant integer behind a Value, or nullopt.
 static std::optional<int64_t> constIntOf(Value v) {
   if (!v)
@@ -499,24 +492,9 @@ static bool foldStride(Value v, SymStride &out, int depth = 0) {
 using FpAcc = llvm::MapVector<Value, FpAxis>;
 
 /// Decompose an element offset into `const + sum stride_i * v_i` and record the
-/// varying part. `scale` carries the enclosing multiplications down.
-/// Report why an address was not modelled. Giving up here is silent otherwise:
-/// the operand just falls back to the host budget, which looks like success.
-/// IM_FP_DEBUG=1 to see it.
-static bool fpBail(Value v, const char *why) {
-  static int on = -1;
-  if (on < 0)
-    on = std::getenv("IM_FP_DEBUG") ? 1 : 0;
-  if (on) {
-    llvm::errs() << "[fp] bail " << why << " : ";
-    if (Operation *d = v ? v.getDefiningOp() : nullptr)
-      llvm::errs() << d->getName();
-    else
-      llvm::errs() << "<block arg>";
-    llvm::errs() << "\n";
-  }
-  return false;
-}
+/// varying part. `scale` carries the enclosing multiplications down. A false return
+/// means the address is not modelled and its operand gets no footprint.
+///
 /// `key` names the axis. It is the outermost layout-changing op the walk went
 /// through, because layout assignment CSEs one tl.arange into several tile
 /// dimensions and the range value alone cannot tell them apart. Null until the
@@ -526,7 +504,7 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
                         const SymStride &scale, FpAcc &acc, int depth,
                         Value key) {
   if (!v || depth > 32)
-    return fpBail(v, "depth");
+    return false;
   if (uniformIntOf(v))
     return true; // shifts the base, does not spread it
   auto note = [&](Value var, int64_t extent, int64_t stepScale) {
@@ -558,7 +536,7 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
     return isa<triton::FuncOp>(barg.getOwner()->getParentOp());
   Operation *def = v.getDefiningOp();
   if (!def)
-    return fpBail(v, "no-def");
+    return false;
   if (isa<triton::GetProgramIdOp>(def))
     return true; // fixed within one program instance
   if (auto mr = dyn_cast<triton::MakeRangeOp>(def)) {
@@ -590,9 +568,9 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
         return collectAxes(def->getOperand(1 - i), iv, ivTrip, ivStep, sub, acc,
                            depth + 1, key);
     }
-    return fpBail(v, "mul-nonconst-stride");
+    return false;
   }
-  return fpBail(v, "unhandled-op");
+  return false;
 }
 
 /// How many times wider the LIVE accumulator is than the value that reaches the
@@ -658,23 +636,6 @@ static int64_t liveSplitFactor(triton::StoreOp st) {
   return best / storedCells;
 }
 
-/// Cells ONE LANE holds of the accumulator a store drains, 0 when nothing accumulates.
-/// This is what the register file keeps live across a reduction, so it is what a GRF
-/// bound compares against.
-///
-/// TWO shapes reach it. A loop-carried accumulator (scf.for iter_arg) is the widest
-/// carried tile. A single-shot reduce -- tl.sum over a tile with no carry, which is what
-/// the persistent matvec, matmul and conv kernels emit, and what canonicalize leaves when
-/// a reduction loop has trip count 1 -- keeps the STORED tile live instead, so that is
-/// the figure. Taking only the carried form reported 0 for those kernels and the bound
-/// never fired on them.
-///
-/// An elementwise store (VA, RELU) neither carries nor reduces and reports 0: it streams
-/// through the ALU without occupying the accumulator file.
-///
-/// Every tensor one loop carries is live at once, so a loop's figure is the SUM of its
-/// carried tiles, and the widest loop wins. Taking the widest carried value admitted an
-/// interchanged GEMV holding four 128-cell accumulators as 128.
 /// Cells a loop nest keeps live in fresh tiles: a loop's float carries whose initial value
 /// is not an enclosing loop's carry (that one is the same registers), plus the widest of its
 /// own nests. A block loop carrying a running sum around a k loop holds both tiles.
@@ -698,6 +659,23 @@ static int64_t freshNestCells(scf::ForOp loop, PerLane &perLane) {
   return cells + inner;
 }
 
+/// Cells ONE LANE holds of the accumulator a store drains, 0 when nothing accumulates.
+/// This is what the register file keeps live across a reduction, so it is what a GRF
+/// bound compares against.
+///
+/// TWO shapes reach it. A loop-carried accumulator (scf.for iter_arg) is the widest
+/// carried tile. A single-shot reduce -- tl.sum over a tile with no carry, which is what
+/// the persistent matvec, matmul and conv kernels emit, and what canonicalize leaves when
+/// a reduction loop has trip count 1 -- keeps the STORED tile live instead, so that is
+/// the figure. Taking only the carried form reported 0 for those kernels and the bound
+/// never fired on them.
+///
+/// An elementwise store (VA, RELU) neither carries nor reduces and reports 0: it streams
+/// through the ALU without occupying the accumulator file.
+///
+/// Every tensor one loop carries is live at once, so a loop's figure is the SUM of its
+/// carried tiles, and the widest loop wins. Taking the widest carried value admitted an
+/// interchanged GEMV holding four 128-cell accumulators as 128.
 static int64_t accCellsPerLane(triton::StoreOp st) {
   auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
   if (!storedTy)
@@ -780,10 +758,8 @@ static int64_t accCellsPerLane(triton::StoreOp st) {
 /// Footprint of the whole address: walk the addptr chain back to the kernel
 /// pointer argument, summing every offset on the way.
 ///
-/// The result is the set of element offsets one program instance touches, which
-/// is what the runtime turns into a register-slot count. The pass deliberately
-/// stops at the logical description: how many physical slots those offsets need
-/// depends on the bank/row/column interleaving, which lives in the runtime.
+/// The result is the set of element offsets one program instance touches. The pass
+/// stops at the logical description, and the runtimes read only its extents.
 static bool operandFootprint(Value ptr, scf::ForOp redFor,
                              SmallVectorImpl<FpAxis> &out) {
   Value iv = redFor ? redFor.getInductionVar() : Value();
@@ -792,7 +768,7 @@ static bool operandFootprint(Value ptr, scf::ForOp redFor,
     auto t = constTripCount(redFor);
     auto s = constIntOf(redFor.getStep());
     if (!t || !s)
-      return fpBail(ptr, "runtime-trip-count");
+      return false;
     ivTrip = *t;
     ivStep = *s;
   }
@@ -817,20 +793,23 @@ static bool operandFootprint(Value ptr, scf::ForOp redFor,
       cur = def->getOperand(0);
       continue;
     }
-    return fpBail(cur, "ptr-chain");
+    return false;
   }
   for (const auto &kv : acc) {
     const FpAxis &ax = kv.second;
     if (!ax.stride.ok)
-      return fpBail(kv.first, "stride-collision");
+      return false;
     if (ax.extent > 1 && (ax.stride.factor != 0 || !ax.stride.args.empty()))
       out.push_back(ax);
   }
   if ((int64_t)out.size() > kMaxFpAxes)
-    return fpBail(ptr, "too-many-axes");
+    return false;
   return true;
 }
 
+// Is `op` a scalar tt.load whose (scalar) result feeds a tt.splat?  This is the
+// matvec `x_val = tl.load(x + k)` operand, invisible to the tensor-pointer
+// walk because its pointer is a plain !tt.ptr, not a tensor of pointers.
 static bool isScalarSplatLoad(Operation *op) {
   auto load = dyn_cast<triton::LoadOp>(op);
   if (!load)
@@ -847,8 +826,7 @@ static bool isScalarSplatLoad(Operation *op) {
 // User-expressible schedule (roadmap step 4)
 // -----------------------------------------------------------------------
 /// The classification below is a DEFAULT. A schedule forces policy on top of it,
-/// from `im.schedule` on the module (keyed `arg<N>` by kernel operand index) or
-/// from `im.residency.force` on one access op, the op winning where both apply.
+/// from `im.schedule` on the module (keyed `arg<N>` by kernel operand index).
 /// Input lives in its own attribute so re-running the pass cannot mistake its own
 /// output for user intent.
 ///
@@ -1284,16 +1262,12 @@ struct IMOperandResidencyLayoutPass
     }
 
     // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
-    // carries iter_args (the accumulator).  Record the count and which
-    // functions contain one.
-    int64_t numReductionLoops = 0;
+    // carries iter_args (the accumulator).  Record which functions contain one.
     llvm::DenseSet<Operation *> funcsWithReduction;
     mod.walk([&](scf::ForOp forOp) {
-      if (forOp.getNumRegionIterArgs() > 0) {
-        ++numReductionLoops;
+      if (forOp.getNumRegionIterArgs() > 0)
         if (auto fn = forOp->getParentOfType<triton::FuncOp>())
           funcsWithReduction.insert(fn.getOperation());
-      }
     });
 
     llvm::MapVector<int64_t, int64_t> optResidency;
@@ -1317,7 +1291,7 @@ struct IMOperandResidencyLayoutPass
     }
 
     // Pass B, classify each memory-access op and stamp im.residency.
-    int64_t numAnalyzed = 0, numClassified = 0, numForced = 0;
+    int64_t numForced = 0;
     bool scheduleError = false;
     const bool optipimConv = mod->hasAttr("im.optipim_conv");
     // arg -> replicated lane dims, -1 for a scalar splat (every lane dim).
@@ -1332,7 +1306,6 @@ struct IMOperandResidencyLayoutPass
       bool scalarSplat = !isTensorPtr && isScalarSplatLoad(op);
       if (!isTensorPtr && !scalarSplat)
         return;
-      ++numAnalyzed;
 
       // Innermost enclosing reduction loop (for the induction-var test).
       scf::ForOp redFor;
@@ -1403,33 +1376,6 @@ struct IMOperandResidencyLayoutPass
             b.getNamedAttr("cell_fanout", b.getI64IntegerAttr(cellFanout)));
       fields.push_back(
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
-      // The residency stamp on each access, like every fact here. The runtime reads the
-      // global instead.
-      if (auto it = optResidency.find(operandArg); it != optResidency.end())
-        fields.push_back(
-            b.getNamedAttr("opt_residency", b.getI32IntegerAttr((int32_t)it->second)));
-      if (!optHold.empty() && operandArg == optHold[0])
-        fields.push_back(b.getNamedAttr(
-            "opt_hold", b.getDenseI32ArrayAttr(ArrayRef<int32_t>(optHold).drop_front())));
-      // Is the contraction axis TILED INTO the access shape? A rank-1 load inside
-      // the reduction loop takes ONE value out of each DQ word, so the operand bus
-      // memo cannot fire (matmul measured 0 skips of 1,048,576); tiling the
-      // reduction into the load makes word-mates consecutive and the memo collapses
-      // them 7/8, worth 8.0x on matmul.
-      //
-      // SUFFICIENT, NOT NECESSARY, and the name says tiled for that reason. Packing
-      // can also be earned by address contiguity without any tiling: conv's scalar
-      // weight load walks s with unit stride and its memo fires at exactly 7/8
-      // (64512/73728 measured 2026-09-09) while this flag reads false on all three
-      // of its tensors. So false here does NOT mean the lever is off. Never use this
-      // as the gate for the lever or as evidence that packing is absent; the runtime
-      // skip counter is the ground truth.
-      bool reductionTiled = false;
-      if (redFor && ivDep && op->getNumResults() > 0)
-        if (auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
-          reductionTiled = rt.getRank() >= 2;
-      fields.push_back(
-          b.getNamedAttr("reduction_tiled", b.getBoolAttr(reductionTiled)));
       // Address footprint of one program instance, flattened five words per
       // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
       // stride the pass cannot fold to a number is left as a product of kernel
@@ -1460,7 +1406,6 @@ struct IMOperandResidencyLayoutPass
       }
 
       // Step 4: the classification above was the default, this is the decision.
-      // Per-arg first so the per-op force wins where both name a field.
       bool forced = false;
       if (operandArg >= 0) {
         auto it = argSchedule.find(operandArg);
@@ -1469,15 +1414,6 @@ struct IMOperandResidencyLayoutPass
           argScheduleUsed.insert(operandArg);
           forced = true;
         }
-      }
-      if (auto perOp = dyn_cast_or_null<DictionaryAttr>(
-              op->getDiscardableAttr("im.residency.force"))) {
-        if (failed(checkSchedule(perOp, op->getLoc(), "im.residency.force"))) {
-          scheduleError = true;
-          return;
-        }
-        applySchedule(b, perOp, fields);
-        forced = true;
       }
       if (forced) {
         setField(b, fields, "user_forced", b.getUnitAttr());
@@ -1506,7 +1442,6 @@ struct IMOperandResidencyLayoutPass
       }
 
       op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
-      ++numClassified;
     });
 
     if (scheduleError)
@@ -1542,12 +1477,6 @@ struct IMOperandResidencyLayoutPass
     // Provenance. A reported number has to be able to say whether it came from
     // the classifier or from a forced schedule.
     mod->setAttr("im.residency-user-forced", b.getI64IntegerAttr(numForced));
-    mod->setAttr("im.residency-analyzed-mem-ops",
-                 b.getI64IntegerAttr(numAnalyzed));
-    mod->setAttr("im.residency-classified-mem-ops",
-                 b.getI64IntegerAttr(numClassified));
-    mod->setAttr("im.residency-reduction-loops",
-                 b.getI64IntegerAttr(numReductionLoops));
   }
 };
 

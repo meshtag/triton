@@ -55,8 +55,7 @@ namespace {
 constexpr llvm::StringLiteral kBoundaryFn = "__pim_tile_boundary";
 constexpr llvm::StringLiteral kPersistentAttr = "im.persistent";
 constexpr llvm::StringLiteral kPrologueFirstAttr = "im.tile_prologue_first";
-/// Stamped on each loop we mark, so a reader of the IR (and the harness) can see
-/// that the boundary call is there and how many loops took one.
+/// Stamped on each loop we mark. IMOptiPimMac reads it to find the tile loop.
 constexpr llvm::StringLiteral kMarkedAttr = "im.tile-boundary";
 
 /// Declare `void __pim_tile_boundary()` once per module.

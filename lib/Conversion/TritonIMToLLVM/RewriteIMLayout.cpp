@@ -1,13 +1,12 @@
 /// RewriteIMLayout.cpp — Rewrite tensor layout for PIM bank-consecutive access.
 ///
-/// After ConvertTritonToTritonGPU, every tensor type carries a
-/// BlockedEncodingAttr with sizePerThread=[1] (GPU-coalesced, lane-
-/// innermost).  For In-Memory processing each PIM bank should own a
-/// *consecutive* chunk, so this pass rewrites the encoding to have
-/// sizePerThread = shape / (threadsPerWarp × warpsPerCTA) per
-/// dimension.  ConvertLayoutOps are inserted around load/store ops;
-/// the downstream tritongpu-remove-layout-conversions pass propagates
-/// the new encoding through the full IR.
+/// For im: targets ConvertTritonToTritonGPU already emits the IM encoding, where each
+/// PIM bank owns a consecutive chunk with sizePerThread = shape / (threadsPerWarp ×
+/// warpsPerCTA) per dimension, lanes on the innermost axis. This pass rebuilds that
+/// encoding with the banks on the axis the module states (im.bank_axis, im.bank_split,
+/// or one derived from a reduce or from im.derive_bank_axis). ConvertLayoutOps are
+/// inserted around load/store ops, and the downstream tritongpu-remove-layout-conversions
+/// pass propagates the new encoding through the full IR.
 ///
 /// This pass replaces tritongpu-coalesce in the IM pipeline.
 
@@ -39,13 +38,6 @@ namespace {
 
 namespace ttg = mlir::triton::gpu;
 
-/// Compute the IM-optimal BlockedEncodingAttr for the given tensor type.
-///
-/// For each dimension d:
-///   sizePerThread[d] = shape[d] / (threadsPerWarp[d] × warpsPerCTA[d])
-///
-/// This makes the "register" (per-thread) dimension contiguous so that
-/// each PIM bank accesses a consecutive slice of the tensor.
 /// Which tensor axis carries the banks.
 ///
 /// `order` decides it: the BlockedEncodingAttr::get overload below fills lanes along
@@ -116,6 +108,13 @@ static SmallVector<int64_t> projectSplit(ArrayRef<int64_t> split, int rank) {
   return (int)out.size() == rank ? out : SmallVector<int64_t>{};
 }
 
+/// Compute the IM-optimal BlockedEncodingAttr for the given tensor type.
+///
+/// For each dimension d:
+///   sizePerThread[d] = shape[d] / (threadsPerWarp[d] × warpsPerCTA[d])
+///
+/// This makes the "register" (per-thread) dimension contiguous so that
+/// each PIM bank accesses a consecutive slice of the tensor.
 static Attribute buildIMEncoding(RankedTensorType tensorType,
                                  int threadsPerWarp, int numWarps,
                                  int bankAxis, int64_t bankExtent = 0,
@@ -221,8 +220,6 @@ struct RewriteIMLayoutPass
         ttg::TritonGPUDialect::getThreadsPerWarp(mod); // = num_banks
     int numWarps = ttg::lookupNumWarps(mod.getOperation());
 
-    // Step 4 lever: which axis carries the banks. Absent = keep the upstream
-    // choice, so this is a no-op unless a schedule asks for it.
     // Per-axis lane counts. Product must be the bank count: every bank still gets
     // exactly one lane, the split only says which axes they spread over.
     SmallVector<int64_t> bankSplit;
@@ -249,6 +246,8 @@ struct RewriteIMLayoutPass
       }
     }
 
+    // Which axis carries the banks, stated by the im_bank_axis compile option. Absent
+    // keeps the upstream choice.
     int bankAxis = -1;
     bool userPinnedBankAxis = false;
     if (auto a = mod->getAttrOfType<IntegerAttr>("im.bank_axis")) {
@@ -326,14 +325,10 @@ struct RewriteIMLayoutPass
             << (1 - reduceAxis) << ", or drop im.bank_axis and let the pass derive it.";
         return signalPassFailure();
       }
-    } else if (reduceAmbiguous) {
-      // Two reduces disagree. Deriving would be a guess, so leave the upstream
-      // choice and record that we declined.
-      mod->setAttr("im.bank-axis-ambiguous-reduce", UnitAttr::get(mod.getContext()));
-    } else if (reduceAxis >= 0 && reduceRank == 2) {
-      bankAxis = 1 - reduceAxis; // banks on the non-reduced axis, only meaningful at rank 2
-      mod->setAttr("im.bank-axis-from-reduce",
-                   IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
+    } else if (!reduceAmbiguous && reduceAxis >= 0 && reduceRank == 2) {
+      // Two reduces that disagree would make deriving a guess, so they keep the
+      // upstream choice. Otherwise banks go on the non-reduced axis (rank 2 only).
+      bankAxis = 1 - reduceAxis;
     }
 
     // Nothing stated and no rank-2 reduce decided: banks on the output's outermost axis
@@ -365,13 +360,8 @@ struct RewriteIMLayoutPass
             break;
           }
       });
-      if (any && all && !hitsReduce) {
+      if (any && all && !hitsReduce)
         bankAxis = 0;
-        mod->setAttr("im.bank-axis-from-shape",
-                     IntegerAttr::get(IntegerType::get(mod.getContext(), 64), bankAxis));
-      } else if (any) {
-        mod->setAttr("im.bank-axis-derive-declined", UnitAttr::get(mod.getContext()));
-      }
     }
 
     // The choice is stated on the OUTPUT's rank, so every other tensor's placement is
@@ -399,10 +389,6 @@ struct RewriteIMLayoutPass
           << "bank count, or choose the other axis.";
       return signalPassFailure();
     }
-
-    mod->setAttr("im.bank-axis-requested",
-                 IntegerAttr::get(IntegerType::get(mod.getContext(), 64),
-                                  bankAxis));
 
     // A bank-axis flip is a WHOLE-KERNEL substitution, not a per-op rewrite.
     // Rewriting only the memory-op pointers leaves the loop-carried accumulator
