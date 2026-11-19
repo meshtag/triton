@@ -1034,13 +1034,12 @@ int64_t getConvertCost(Value convertSrc) {
 /// eliminate \p convertOp and require creating new convert ops with cost \p
 /// newCvtCost.
 ///
-/// IM target carve-out: PIM hardware has no shared memory and shuffles
-/// reduce to identity (single lane per warp), so cross-lane convert_layout
-/// ops cannot be lowered. The standard cost model trades convert vs.
-/// rematerialisation by SM-cycle estimate, which can decline remat for
-/// wider tiles (e.g. matmul BLOCK_M=32) and leave a cross-lane convert
-/// that ConvertTritonIMToLLVM then crashes on. For the IM target we must
-/// always rematerialise — correctness over cost.
+/// IM target carve-out: a lane is a PIM bank, and no bank can read another's
+/// data, so the IM lowering refuses a convert_layout that moves values between
+/// lanes. The standard cost model trades convert vs. rematerialisation by
+/// SM-cycle estimate, which can decline remat for wider tiles (e.g. matmul
+/// BLOCK_M=32) and leave such a convert. For the IM target we always
+/// rematerialise, since correctness comes before cost.
 bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
                        int64_t newCvtCost) {
   if (auto module = convertOp->getParentOfType<ModuleOp>()) {

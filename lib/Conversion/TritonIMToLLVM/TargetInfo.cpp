@@ -1,4 +1,5 @@
 #include "TargetInfo.h"
+#include "IMArtifact.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -24,18 +25,12 @@ Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
 }
 
 // ---------------------------------------------------------------------------
-// Warp-level primitives  (no warp hardware on IM targets)
+// Barriers  (the lanes run in lockstep and share no memory, so none is needed)
 // ---------------------------------------------------------------------------
-
-Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
-                         Value cmp) const {
-  // Single-lane "ballot" – return cmp zero-extended to the requested type.
-  return LLVM::ZExtOp::create(rewriter, loc, type, cmp);
-}
 
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace /*targets*/) const {
-  // No-op: single-threaded execution needs no barriers.
+  // No-op.
 }
 
 void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
@@ -63,12 +58,19 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 }
 
 // ---------------------------------------------------------------------------
-// Shuffle primitives  (not available on IM targets)
+// Cross-lane primitives
 // ---------------------------------------------------------------------------
+
+// Lanes are banks, and no lane can read another's registers. These return their input, and
+// refuseCrossBank rejects every op that would need a real exchange.
+
+Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
+                         Value cmp) const {
+  return LLVM::ZExtOp::create(rewriter, loc, type, cmp);
+}
 
 Value TargetInfo::shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                              int /*i*/) const {
-  // Single lane – shuffle is identity.
   return val;
 }
 
@@ -89,7 +91,6 @@ Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
 
 Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
                           Value /*b*/, Value /*selector*/) const {
-  // Single lane – permute is identity on a.
   return a;
 }
 
@@ -116,17 +117,9 @@ Value TargetInfo::programId(RewriterBase &rewriter, Location loc,
     break;
   }
 
-  auto *ctx = rewriter.getContext();
-  Type i32 = IntegerType::get(ctx, 32);
-
-  auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(fnName);
-  if (!funcOp) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(moduleOp.getBody());
-    auto fnType = LLVM::LLVMFunctionType::get(i32, {});
-    funcOp = LLVM::LLVMFuncOp::create(rewriter, loc, fnName, fnType);
-  }
-
+  Type i32 = IntegerType::get(rewriter.getContext(), 32);
+  auto funcOp = getOrDeclareRuntimeFn(rewriter, moduleOp, loc, fnName,
+                                      LLVM::LLVMFunctionType::get(i32, {}));
   return LLVM::CallOp::create(rewriter, loc, funcOp, ValueRange{}).getResult();
 }
 
@@ -163,15 +156,10 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
   Type i32 = IntegerType::get(ctx, 32);
   Type ptr = LLVM::LLVMPointerType::get(ctx);
 
-  // Build declaration of printf if it does not exist.
   auto moduleOp = formatStrStart.getParentRegion()->getParentOfType<ModuleOp>();
-  auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("printf");
-  if (!funcOp) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(moduleOp.getBody());
-    auto fnType = LLVM::LLVMFunctionType::get(i32, {ptr}, /*isVarArg=*/true);
-    funcOp = LLVM::LLVMFuncOp::create(rewriter, loc, "printf", fnType);
-  }
+  auto funcOp = getOrDeclareRuntimeFn(
+      rewriter, moduleOp, loc, "printf",
+      LLVM::LLVMFunctionType::get(i32, {ptr}, /*isVarArg=*/true));
 
   SmallVector<Value> operands;
   operands.push_back(formatStrStart);
@@ -196,16 +184,9 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
                             int line) const {
   auto moduleOp =
       rewriter.getInsertionBlock()->getParentOp()->getParentOfType<ModuleOp>();
-  auto *ctx = rewriter.getContext();
-  Type voidTy = LLVM::LLVMVoidType::get(ctx);
-
-  auto abortFn = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("abort");
-  if (!abortFn) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(moduleOp.getBody());
-    auto fnType = LLVM::LLVMFunctionType::get(voidTy, {});
-    abortFn = LLVM::LLVMFuncOp::create(rewriter, loc, "abort", fnType);
-  }
+  Type voidTy = LLVM::LLVMVoidType::get(rewriter.getContext());
+  auto abortFn = getOrDeclareRuntimeFn(rewriter, moduleOp, loc, "abort",
+                                       LLVM::LLVMFunctionType::get(voidTy, {}));
   LLVM::CallOp::create(rewriter, loc, abortFn, ValueRange{});
 }
 

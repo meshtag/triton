@@ -1,38 +1,41 @@
-/// IMOperandResidencyLayout.cpp. Decide per-operand physical layout and residency
-/// for the in-memory (IM) backend.
+/// IMOperandResidencyLayout.cpp. The residency analysis: where the value of every memory
+/// access lives across the banks. The lowering writes the stamps into the kernel's layout
+/// table (IMArtifact.cpp), and every runtime places a tensor by its record.
 ///
-/// Target scope: this pass is substrate-agnostic. Its classification is a pure IR
-/// analysis of the kernel's SSA and loop structure with no architecture branch, so
-/// it runs for every IM target, both near-memory PIM (HBM-PIM) and
-/// processing-using-memory PUM (SIMDRAM). Both runtimes read the layout table
-/// emitPimLayoutTable builds from its stamps.
+/// The pass is the same for every IM target. It stamps each tensor-of-pointer load or store,
+/// and each scalar load splatted across the lanes, with an `im.residency` dictionary:
+///   operand_arg      the kernel pointer argument the address derives from, -1 when none
+///   bank_replicated  how many banks receive a copy: 0 when the value is partitioned across
+///                    the lanes, n > 1 when it is replicated over n banks, and 1, which reads
+///                    as every bank, for a scalar splat or a store with no lane axis. Absent
+///                    when the pass cannot tell. im.schedule can force it.
+///   cell_fanout      how many output cells in one lane consume one loaded value, when more
+///                    than one
+///   live_split       on a store, how much wider the live accumulator is than the stored
+///                    value, when more than one
+///   footprint        the element offsets one program instance touches, as (extent, stride)
+///                    axes over the ranges and the induction variable of a reduction loop
+///                    with a constant trip count. Absent when the address is not affine in
+///                    them. The runtimes read only the extents.
+///   reuse_class      how the address depends on the program ids and on the reduction loop
+///                    (reuseClass). Only the layout table's merge reads it, to keep a record
+///                    with a real class over the StreamedElementwise catch-all.
 ///
-/// Phase 1 (classification): for each tensor-of-pointer load or store, and each
-/// scalar load that feeds a broadcast (the matvec `x[k]` operand), classify the
-/// operand's reuse axes and stamp an `im.residency` dictionary attribute.
+/// bank_replicated follows the dims a value occupies from the access to every store it
+/// reaches, and the value is partitioned only when it occupies every lane dim of each store.
+/// A loaded value starts from all the dims its shape spans, so a load broadcast over a dim,
+/// as its mask can force, counts as occupying that dim. The paper states the address rule,
+/// under which a value whose address stays the same along a lane dim is replicated, and the
+/// OptiPIM lane mask follows it by starting from the dims the address varies along.
 ///
-///   reuse_class is decided from two reachability facts about the address:
-///     pidMask: does the address depend on tt.get_program_id (output tile)?
-///     ivDep:   does the address depend on the reduction loop induction var?
-///   In a function containing a reduction (accumulator-carrying scf.for):
-///     ivDep & pid   -> ReductionStridedMatrix  (reduction axis -> columns)
-///     ivDep & !pid  -> BroadcastReplicate      (invariant in output tile)
-///     !ivDep & pid  -> ParallelSpread          (output, spread over banks)
-///     otherwise     -> StreamedElementwise
-///   With no reduction loop (pure elementwise, e.g. axpy) every op is
-///   StreamedElementwise.
-///
-/// Phase 2 (footprint): the element offsets one program instance touches, as
-/// (extent, stride) axes over the tl.arange axes and the reduction induction
-/// variable. It stays logical, and a stride the pass cannot fold (conv's CI*R*S
-/// weight pitch) travels as a product of kernel argument indices. Only a constant
-/// trip count gives a footprint, so an untiled reduction gets none. The runtimes
-/// read only the extents.
+/// Under im.optipim_conv, im.optipim_roles and im.optipim_hold_input the pass also stamps
+/// OptiPIM's conventions on the module as im.opt_<x>, which the lowering states as
+/// @__pim_opt_<x>.
 
+#include "IMContraction.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -43,7 +46,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
-#include <array>
 #include <utility>
 
 // -----------------------------------------------------------------------
@@ -60,8 +62,11 @@ namespace im {
 } // namespace mlir
 
 using namespace mlir;
+using namespace mlir::triton::im::contraction;
 
 namespace ttg_ = mlir::triton::gpu;
+
+namespace {
 
 /// Mask of the dims of a STORE tile that carry lanes, several under im.bank_split. Only
 /// store encodings are trusted: remove-layout-conversions has not run yet, so a load's
@@ -97,13 +102,8 @@ static std::optional<SmallVector<std::pair<int32_t, int32_t>>> laneAxes(Type ty)
   return out;
 }
 
-/// How many banks receive a copy of one value: the product of the lane extents over the
-/// lane axes the value does NOT occupy. 1 means bank-partitioned. This is the MAGNITUDE
-/// that the replicated/partitioned verdict below was missing: with a single-axis split the
-/// two agree (miss the one lane axis and every bank gets a copy), but a multi-axis split
-/// like 2 on M and 16 on N has a value occupying N replicated over only the 2 M lanes, and
-/// calling that "replicated" charged it to all 32. Measured on OptiPIM's own mapping for
-/// matmul 128x128x64: B cost 16,384 operand writes where 1,024 is the delivery it needs.
+/// How many banks receive a copy of one value: the product of the lane extents over the store
+/// tile's lane dims the value does not occupy, 1 when it occupies them all.
 static int64_t laneReplicationFactor(Type ty, uint32_t occ) {
   auto tt = dyn_cast<RankedTensorType>(ty);
   if (!tt)
@@ -159,46 +159,47 @@ static uint32_t addressDims(Value v, llvm::DenseMap<Value, uint32_t> &memo,
   return occ;
 }
 
-/// >1 replicated over that many banks, 0 bank-partitioned, -1 undetermined.
-/// A load's own type is never read (see laneAxisMask). Track the dims the loaded value
-/// OCCUPIES through the dataflow to the store and ask whether the store's lane dim is
-/// one of them: expand_dims inserts a dim it does not occupy, reduce deletes one.
-/// TRAP this replaces: reading a rank-2 load directly because it matched the store's
-/// rank flipped kpacked matmul's A to partitioned, 65,537 -> 246 cycles on HBM.
-/// `cellFanout` (out) is how many output cells IN ONE LANE consume a single loaded
-/// value: the product of the output tile's extents over the dims that are neither the
-/// lane axis nor occupied by the value. SIMDRAM computes across the columns of a row,
-/// so an operand feeding F cells must be written into F columns; charging it once per
-/// bank was a 64x discount on matmul (review 2026-09-12). The largest fanout over the
-/// stores a value reaches wins, for the same reason replicated wins below.
-/// `repLanes` (out) is the store dims with lanes that the value does not occupy, ORed over
-/// the stores it reaches. `occMask` narrows what the loaded value occupies at the start.
-static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
-                             uint32_t *repLanes = nullptr, uint32_t occMask = ~0u) {
-  if (cellFanout)
-    *cellFanout = 1;
-  if (repLanes)
-    *repLanes = 0u;
-  if (auto st = dyn_cast<triton::StoreOp>(memOp))
-    return laneAxisMask(st.getValue().getType()) != 0u ? 0 : 1;
+/// Where a value lives across the banks, from the dims it occupies on its way to the stores
+/// it reaches. A load's own type is never read for lanes (see laneAxisMask).
+struct Placement {
+  /// The bank_replicated stamp: n > 1 when replicated over n banks, 0 when partitioned, 1 for
+  /// a store with no lane axis, which every bank holds, and -1 when undetermined.
+  int banks = -1;
+  /// How many output cells in one lane consume one loaded value, the most over the stores it
+  /// reaches. SIMDRAM computes across the columns of a row, so an operand that feeds F cells
+  /// is written into F columns.
+  int64_t cellFanout = 1;
+  /// The store tile's lane dims the value does not occupy, ORed over the stores it reaches.
+  uint32_t replicatedLanes = 0u;
+};
+
+/// The placement of `memOp`'s value. A loaded value starts out occupying the dims its shape
+/// spans with an extent above 1, within `startMask`, and its occupancy follows it through the
+/// dataflow: expand_dims inserts a dim it does not occupy, and a reduce deletes one. Every
+/// store it reaches gives a verdict, and replicated wins, since an operand charge never
+/// under-bills. A walk that meets an op it cannot follow stops with banks -1 and what it
+/// found so far.
+static Placement placementOf(Operation *memOp, uint32_t startMask) {
+  Placement p;
+  if (auto st = dyn_cast<triton::StoreOp>(memOp)) {
+    p.banks = laneAxisMask(st.getValue().getType()) != 0u ? 0 : 1;
+    return p;
+  }
   if (memOp->getNumResults() != 1)
-    return -1;
+    return p;
   Value v0 = memOp->getResult(0);
   auto tt0 = dyn_cast<RankedTensorType>(v0.getType());
-  // Only dims of extent > 1 are occupied: a [BM,1] load is the same value in every
-  // lane along the size-1 dim, so counting it stamped a bias vector partitioned.
+  // A [BM,1] load is the same value in every lane along its size-1 dim, so it does not
+  // occupy that dim.
   uint32_t occ0 = 0u;
   if (tt0)
     for (int d = 0; d < tt0.getRank(); ++d)
       if (tt0.getShape()[d] > 1)
         occ0 |= 1u << d;
-  occ0 &= occMask;
+  occ0 &= startMask;
   SmallVector<std::pair<Value, uint32_t>, 16> work{{v0, occ0}};
   llvm::DenseSet<Value> seen;
   int hops = 0;
-  // Every store the value reaches gets a verdict; replicated wins because OPERAND is
-  // the charge that never under-bills. First-store-wins stamped a tensor with a
-  // partitioned copy-out and a replicated outer-product use as partitioned.
   bool anyRep = false, anyPart = false;
   int64_t repFactor = 1;
   while (!work.empty() && hops++ < 4096) {
@@ -211,32 +212,27 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
           continue; // reached through the pointer or mask, not the stored value
         uint32_t laneM = laneAxisMask(st.getValue().getType());
         if (laneM == 0u)
-          return -1;
-        if (repLanes)
-          if (auto axes = laneAxes(st.getValue().getType()))
-            for (auto [d, n] : *axes)
-              if (!((occ >> d) & 1u))
-                *repLanes |= 1u << d;
-        // Partitioned only if the value occupies EVERY lane axis. Miss one and it is
-        // replicated along it, so every bank on that axis is delivered the value.
+          return p;
+        if (auto axes = laneAxes(st.getValue().getType()))
+          for (auto [d, n] : *axes)
+            if (!((occ >> d) & 1u))
+              p.replicatedLanes |= 1u << d;
+        // Partitioned only if the value occupies every lane dim. Miss one and every bank
+        // along it is delivered the value.
         if ((occ & laneM) == laneM) {
           anyPart = true;
         } else {
           anyRep = true;
-          // The largest over the stores a value reaches, matching "replicated wins".
-          int64_t f = laneReplicationFactor(st.getValue().getType(), occ);
-          if (f > repFactor)
-            repFactor = f;
+          repFactor =
+              std::max(repFactor, laneReplicationFactor(st.getValue().getType(), occ));
         }
-        if (cellFanout) {
-          auto stt = cast<RankedTensorType>(st.getValue().getType());
-          int64_t f = 1;
-          for (int d = 0; d < stt.getRank(); ++d)
-            if (!((laneM >> d) & 1u) && !((occ >> d) & 1u))
-              f *= stt.getShape()[d];
-          if (f > *cellFanout)
-            *cellFanout = f;
-        }
+        // The store tile's extents over the dims that are neither a lane dim nor occupied.
+        auto stt = cast<RankedTensorType>(st.getValue().getType());
+        int64_t f = 1;
+        for (int d = 0; d < stt.getRank(); ++d)
+          if (!((laneM >> d) & 1u) && !((occ >> d) & 1u))
+            f *= stt.getShape()[d];
+        p.cellFanout = std::max(p.cellFanout, f);
         continue;
       }
       if (auto tr = dyn_cast<triton::TransOp>(u)) {
@@ -249,12 +245,11 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
         work.push_back({tr.getResult(), nocc});
         continue;
       }
-      // Ops that move values between dims in ways not tracked here: say so rather
-      // than pass occ through unchanged, which stamped tt.trans wrong.
+      // Ops that move values between dims in ways not tracked here.
       if (isa<triton::ReshapeOp, triton::JoinOp, triton::SplitOp, triton::CatOp>(u))
-        return -1;
+        return p;
       if (isa<triton::DotOp>(u))
-        return -1; // operand roles inside a dot are not tracked here
+        return p; // operand roles inside a dot are not tracked here
       if (auto ed = dyn_cast<triton::ExpandDimsOp>(u)) {
         unsigned a = ed.getAxis();
         uint32_t lo = occ & ((1u << a) - 1), hi = occ >> a;
@@ -268,9 +263,8 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
           work.push_back({r, lo | (hi << a)});
         continue;
       }
-      // The accumulator is loop-carried: its last in-loop user is the yield, and
-      // the store sits outside on the for's RESULT. Cross both edges or every load
-      // that feeds an accumulator comes back undetermined.
+      // The accumulator is loop-carried: its last in-loop user is the yield, and the store
+      // sits outside on the for's result. Both edges are crossed.
       if (auto y = dyn_cast<scf::YieldOp>(u)) {
         auto forOp = dyn_cast<scf::ForOp>(y->getParentOp());
         if (!forOp)
@@ -292,26 +286,25 @@ static int bankReplicatedTri(Operation *memOp, int64_t *cellFanout,
         continue;
       }
       if (u->getNumResults() == 1) {
-        // Elementwise or layout-only: occupancy passes through. Anything else is
-        // unknown and stays -1 rather than guessed.
+        // Elementwise or layout-only: occupancy passes through. Anything else is unknown
+        // and stays undetermined rather than guessed.
         StringRef dialect = u->getName().getDialectNamespace();
         if (dialect == "arith" || dialect == "math" ||
             isa<triton::gpu::ConvertLayoutOp, triton::BroadcastOp, triton::SplatOp,
                 triton::BitcastOp, triton::FpToFpOp>(u))
           work.push_back({u->getResult(0), occ});
         else
-          return -1;
+          return p;
       }
     }
   }
   if (anyRep)
-    return (int)repFactor;   // banks that receive a copy, >= 2 here
-  if (anyPart)
-    return 0;
-  return -1;
+    p.banks = (int)repFactor; // banks that receive a copy, >= 2 here
+  else if (anyPart)
+    p.banks = 0;
+  return p;
 }
 
-namespace {
 // Footprint descriptor limits. The layout table record is fixed width, so
 // these must match PIM_MAX_FP_AXES / PIM_MAX_STRIDE_ARGS in pim_layout_table.h.
 static constexpr int64_t kMaxFpAxes = 3;
@@ -351,92 +344,9 @@ static bool reachesValue(Value v, Value target, llvm::DenseSet<Value> &visited) 
   return false;
 }
 
-// Follow the addptr/splat/broadcast chain of an address back to the kernel
-// !tt.ptr argument it bottoms out at. Return its func-argument index, or -1.
-// This is the join key the runtime emitter maps to a registered tensor id.
-static int64_t resolveOperandArg(Value ptr) {
-  Value cur = ptr;
-  llvm::DenseSet<Value> guard;
-  while (cur && guard.insert(cur).second) {
-    if (auto barg = dyn_cast<BlockArgument>(cur)) {
-      Operation *parent = barg.getOwner()->getParentOp();
-      if (isa<triton::FuncOp>(parent))
-        return barg.getArgNumber();
-      return -1; // a loop/region block arg, not a kernel pointer argument
-    }
-    Operation *def = cur.getDefiningOp();
-    if (!def)
-      return -1;
-    if (auto addptr = dyn_cast<triton::AddPtrOp>(def)) {
-      cur = addptr.getPtr();
-      continue;
-    }
-    if (auto splat = dyn_cast<triton::SplatOp>(def)) {
-      cur = splat.getSrc();
-      continue;
-    }
-    if (auto bcast = dyn_cast<triton::BroadcastOp>(def)) {
-      cur = bcast.getSrc();
-      continue;
-    }
-    // A layout conversion is pure relabelling, the pointer is the same tensor.
-    // Without this a 2-D operand tile resolves to -1 and drops out of the
-    // descriptor entirely: the k-packed matmul puts two ttg.convert_layout in the
-    // A chain, so the compiler classified the load correctly and then could not
-    // say which argument it belonged to.
-    if (auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(def)) {
-      cur = cvt.getSrc();
-      continue;
-    }
-    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def)) {
-      cur = expand.getSrc();
-      continue;
-    }
-    return -1; // unknown producer of a pointer value
-  }
-  return -1;
-}
-
-/// Constant integer behind a Value, or nullopt.
-static std::optional<int64_t> constIntOf(Value v) {
-  if (!v)
-    return std::nullopt;
-  if (auto c = v.getDefiningOp<arith::ConstantOp>())
-    if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
-      return ia.getInt();
-  return std::nullopt;
-}
-
-/// Trip count of `f`, if all three bounds are compile-time constants.
-static std::optional<int64_t> constTripCount(scf::ForOp f) {
-  if (!f)
-    return std::nullopt;
-  auto lb = constIntOf(f.getLowerBound());
-  auto ub = constIntOf(f.getUpperBound());
-  auto st = constIntOf(f.getStep());
-  if (!lb || !ub || !st || *st <= 0 || *ub <= *lb)
-    return std::nullopt;
-  return (*ub - *lb + *st - 1) / *st;
-}
-
-/// Compile-time value of a scalar (or uniformly splatted) integer, or nullopt.
+/// Compile-time value of a scalar or splatted integer, seen through integer casts.
 static std::optional<int64_t> uniformIntOf(Value v) {
-  if (!v)
-    return std::nullopt;
-  if (auto c = v.getDefiningOp<arith::ConstantOp>()) {
-    if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
-      return ia.getInt();
-    if (auto de = dyn_cast<DenseElementsAttr>(c.getValue()))
-      if (de.isSplat())
-        return de.getSplatValue<APInt>().getSExtValue();
-  }
-  if (auto sp = v.getDefiningOp<triton::SplatOp>())
-    return uniformIntOf(sp.getSrc());
-  if (auto ext = v.getDefiningOp<arith::ExtSIOp>())
-    return uniformIntOf(ext.getIn());
-  if (auto trunc = v.getDefiningOp<arith::TruncIOp>())
-    return uniformIntOf(trunc.getIn());
-  return std::nullopt;
+  return constIntThrough<triton::SplatOp, arith::ExtSIOp, arith::TruncIOp>(v);
 }
 
 /// A stride the pass could not fold to a number: `factor` times the product of
@@ -546,8 +456,7 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
     note(v, n, 1);
     return true;
   }
-  // ttg.convert_layout only moves values between layouts, so it is a
-  // pass-through here. Missing it hid every 2D accumulator address.
+  // ttg.convert_layout only moves values between layouts, so it is a pass-through here.
   if (isa<triton::BroadcastOp, triton::ExpandDimsOp,
           triton::gpu::ConvertLayoutOp>(def))
     return collectAxes(def->getOperand(0), iv, ivTrip, ivStep, scale, acc,
@@ -573,27 +482,12 @@ static bool collectAxes(Value v, Value iv, int64_t ivTrip, int64_t ivStep,
   return false;
 }
 
-/// How many times wider the LIVE accumulator is than the value that reaches the
-/// store, i.e. the factor a rank-collapsing reduce hid from the store's footprint.
-///
-/// WHY A MULTIPLIER AND NOT THE ACCUMULATOR'S OWN SIZE. The occupancy denominator
-/// keeps coming from the store footprint; this only scales it. That makes the change
-/// the IDENTITY on every kernel without such a reduce, by arithmetic rather than by
-/// inspection, which matters because the alternative had to get all 24 kernels right:
-/// kernels with no accumulator at all (axpy, matadd, the persistent three) would have
-/// fallen back to the 8192 default and lost a factor of 4096 in the divisor, and the
-/// CO-fused conv unrolls into BLOCK_CO separate accumulator-carrying loops, so an
-/// absolute rule that summed across them would rebuild BLOCK_CO*BLOCK_HW, which is
-/// the retracted 20.9-33.9x. Here that factor is 1 and the question never arises.
-///
-/// TRAPS, all of them load-bearing:
-///  - redFor is USELESS for this. It walks parents upward, and every reduction kernel
-///    here stores AFTER the loop, so a store's redFor is null. Chase the stored VALUE.
-///  - Walk ALL operands, not operand 0. Epilogues are normal: the K-tiled matmul
-///    stores c_old + acc and attention stores min(max(acc + bias, 0), MAX_VAL).
-///  - Skip pointer-typed iter_args. matmul_loopcarried carries b_ptrs at 16x32, which
-///    TIES acc on cell count, so picking by size alone is ambiguous on a real kernel.
-///  - MAX across loops reached, never sum. Summing is how BLOCK_CO comes back.
+/// The widest loop-carried tile the stored value comes from, divided by the stored tile,
+/// which is the factor a rank-collapsing reduce hid from the store's footprint. It only
+/// scales the occupancy the footprint gives, so a kernel with no such reduce gets 1.
+/// Chase the stored value through every operand, since a reduction kernel stores after its
+/// loop and an epilogue can combine the accumulator with other values. Take the max over
+/// loops, never the sum, and skip pointer carries.
 static int64_t liveSplitFactor(triton::StoreOp st) {
   auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
   if (!storedTy)
@@ -659,23 +553,12 @@ static int64_t freshNestCells(scf::ForOp loop, PerLane &perLane) {
   return cells + inner;
 }
 
-/// Cells ONE LANE holds of the accumulator a store drains, 0 when nothing accumulates.
-/// This is what the register file keeps live across a reduction, so it is what a GRF
-/// bound compares against.
-///
-/// TWO shapes reach it. A loop-carried accumulator (scf.for iter_arg) is the widest
-/// carried tile. A single-shot reduce -- tl.sum over a tile with no carry, which is what
-/// the persistent matvec, matmul and conv kernels emit, and what canonicalize leaves when
-/// a reduction loop has trip count 1 -- keeps the STORED tile live instead, so that is
-/// the figure. Taking only the carried form reported 0 for those kernels and the bound
-/// never fired on them.
-///
-/// An elementwise store (VA, RELU) neither carries nor reduces and reports 0: it streams
-/// through the ALU without occupying the accumulator file.
-///
-/// Every tensor one loop carries is live at once, so a loop's figure is the SUM of its
-/// carried tiles, and the widest loop wins. Taking the widest carried value admitted an
-/// interchanged GEMV holding four 128-cell accumulators as 128.
+/// Cells one lane holds of the accumulator a store drains, 0 when nothing accumulates. The
+/// register file keeps them live across a reduction, so a GRF bound compares against this.
+/// Every tile one loop carries is live at once, so a loop counts the sum of its carried
+/// tiles, and the widest loop wins. A reduce with no carry, such as tl.sum over a whole tile,
+/// keeps the stored tile live instead. An elementwise store neither carries nor reduces and
+/// reports 0.
 static int64_t accCellsPerLane(triton::StoreOp st) {
   auto storedTy = dyn_cast<RankedTensorType>(st.getValue().getType());
   if (!storedTy)
@@ -765,12 +648,11 @@ static bool operandFootprint(Value ptr, scf::ForOp redFor,
   Value iv = redFor ? redFor.getInductionVar() : Value();
   int64_t ivTrip = 0, ivStep = 1;
   if (redFor) {
-    auto t = constTripCount(redFor);
-    auto s = constIntOf(redFor.getStep());
-    if (!t || !s)
+    auto trip = constTripCount(redFor);
+    if (!trip || *trip == 0)
       return false;
-    ivTrip = *t;
-    ivStep = *s;
+    ivTrip = *trip;
+    ivStep = *getConstantIntValue(redFor.getStep());
   }
   FpAcc acc;
   Value cur = ptr;
@@ -820,6 +702,12 @@ static bool isScalarSplatLoad(Operation *op) {
     if (isa<triton::SplatOp>(user))
       return true;
   return false;
+}
+
+/// Whether `ptr` is a tensor of pointers, an access the pass stamps whatever its users.
+static bool isTensorOfPointers(Value ptr) {
+  auto tt = dyn_cast<RankedTensorType>(ptr.getType());
+  return tt && isa<triton::PointerType>(tt.getElementType());
 }
 
 // -----------------------------------------------------------------------
@@ -904,11 +792,154 @@ static void applySchedule(OpBuilder &b, DictionaryAttr d,
 
 } // namespace
 
-/// OptiPIM's lanes under im.optipim_conv, beside the layout record so it does not change:
-/// __pim_opt_lane_rep holds [arg, replicated lane dims] pairs and __pim_opt_lane_ext the
-/// store's lane id as [dim, lanes] pairs, fastest first. Dims number the store tile.
-static LogicalResult emitOptiPimLanes(ModuleOp mod,
-                                      const llvm::MapVector<int64_t, int64_t> &rep) {
+// -----------------------------------------------------------------------
+// Stamping one access
+// -----------------------------------------------------------------------
+
+/// im.schedule by kernel argument, checked before any access is classified, so a malformed
+/// schedule fails before the pass stamps anything.
+static FailureOr<llvm::MapVector<int64_t, DictionaryAttr>> readSchedule(ModuleOp mod) {
+  llvm::MapVector<int64_t, DictionaryAttr> out;
+  auto schedule = mod->getAttrOfType<DictionaryAttr>("im.schedule");
+  if (!schedule)
+    return out;
+  for (NamedAttribute e : schedule) {
+    StringRef k = e.getName().strref();
+    int64_t argIdx = 0;
+    if (!k.starts_with("arg") || k.drop_front(3).getAsInteger(10, argIdx))
+      return mod.emitError() << "im.schedule: key '" << k
+                             << "' must be arg<N> with N a kernel operand index";
+    auto d = dyn_cast<DictionaryAttr>(e.getValue());
+    if (!d)
+      return mod.emitError() << "im.schedule: '" << k
+                             << "' must map to a dictionary of schedule fields";
+    if (failed(checkSchedule(d, mod.getLoc(), "im.schedule." + k)))
+      return failure();
+    out[argIdx] = d;
+  }
+  return out;
+}
+
+/// The reuse class of an access. In a function with a reduction loop, an scf.for that
+/// carries a value, it follows from whether the address reaches a program id (`pidMask`) and
+/// the induction variable of the reduction loop around the access (`ivDep`):
+///   both       ReductionStridedMatrix
+///   iv only    BroadcastReplicate
+///   pid only   ParallelSpread
+///   neither    StreamedElementwise
+/// Every access of a function without one is StreamedElementwise, and a scalar splatted
+/// across the lanes is BroadcastReplicate anywhere.
+static StringRef reuseClass(bool scalarSplat, bool reductionFunc, bool ivDep,
+                            unsigned pidMask) {
+  if (scalarSplat)
+    return "BroadcastReplicate";
+  if (!reductionFunc)
+    return "StreamedElementwise";
+  if (ivDep && pidMask != 0)
+    return "ReductionStridedMatrix";
+  if (ivDep)
+    return "BroadcastReplicate";
+  if (pidMask != 0)
+    return "ParallelSpread";
+  return "StreamedElementwise";
+}
+
+/// What the pass reads off the module before it stamps an access.
+struct StampContext {
+  /// The functions that hold a reduction loop.
+  llvm::DenseSet<Operation *> reductionFuncs;
+  /// im.schedule by kernel argument.
+  llvm::MapVector<int64_t, DictionaryAttr> schedule;
+};
+
+/// The im.residency stamp of one access, null for an op that is none, and failure for a store
+/// the schedule forces replicated.
+static FailureOr<DictionaryAttr> stampResidency(Operation *op, const StampContext &cx,
+                                                OpBuilder &b) {
+  Value ptr = getMemAccessPtr(op);
+  if (!ptr)
+    return DictionaryAttr();
+  bool isTensorPtr = isTensorOfPointers(ptr);
+  bool scalarSplat = !isTensorPtr && isScalarSplatLoad(op);
+  if (!isTensorPtr && !scalarSplat)
+    return DictionaryAttr();
+
+  // The reduction loop around the access, the innermost scf.for that carries a value.
+  scf::ForOp redFor;
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+    if (auto f = dyn_cast<scf::ForOp>(p); f && f.getNumRegionIterArgs() > 0) {
+      redFor = f;
+      break;
+    }
+  llvm::DenseSet<Value> pidSeen, ivSeen;
+  unsigned pidMask = reachesProgramId(ptr, pidSeen);
+  bool ivDep = redFor && reachesValue(ptr, redFor.getInductionVar(), ivSeen);
+  int64_t operandArg = kernelArgOf(ptr, /*throughReshape=*/false);
+  auto fn = op->getParentOfType<triton::FuncOp>();
+  bool reductionFunc = fn && cx.reductionFuncs.contains(fn.getOperation());
+
+  // The verdict is read off the lane layout rather than asserted by the host, and a scalar
+  // splatted across the lanes is in every bank.
+  Placement place;
+  if (scalarSplat)
+    place.banks = 1;
+  else
+    place = placementOf(op, ~0u);
+
+  SmallVector<NamedAttribute> fields;
+  fields.push_back(b.getNamedAttr(
+      "reuse_class", b.getStringAttr(reuseClass(scalarSplat, reductionFunc, ivDep, pidMask))));
+  // Omitted when undetermined. The layout record then says -1, and the runtime keeps the
+  // host's role.
+  if (place.banks >= 0)
+    fields.push_back(b.getNamedAttr("bank_replicated", b.getI32IntegerAttr(place.banks)));
+  // Only a broadcast inside the tile counts, since the runtime counts sharing that reaches
+  // memory from the loads themselves. Only a partitioned tensor is charged by it.
+  if (place.cellFanout > 1)
+    fields.push_back(b.getNamedAttr("cell_fanout", b.getI64IntegerAttr(place.cellFanout)));
+  fields.push_back(b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
+  // Five words per axis, [extent, stride factor, arg, arg, arg] with -1 padding.
+  SmallVector<FpAxis> fp;
+  if (operandFootprint(ptr, redFor, fp) && !fp.empty()) {
+    SmallVector<int64_t> flat;
+    for (const FpAxis &ax : fp) {
+      flat.push_back(ax.extent);
+      flat.push_back(ax.stride.factor);
+      for (int64_t i = 0; i < kMaxStrideArgs; ++i)
+        flat.push_back(i < (int64_t)ax.stride.args.size() ? ax.stride.args[i] : -1);
+    }
+    fields.push_back(b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
+  }
+  if (auto st = dyn_cast<triton::StoreOp>(op))
+    if (int64_t ls = liveSplitFactor(st); ls > 1)
+      fields.push_back(b.getNamedAttr("live_split", b.getI64IntegerAttr(ls)));
+
+  // The schedule's fields replace the classifier's for the arguments it names.
+  auto forced = operandArg >= 0 ? cx.schedule.find(operandArg) : cx.schedule.end();
+  if (forced != cx.schedule.end()) {
+    applySchedule(b, forced->second, fields);
+    setField(b, fields, "user_forced", b.getUnitAttr());
+    // Lanes store distinct elements, so a stored tensor cannot have identical copies.
+    if (isa<triton::StoreOp>(op))
+      for (NamedAttribute f : fields)
+        if (f.getName() == "bank_replicated")
+          if (auto n = dyn_cast<IntegerAttr>(f.getValue()); n && n.getInt() != 0)
+            return op->emitError() << "a stored tensor cannot be forced bank_replicated: each "
+                                   << "lane stores its own elements";
+  }
+  return b.getDictionaryAttr(fields);
+}
+
+// -----------------------------------------------------------------------
+// OptiPIM's conventions
+// -----------------------------------------------------------------------
+
+/// OptiPIM's lanes under im.optipim_conv. im.opt_lane_rep holds [arg, replicated lane dims]
+/// pairs by the address rule of the file header, and im.opt_lane_ext the store's lane id as
+/// [dim, lanes] pairs, fastest first. Dims number the store tile. A scalar splat is
+/// replicated along every lane dim, and an access the pass could not place, or whose verdict
+/// the schedule forced, states none.
+static LogicalResult stampOptiPimLanes(ModuleOp mod) {
   std::optional<SmallVector<std::pair<int32_t, int32_t>>> ext;
   LogicalResult ok = success();
   mod.walk([&](triton::StoreOp st) {
@@ -923,42 +954,42 @@ static LogicalResult emitOptiPimLanes(ModuleOp mod,
   });
   if (failed(ok))
     return failure();
-  if (!mod.getContext()->getLoadedDialect<LLVM::LLVMDialect>())
-    return mod.emitError() << "im.optipim_conv emits LLVM globals here, load the LLVM "
-                              "dialect first";
+  auto lanes = ext.value_or(SmallVector<std::pair<int32_t, int32_t>>{});
   uint32_t all = 0u;
-  SmallVector<int32_t> extFlat;
-  for (auto [d, n] : ext.value_or(SmallVector<std::pair<int32_t, int32_t>>{})) {
+  SmallVector<int64_t> extFlat;
+  for (auto [d, n] : lanes) {
     all |= 1u << d;
     extFlat.append({d, n});
   }
-  SmallVector<int32_t> repFlat;
-  for (auto [arg, m] : rep)
-    repFlat.append({(int32_t)arg, (int32_t)(m < 0 ? all : (uint32_t)m)});
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  auto table = [&](StringRef name, ArrayRef<int32_t> v) {
-    if (v.empty())
+  // arg -> replicated lane dims, -1 for a scalar splat.
+  llvm::MapVector<int64_t, int64_t> rep;
+  mod.walk([&](Operation *op) {
+    auto stamp = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
+    if (!stamp || stamp.contains("user_forced") || !stamp.contains("bank_replicated"))
       return;
-    auto dataTy = RankedTensorType::get({(int64_t)v.size()}, i32);
-    LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, v.size()),
-                           /*isConstant=*/true, LLVM::Linkage::External, name,
-                           DenseElementsAttr::get(dataTy, v));
-  };
-  auto scalar = [&](StringRef name, int32_t v) {
-    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                           name, b.getI32IntegerAttr(v));
-  };
-  table("__pim_opt_lane_rep", repFlat);
-  scalar("__pim_opt_lane_rep_count", (int32_t)(repFlat.size() / 2));
-  table("__pim_opt_lane_ext", extFlat);
-  scalar("__pim_opt_lane_ext_count", (int32_t)(extFlat.size() / 2));
-  // __pim_opt_lane_on, the active lanes of each lane axis where their mapping leaves some idle,
-  // as [dim, active] pairs in __pim_opt_lane_ext's order. im.bank_active numbers im.bank_split's
-  // dims, the store tile's lane dims are those dims with the reduced one, never a lane axis,
-  // dropped, so the two pair up in dim order.
+    int64_t arg = stamp.getAs<IntegerAttr>("operand_arg").getInt();
+    if (arg < 0)
+      return;
+    Value ptr = getMemAccessPtr(op);
+    bool scalarSplat = !isTensorOfPointers(ptr);
+    uint32_t repLanes = 0u;
+    if (!scalarSplat && isa<triton::LoadOp>(op)) {
+      llvm::DenseMap<Value, uint32_t> memo;
+      repLanes = placementOf(op, addressDims(ptr, memo)).replicatedLanes;
+    }
+    int64_t &m = rep.insert({arg, 0}).first->second;
+    m = (scalarSplat || m < 0) ? -1 : (m | repLanes);
+  });
+  SmallVector<int64_t> repFlat;
+  for (auto [arg, m] : rep)
+    repFlat.append({arg, m < 0 ? (int64_t)all : m});
+  Builder b(mod.getContext());
+  mod->setAttr("im.opt_lane_rep", b.getDenseI64ArrayAttr(repFlat));
+  mod->setAttr("im.opt_lane_ext", b.getDenseI64ArrayAttr(extFlat));
+  // im.opt_lane_on, the active lanes of each lane axis where their mapping leaves some idle,
+  // as [dim, active] pairs in im.opt_lane_ext's order. im.bank_active numbers im.bank_split's
+  // dims, and the store tile's lane dims are those dims less the reduced one, never a lane
+  // axis, so the two pair up in dim order.
   auto activeAttr = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_active");
   auto splitAttr = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_split");
   if (!activeAttr)
@@ -971,7 +1002,6 @@ static LogicalResult emitOptiPimLanes(ModuleOp mod,
   for (int64_t d = 0; d < (int64_t)split.size(); ++d)
     if (split[d] > 1)
       splitDims.push_back(d);
-  auto lanes = ext.value_or(SmallVector<std::pair<int32_t, int32_t>>{});
   SmallVector<int32_t> storeDims;
   for (auto [d, n] : lanes)
     storeDims.push_back(d);
@@ -979,17 +1009,16 @@ static LogicalResult emitOptiPimLanes(ModuleOp mod,
   if (storeDims.size() != splitDims.size())
     return mod.emitError() << "im.bank_active: the store tile has " << storeDims.size()
                            << " lane axes and im.bank_split " << splitDims.size();
-  SmallVector<int32_t> onFlat;
+  SmallVector<int64_t> onFlat;
   for (auto [d, n] : lanes) {
     int64_t p = splitDims[llvm::find(storeDims, d) - storeDims.begin()];
     if (split[p] != n || active[p] < 1 || active[p] > n)
       return mod.emitError() << "im.bank_active gives " << active[p] << " active lanes on "
                              << "split dim " << p << " of " << split[p] << ", stored on dim " << d
                              << " with " << n;
-    onFlat.append({d, (int32_t)active[p]});
+    onFlat.append({d, active[p]});
   }
-  table("__pim_opt_lane_on", onFlat);
-  scalar("__pim_opt_lane_on_count", (int32_t)(onFlat.size() / 2));
+  mod->setAttr("im.opt_lane_on", b.getDenseI64ArrayAttr(onFlat));
   return success();
 }
 
@@ -997,54 +1026,14 @@ static LogicalResult emitOptiPimLanes(ModuleOp mod,
 /// first factor is delivered to the PE (1), its second is resident in the bank (2), and
 /// the stored sum is drained by read-out (3). Their codegen fixes roles by position too.
 static FailureOr<llvm::MapVector<int64_t, int64_t>> optiPimResidency(ModuleOp mod) {
-  auto loadOf = [](Value v) -> triton::LoadOp {
-    while (Operation *d = v.getDefiningOp()) {
-      if (auto ld = dyn_cast<triton::LoadOp>(d))
-        return ld;
-      if (!isa<triton::BroadcastOp, triton::ExpandDimsOp, triton::ReshapeOp,
-               triton::gpu::ConvertLayoutOp, arith::ExtFOp, arith::TruncFOp>(d))
-        return {};
-      v = d->getOperand(0);
-    }
-    return {};
-  };
-  SmallVector<std::pair<triton::ReduceOp, arith::MulFOp>> found;
-  mod.walk([&](triton::ReduceOp red) {
-    if (red.getNumOperands() != 1)
-      return;
-    Value src = red.getOperands()[0];
-    while (auto cvt = src.getDefiningOp<triton::gpu::ConvertLayoutOp>())
-      src = cvt.getSrc();
-    bool adds = false;
-    red.getCombineOp().walk([&](Operation *op) { adds |= isa<arith::AddFOp>(op); });
-    if (auto mul = src.getDefiningOp<arith::MulFOp>(); mul && adds)
-      found.push_back({red, mul});
-  });
-  if (found.size() != 1)
-    return mod.emitError() << "im.optipim_roles states residency for exactly one "
-                              "contraction, a sum over a product, and this kernel has "
-                           << found.size();
-  auto [red, mul] = found.front();
-  triton::LoadOp in = loadOf(mul.getLhs()), wt = loadOf(mul.getRhs());
-  int64_t inArg = in ? resolveOperandArg(in.getPtr()) : -1;
-  int64_t wtArg = wt ? resolveOperandArg(wt.getPtr()) : -1;
-  int64_t outArg = -1;
-  SmallVector<Value> work{red.getResult()[0]};
-  llvm::SmallPtrSet<Operation *, 16> seen;
-  while (!work.empty()) {
-    Value v = work.pop_back_val();
-    for (Operation *u : v.getUsers()) {
-      if (!seen.insert(u).second)
-        continue;
-      if (auto st = dyn_cast<triton::StoreOp>(u)) {
-        if (st.getValue() == v)
-          outArg = resolveOperandArg(st.getPtr());
-        continue;
-      }
-      if (u->getNumResults() == 1 && isa<RankedTensorType>(u->getResult(0).getType()))
-        work.push_back(u->getResult(0));
-    }
-  }
+  FailureOr<Contraction> c = findOneContraction(mod, "im.optipim_roles states residency for");
+  if (failed(c))
+    return failure();
+  auto argOf = [](Value ptr) { return kernelArgOf(ptr, /*throughReshape=*/false); };
+  int64_t inArg = c->input ? argOf(c->input.getPtr()) : -1;
+  int64_t wtArg = c->weight ? argOf(c->weight.getPtr()) : -1;
+  triton::StoreOp out = storeOf(c->reduce);
+  int64_t outArg = out ? argOf(out.getPtr()) : -1;
   if (inArg < 0 || wtArg < 0 || outArg < 0 || inArg == wtArg || outArg == inArg ||
       outArg == wtArg)
     return mod.emitError() << "im.optipim_roles cannot name the contraction's operands: "
@@ -1055,31 +1044,6 @@ static FailureOr<llvm::MapVector<int64_t, int64_t>> optiPimResidency(ModuleOp mo
   res.insert({wtArg, 2});
   res.insert({outArg, 3});
   return res;
-}
-
-/// __pim_opt_residency holds [arg, residency] pairs, beside the layout record so it does
-/// not change. bank_replicated stays the placement fact.
-static LogicalResult emitOptiPimResidency(ModuleOp mod,
-                                          const llvm::MapVector<int64_t, int64_t> &res) {
-  if (!mod.getContext()->getLoadedDialect<LLVM::LLVMDialect>())
-    return mod.emitError() << "im.optipim_roles emits LLVM globals here, load the LLVM "
-                              "dialect first";
-  SmallVector<int32_t> flat;
-  for (auto [arg, r] : res)
-    flat.append({(int32_t)arg, (int32_t)r});
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, flat.size()),
-                         /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_residency",
-                         DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_residency_count",
-                         b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
-  return success();
 }
 
 /// The program ids `v` derives from, each value on the way added to `seen`. Unlike
@@ -1118,21 +1082,14 @@ static FailureOr<unsigned> pidDependence(Value v, llvm::DenseSet<Value> &seen) {
 /// OptiPIM's unbounded input memo, THEIR bug reproduced on purpose and disclosed: their
 /// codegen never re-sends an input element the leader once held, though their PE declares
 /// reg_per_pe 1. Record [arg, held ids, bound x, y, z (-1 none)].
-static FailureOr<SmallVector<int32_t>>
+static FailureOr<SmallVector<int64_t>>
 optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
   int64_t inArg = -1;
   for (auto [arg, r] : res)
     if (r == 1)
       inArg = arg;
-  std::array<triton::GetProgramIdOp, 3> pids{};
-  bool twice = false;
-  mod.walk([&](triton::GetProgramIdOp op) {
-    if (op->use_empty())
-      return;
-    twice |= (bool)pids[op.getAxisAsInt()];
-    pids[op.getAxisAsInt()] = op;
-  });
-  if (twice)
+  auto pids = programIds(mod);
+  if (!pids)
     return mod.emitError() << "im.optipim_hold_input reads each program id once";
   // What the input delivers is its address, mask and other. A load in a loop or branch can
   // run a pid-dependent number of times, which a hold per program instance cannot state.
@@ -1140,7 +1097,7 @@ optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
   bool stored = false, nested = false;
   mod.walk([&](Operation *op) {
     Value ptr = getMemAccessPtr(op);
-    if (!ptr || inArg < 0 || resolveOperandArg(ptr) != inArg)
+    if (!ptr || inArg < 0 || kernelArgOf(ptr, /*throughReshape=*/false) != inArg)
       return;
     auto ld = dyn_cast<triton::LoadOp>(op);
     stored |= !ld;
@@ -1167,7 +1124,7 @@ optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
     return mod.emitError() << "im.optipim_hold_input holds an input loaded once per program "
                               "instance, and arg " << inArg << " is loaded in a loop or branch";
   for (int a = 0; a < 3; ++a)
-    if (pids[a])
+    if ((*pids)[a])
       used |= 1u << a;
   unsigned held = used & ~reach;
   // A stated hash (im.optipim_memo) can also hold steps the input reaches: their misread
@@ -1189,35 +1146,45 @@ optiPimHold(ModuleOp mod, const llvm::MapVector<int64_t, int64_t> &res) {
       diag << " and reaches none";
     return diag;
   }
-  SmallVector<int32_t> rec{(int32_t)inArg, (int32_t)held};
+  SmallVector<int64_t> rec{inArg, (int64_t)held};
   for (int a = 0; a < 3; ++a)
     rec.push_back((held >> a) & 1u ? 1 : -1);
   return rec;
 }
 
-/// __pim_opt_hold is that record, beside the layout record so it does not change.
-static void emitOptiPimHold(ModuleOp mod, ArrayRef<int32_t> rec) {
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  auto dataTy = RankedTensorType::get({(int64_t)rec.size()}, i32);
-  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, rec.size()),
-                         /*isConstant=*/true, LLVM::Linkage::External, "__pim_opt_hold",
-                         DenseElementsAttr::get(dataTy, rec));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_hold_count", b.getI32IntegerAttr(1));
-  // __pim_opt_memo, their memo's hash of a step as (bound, weight) pairs, slowest loop first.
-  auto memo = mod->getAttrOfType<DenseI64ArrayAttr>("im.optipim_memo");
-  if (!memo)
-    return;
-  SmallVector<int32_t> flat(memo.asArrayRef().begin(), memo.asArrayRef().end());
-  auto memoTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-  LLVM::GlobalOp::create(b, loc, LLVM::LLVMArrayType::get(i32, flat.size()),
-                         /*isConstant=*/true, LLVM::Linkage::External, "__pim_opt_memo",
-                         DenseElementsAttr::get(memoTy, ArrayRef<int32_t>(flat)));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_memo_count", b.getI32IntegerAttr((int32_t)flat.size() / 2));
+/// OptiPIM's conventions, stamped on the module beside the layout records, which they leave
+/// as they are: the lanes under im.optipim_conv, the roles under im.optipim_roles and the
+/// input's hold under im.optipim_hold_input.
+static LogicalResult runOptiPimConventions(ModuleOp mod) {
+  const bool roles = mod->hasAttr("im.optipim_roles");
+  llvm::MapVector<int64_t, int64_t> residency;
+  if (roles) {
+    auto res = optiPimResidency(mod);
+    if (failed(res))
+      return failure();
+    residency = std::move(*res);
+  }
+  SmallVector<int64_t> hold;
+  if (mod->hasAttr("im.optipim_hold_input")) {
+    if (!roles)
+      return mod.emitError() << "im.optipim_hold_input holds the input im.optipim_roles names";
+    auto rec = optiPimHold(mod, residency);
+    if (failed(rec))
+      return failure();
+    hold = std::move(*rec);
+  }
+  if (mod->hasAttr("im.optipim_conv") && failed(stampOptiPimLanes(mod)))
+    return failure();
+  Builder b(mod.getContext());
+  if (roles) {
+    SmallVector<int64_t> flat;
+    for (auto [arg, r] : residency)
+      flat.append({arg, r});
+    mod->setAttr("im.opt_residency", b.getDenseI64ArrayAttr(flat));
+  }
+  if (!hold.empty())
+    mod->setAttr("im.opt_hold", b.getDenseI64ArrayAttr(hold));
+  return success();
 }
 
 // -----------------------------------------------------------------------
@@ -1233,247 +1200,58 @@ struct IMOperandResidencyLayoutPass
     ModuleOp mod = getOperation();
     OpBuilder b(mod.getContext());
 
-    // Step 4 user schedule, validated up front so a malformed one fails before
-    // any classification rather than half way through it.
-    llvm::MapVector<int64_t, DictionaryAttr> argSchedule;
-    llvm::DenseSet<int64_t> argScheduleUsed;
-    if (auto schedule = mod->getAttrOfType<DictionaryAttr>("im.schedule")) {
-      for (NamedAttribute e : schedule) {
-        StringRef k = e.getName().strref();
-        int64_t argIdx = 0;
-        if (!k.starts_with("arg") || k.drop_front(3).getAsInteger(10, argIdx)) {
-          mod.emitError() << "im.schedule: key '" << k
-                          << "' must be arg<N> with N a kernel operand index";
-          return signalPassFailure();
-        }
-        auto d = dyn_cast<DictionaryAttr>(e.getValue());
-        if (!d) {
-          mod.emitError() << "im.schedule: '" << k
-                          << "' must map to a dictionary of schedule fields";
-          return signalPassFailure();
-        }
-        if (failed(checkSchedule(d, mod.getLoc(), "im.schedule." + k)))
-          return signalPassFailure();
-        argSchedule[argIdx] = d;
-      }
-    }
-
-    // Pass A, reduction-loop detection.  A reduction loop is an scf.for that
-    // carries iter_args (the accumulator).  Record which functions contain one.
-    llvm::DenseSet<Operation *> funcsWithReduction;
+    StampContext cx;
+    auto schedule = readSchedule(mod);
+    if (failed(schedule))
+      return signalPassFailure();
+    cx.schedule = std::move(*schedule);
+    // A reduction loop is an scf.for that carries a value, the accumulator.
     mod.walk([&](scf::ForOp forOp) {
       if (forOp.getNumRegionIterArgs() > 0)
         if (auto fn = forOp->getParentOfType<triton::FuncOp>())
-          funcsWithReduction.insert(fn.getOperation());
+          cx.reductionFuncs.insert(fn.getOperation());
     });
 
-    llvm::MapVector<int64_t, int64_t> optResidency;
-    const bool optipimRoles = mod->hasAttr("im.optipim_roles");
-    if (optipimRoles) {
-      auto res = optiPimResidency(mod);
-      if (failed(res))
-        return signalPassFailure();
-      optResidency = std::move(*res);
-    }
-    SmallVector<int32_t> optHold;
-    if (mod->hasAttr("im.optipim_hold_input")) {
-      if (!optipimRoles) {
-        mod.emitError() << "im.optipim_hold_input holds the input im.optipim_roles names";
-        return signalPassFailure();
-      }
-      auto hold = optiPimHold(mod, optResidency);
-      if (failed(hold))
-        return signalPassFailure();
-      optHold = std::move(*hold);
-    }
-
-    // Pass B, classify each memory-access op and stamp im.residency.
     int64_t numForced = 0;
-    bool scheduleError = false;
-    const bool optipimConv = mod->hasAttr("im.optipim_conv");
-    // arg -> replicated lane dims, -1 for a scalar splat (every lane dim).
-    llvm::MapVector<int64_t, int64_t> optLaneRep;
+    llvm::DenseSet<int64_t> matched;
+    bool refused = false;
     mod.walk([&](Operation *op) {
-      Value ptr = getMemAccessPtr(op);
-      if (!ptr)
+      FailureOr<DictionaryAttr> stamp = stampResidency(op, cx, b);
+      if (failed(stamp)) {
+        refused = true;
         return;
-      auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
-      bool isTensorPtr =
-          tensorTy && isa<triton::PointerType>(tensorTy.getElementType());
-      bool scalarSplat = !isTensorPtr && isScalarSplatLoad(op);
-      if (!isTensorPtr && !scalarSplat)
+      }
+      if (!*stamp)
         return;
-
-      // Innermost enclosing reduction loop (for the induction-var test).
-      scf::ForOp redFor;
-      for (Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
-        if (auto f = dyn_cast<scf::ForOp>(p)) {
-          if (f.getNumRegionIterArgs() > 0) {
-            redFor = f;
-            break;
-          }
-        }
-      }
-
-      unsigned pidMask = 0;
-      {
-        llvm::DenseSet<Value> vis;
-        pidMask = reachesProgramId(ptr, vis);
-      }
-      bool ivDep = false;
-      if (redFor) {
-        llvm::DenseSet<Value> vis;
-        ivDep = reachesValue(ptr, redFor.getInductionVar(), vis);
-      }
-      int64_t operandArg = resolveOperandArg(ptr);
-
-      auto fn = op->getParentOfType<triton::FuncOp>();
-      bool funcReduction =
-          fn && funcsWithReduction.contains(fn.getOperation());
-
-      // A scalar load splatted across the lanes is a bank-broadcast: the value
-      // is identical across all banks for a given access, whatever its pid or
-      // reduction dependence.
-      StringRef cls;
-      if (scalarSplat)
-        cls = "BroadcastReplicate";
-      else if (!funcReduction)
-        cls = "StreamedElementwise";
-      else if (ivDep && pidMask != 0)
-        cls = "ReductionStridedMatrix";
-      else if (ivDep && pidMask == 0)
-        cls = "BroadcastReplicate";
-      else if (!ivDep && pidMask != 0)
-        cls = "ParallelSpread";
-      else
-        cls = "StreamedElementwise";
-
-      // DERIVED ROLE. Replication is a property of the layout, so read it off the
-      // encoding rather than letting the host assert it.
-      // scalarSplat is itself a positive determination of replication.
-      int64_t cellFanout = 1;
-      const int bankRep = scalarSplat ? 1 : bankReplicatedTri(op, &cellFanout);
-
-      SmallVector<NamedAttribute> fields;
-      fields.push_back(b.getNamedAttr("reuse_class", b.getStringAttr(cls)));
-      // OMIT on -1. The emitter defaults the record word to -1, which the runtime
-      // reads as "no compiler decision, keep the host's role".
-      // The VALUE is how many banks receive a copy: 0 partitioned, >1 replicated over
-      // that many. It used to be a bool, which charged every replicated tensor to all
-      // 32 banks even when the split replicated it over 2.
-      if (bankRep >= 0)
-        fields.push_back(b.getNamedAttr("bank_replicated",
-                                        b.getI32IntegerAttr(bankRep)));
-      // Cells per lane that one CONSUMED value feeds through a TILE BROADCAST. Sharing
-      // that reaches memory as repeated loads is counted by the runtime from the loads,
-      // so this covers only what never reaches memory. 1 is the identity and the safe
-      // default; only a partitioned (STREAMED) tensor is charged by it.
-      if (cellFanout > 1)
-        fields.push_back(
-            b.getNamedAttr("cell_fanout", b.getI64IntegerAttr(cellFanout)));
-      fields.push_back(
-          b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
-      // Address footprint of one program instance, flattened five words per
-      // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
-      // stride the pass cannot fold to a number travels as a product of kernel
-      // argument indices, as conv's CI*R*S weight pitch does, and the runtimes
-      // read only the extents. Absent when the address is not affine in the
-      // ranges and the reduction IV.
-      SmallVector<FpAxis> fp;
-      if (operandFootprint(ptr, redFor, fp) && !fp.empty()) {
-        SmallVector<int64_t> flat;
-        for (const FpAxis &ax : fp) {
-          flat.push_back(ax.extent);
-          flat.push_back(ax.stride.factor);
-          for (int64_t i = 0; i < kMaxStrideArgs; ++i)
-            flat.push_back(i < (int64_t)ax.stride.args.size()
-                               ? ax.stride.args[i]
-                               : -1);
-        }
-        fields.push_back(
-            b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
-      }
-
-      // The reduce-collapse factor, stamped on stores only when it exceeds 1, which
-      // happens where the stored value is a reduce of a wider carried accumulator (the
-      // reduction-factored matvec, DCC's RED partials).
-      if (auto st = dyn_cast<triton::StoreOp>(op)) {
-        int64_t ls = liveSplitFactor(st);
-        if (ls > 1)
-          fields.push_back(b.getNamedAttr("live_split", b.getI64IntegerAttr(ls)));
-      }
-
-      // Step 4: the classification above was the default, this is the decision.
-      bool forced = false;
-      if (operandArg >= 0) {
-        auto it = argSchedule.find(operandArg);
-        if (it != argSchedule.end()) {
-          applySchedule(b, it->second, fields);
-          argScheduleUsed.insert(operandArg);
-          forced = true;
-        }
-      }
-      if (forced) {
-        setField(b, fields, "user_forced", b.getUnitAttr());
+      if (stamp->contains("user_forced")) {
+        matched.insert(stamp->getAs<IntegerAttr>("operand_arg").getInt());
         ++numForced;
       }
-      // Lanes store distinct elements, so a stored tensor cannot have identical copies.
-      if (forced && isa<triton::StoreOp>(op))
-        for (NamedAttribute f : fields)
-          if (f.getName() == "bank_replicated")
-            if (auto n = dyn_cast<IntegerAttr>(f.getValue()); n && n.getInt() != 0) {
-              op->emitError() << "a stored tensor cannot be forced bank_replicated: each "
-                              << "lane stores its own elements";
-              scheduleError = true;
-              return;
-            }
-
-      // A forced verdict is not the layout's, so it states no lane mask. The mask reads the
-      // address, not the load's shape, which a mask operand can broadcast.
-      if (optipimConv && operandArg >= 0 && bankRep >= 0 && !forced) {
-        uint32_t repLanes = 0u;
-        llvm::DenseMap<Value, uint32_t> memo;
-        if (!scalarSplat && isa<triton::LoadOp>(op))
-          bankReplicatedTri(op, nullptr, &repLanes, addressDims(ptr, memo));
-        int64_t &m = optLaneRep.insert({operandArg, 0}).first->second;
-        m = (scalarSplat || m < 0) ? -1 : (m | repLanes);
-      }
-
-      op->setDiscardableAttr("im.residency", b.getDictionaryAttr(fields));
+      op->setDiscardableAttr("im.residency", *stamp);
     });
-
-    if (scheduleError)
+    if (refused)
       return signalPassFailure();
-    // An arg nobody matched means the schedule silently did nothing, which reads
-    // downstream as a tuned run that measured the default.
-    for (const auto &kv : argSchedule) {
-      if (!argScheduleUsed.contains(kv.first)) {
+    // A schedule entry nothing matched would read downstream as a tuned run that measured
+    // the default.
+    for (const auto &kv : cx.schedule) {
+      if (!matched.contains(kv.first)) {
         mod.emitError() << "im.schedule: arg" << kv.first
                         << " matched no classified memory access";
         return signalPassFailure();
       }
     }
 
-    // The widest loop-carried accumulator per lane, for the runtime's register-file
-    // bound. One number at module level because the machine has one GRF_B per bank.
+    // The widest accumulator one lane holds, for the runtime's register-file bound. One
+    // number per module, since the machine has one GRF_B per bank.
     int64_t accCells = 0;
-    mod.walk([&](triton::StoreOp st) {
-      int64_t c = accCellsPerLane(st);
-      if (c > accCells)
-        accCells = c;
-    });
+    mod.walk([&](triton::StoreOp st) { accCells = std::max(accCells, accCellsPerLane(st)); });
     if (accCells > 0)
       mod->setAttr("im.acc_cells_per_lane", b.getI64IntegerAttr(accCells));
 
-    if (optipimConv && failed(emitOptiPimLanes(mod, optLaneRep)))
+    if (failed(runOptiPimConventions(mod)))
       return signalPassFailure();
-    if (optipimRoles && failed(emitOptiPimResidency(mod, optResidency)))
-      return signalPassFailure();
-    if (!optHold.empty())
-      emitOptiPimHold(mod, optHold);
 
-    // Provenance. A reported number has to be able to say whether it came from
-    // the classifier or from a forced schedule.
+    // Whether a reported number came from the classifier or from a forced schedule.
     mod->setAttr("im.residency-user-forced", b.getI64IntegerAttr(numForced));
   }
 };

@@ -30,6 +30,7 @@
  * above the loop shares tile 0 with it. DCC loads an operand after the round's reset,
  * and the runtime's phase order within one tile then emits that order.
  */
+#include "IMArtifact.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -58,17 +59,6 @@ constexpr llvm::StringLiteral kPrologueFirstAttr = "im.tile_prologue_first";
 /// Stamped on each loop we mark. IMOptiPimMac reads it to find the tile loop.
 constexpr llvm::StringLiteral kMarkedAttr = "im.tile-boundary";
 
-/// Declare `void __pim_tile_boundary()` once per module.
-static LLVM::LLVMFuncOp getOrDeclareBoundaryFn(ModuleOp mod) {
-  if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(kBoundaryFn))
-    return fn;
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  auto voidTy = LLVM::LLVMVoidType::get(mod.getContext());
-  auto fnTy = LLVM::LLVMFunctionType::get(voidTy, {}, /*isVarArg=*/false);
-  return LLVM::LLVMFuncOp::create(b, mod.getLoc(), kBoundaryFn, fnTy);
-}
-
 struct IMTileBoundaryPass
     : public triton::im::impl::IMTileBoundaryBase<IMTileBoundaryPass> {
   void runOnOperation() override {
@@ -93,7 +83,9 @@ struct IMTileBoundaryPass
       return;
     }
 
-    LLVM::LLVMFuncOp fn = getOrDeclareBoundaryFn(mod);
+    LLVM::LLVMFuncOp fn = triton::im::getOrDeclareRuntimeFn(
+        mod, kBoundaryFn,
+        LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()), {}));
     bool prologueFirst = mod->hasAttr(kPrologueFirstAttr);
     // Two tile loops in one function would share a tile at their seam.
     if (prologueFirst) {

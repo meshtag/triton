@@ -1,11 +1,11 @@
-/// TritonIMToLLVM.cpp — Lower TritonGPU IR → LLVM for In-Memory targets.
+/// TritonIMToLLVM.cpp. Lower TritonGPU IR to LLVM for In-Memory targets.
 ///
-/// This pass reuses the shared TritonGPUToLLVM lowering patterns
-/// (elementwise, memory, SPMD, control-flow, …) with an IM-specific
-/// TargetInfo that models an HBM-PIM architecture with bank-level
-/// SIMD parallelism.  Each PIM bank is mapped to one Triton "thread"
-/// (threads_per_warp = numBanks).  The bank index is provided at
-/// runtime via the extern function __pim_get_bank_id().
+/// The pass reuses the shared TritonGPUToLLVM lowering patterns with the IM TargetInfo, and
+/// before converting it states the kernel's tables for the trace runtimes (IMArtifact.cpp).
+///
+/// Names. A lane is one Triton thread (threads_per_warp = num_banks) and, on the device, one
+/// of the paper's bank-PE pairs. Option and runtime names keep the word bank for a lane, as in
+/// num_banks and __pim_get_bank_id(), which returns the lane's index at run time.
 ///
 /// ---------- Vectorization strategy ----------
 ///
@@ -17,7 +17,7 @@
 /// scalar operations.
 ///
 /// Memory contiguity is determined by Triton's AxisInfo dataflow
-/// analysis — the same mechanism used by the NVIDIA and AMD backends.
+/// analysis, the same mechanism used by the NVIDIA and AMD backends.
 /// AxisInfo tracks pointer arithmetic (make_range, splat, addptr)
 /// and computes per-dimension contiguity, divisibility, and constancy.
 /// The vector width formula is:
@@ -38,9 +38,9 @@
 ///
 ///       vec = min(vec, maskAlignment)
 ///
-///   - Loads: branch on mask[vecStart] (group predicate), then
-///     per-element `llvm.select` to handle partial masks at the
-///     boundary.
+///   - Loads: after the clamp every element of a group shares
+///     mask[vecStart], so one branch on it decides the group, and the
+///     per-element `llvm.select` always picks the loaded element.
 ///   - Stores: AND all mask bits in the group.  If all-true, emit a
 ///     single vector store.  Otherwise, fall back to per-element
 ///     scalar stores with individual mask checks.
@@ -48,7 +48,7 @@
 /// When vec==1 (e.g. non-contiguous access or sub-byte elements),
 /// this gracefully degrades to scalar behavior.
 
-#include "IMContraction.h"
+#include "IMArtifact.h"
 #include "TargetInfo.h"
 #include "triton/Conversion/TritonIMToLLVM/Passes.h"
 
@@ -57,16 +57,12 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/SetVector.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
@@ -77,9 +73,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
-#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 // --------------------------------------------------------------------------
 // TableGen pass base class
@@ -116,18 +110,9 @@ struct IMThreadIdOpConversion : public RewritePattern {
                                 PatternRewriter &rewriter) const override {
     auto loc = op->getLoc();
     auto moduleOp = op->getParentOfType<ModuleOp>();
-    auto *ctx = rewriter.getContext();
-    Type i32 = IntegerType::get(ctx, 32);
-
-    // Declare __pim_get_bank_id() if not yet present.
-    auto funcOp = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>("__pim_get_bank_id");
-    if (!funcOp) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(moduleOp.getBody());
-      auto fnType = LLVM::LLVMFunctionType::get(i32, {});
-      funcOp =
-          LLVM::LLVMFuncOp::create(rewriter, loc, "__pim_get_bank_id", fnType);
-    }
+    Type i32 = IntegerType::get(rewriter.getContext(), 32);
+    auto funcOp = triton::im::getOrDeclareRuntimeFn(
+        rewriter, moduleOp, loc, "__pim_get_bank_id", LLVM::LLVMFunctionType::get(i32, {}));
 
     // Call and wrap in index_cast (gpu.thread_id returns IndexType;
     // the arith→LLVM patterns lower the cast in the same step).
@@ -162,26 +147,6 @@ struct IMBarrierOpErase
   }
 };
 
-/// Data-bus width in bits, the number of values one column command moves once
-/// divided by the element width. Must equal the runtime's cfg_dq_bits.
-/// Default only: the harness states the machine's width as `im.dq_bits`, and the two
-/// targets differ (HBM-PIM moves prefetch*dq = 256 bits per column command, SIMDRAM's
-/// column is a bit-serial slot whose width is dq itself).
-static constexpr unsigned kImDqBits = 128;
-
-/// The bus width this module's vector widths are being chosen for.
-static unsigned imDqBits(Value anchor) {
-  Operation *op = anchor.getDefiningOp();
-  if (!op && anchor.getParentBlock())
-    op = anchor.getParentBlock()->getParentOp();
-  if (op)
-    if (auto mod = op->getParentOfType<ModuleOp>())
-      if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-        if (a.getInt() > 0)
-          return (unsigned)a.getInt();
-  return kImDqBits;
-}
-
 // --------------------------------------------------------------------------
 // Base class for vectorized load/store conversions
 // --------------------------------------------------------------------------
@@ -197,8 +162,8 @@ static unsigned imDqBits(Value anchor) {
 ///
 ///     vec = min(dqBits / pointeeBitWidth, contiguity)
 ///
-/// - `dqBits` is the bits one column command moves: `im.dq_bits` when the
-///   module states it (256 on HBM-PIM, so 16 FP16), kImDqBits otherwise.
+/// - `dqBits` is the bits one column command moves, the module's
+///   moduleDqBits: 256 on HBM-PIM, so 16 FP16.
 /// - `contiguity` is the number of consecutive elements accessed per
 ///   thread in the fastest-varying dimension, derived from Triton's
 ///   AxisInfo dataflow analysis.  With sizePerThread=[K] in the IM
@@ -215,8 +180,9 @@ static unsigned imDqBits(Value anchor) {
 /// active or all are inactive, so we can use a single predicate bit
 /// for the whole vector load/store.
 struct IMLoadStoreConversionBase {
-  explicit IMLoadStoreConversionBase(ModuleAxisInfoAnalysis &axisAnalysisPass)
-      : axisAnalysisPass(axisAnalysisPass) {}
+  IMLoadStoreConversionBase(ModuleAxisInfoAnalysis &axisAnalysisPass,
+                            unsigned dqBits)
+      : axisAnalysisPass(axisAnalysisPass), dqBits(dqBits) {}
 
   /// Return the number of contiguous elements accessed per thread
   /// along the fastest-varying dimension, as determined by AxisInfo
@@ -227,7 +193,7 @@ struct IMLoadStoreConversionBase {
 
   /// Compute the vector width for a pointer-typed tensor operand.
   ///
-  /// vec = min(imDqBits / pointeeBitWidth, contiguity)
+  /// vec = min(dqBits / pointeeBitWidth, contiguity)
   ///
   /// AxisInfo tracks pointer arithmetic (make_range, splat, addptr,
   /// muli, etc.) and correctly reports contiguity=1 for non-contiguous
@@ -240,10 +206,7 @@ struct IMLoadStoreConversionBase {
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     if (pointeeBitWidth == 0)
       return 1;
-    /* The SAME physical quantity the runtime calls cfg_dq_bits, and it used to be a
-       bare 128 here and a variable there, decided twice with no shared symbol. The
-       emitted @__pim_dq_bits below lets the runtime compare rather than assume. */
-    return std::min<unsigned>(imDqBits(ptr) / pointeeBitWidth, contiguity);
+    return std::min<unsigned>(dqBits / pointeeBitWidth, contiguity);
   }
 
   /// Return the mask alignment — the number of consecutive mask
@@ -256,6 +219,7 @@ struct IMLoadStoreConversionBase {
 
 protected:
   ModuleAxisInfoAnalysis &axisAnalysisPass;
+  unsigned dqBits;
 
   /// Pack `elems[start .. start+vec-1]` into an LLVM vector value.
   /// Used to build the `other` vector for masked loads and the value
@@ -298,11 +262,13 @@ protected:
 /// so that within each vector group, all mask bits are uniform.
 ///
 /// Mask handling:
-///   The group predicate is `mask[vecStart]` — the first element of
+///   The group predicate is `mask[vecStart]`, the first element of
 ///   the vec-group.  After mask-alignment clamping, all elements in
-///   the group share the same mask value, so a single branch suffices.
-///   Per-element `llvm.select` after the load handles edge cases.
-////// Unmasked loads (vec=4, i32):
+///   the group share the same mask value, so a single branch suffices,
+///   and the per-element `llvm.select` after the load always picks the
+///   loaded element.
+///
+/// Unmasked loads (vec=4, i32):
 ///
 ///   %vec = load <4 x i32>, ptr %p       ; single 128-bit load
 ///   %e0 = extractelement %vec, 0
@@ -334,10 +300,10 @@ protected:
 struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                             public IMLoadStoreConversionBase {
   IMLoadOpConversion(LLVMTypeConverter &converter,
-                     ModuleAxisInfoAnalysis &axisAnalysisPass,
+                     ModuleAxisInfoAnalysis &axisAnalysisPass, unsigned dqBits,
                      PatternBenefit benefit)
       : ConvertOpToLLVMPattern(converter, benefit),
-        IMLoadStoreConversionBase(axisAnalysisPass) {}
+        IMLoadStoreConversionBase(axisAnalysisPass, dqBits) {}
 
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
@@ -429,12 +395,11 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
       } else {
         // ---- Masked vector load with per-element select (vec>1) ----
         //
-        // Group predicate: mask[vecStart].
-        //   - If false, the IM monotonic-mask property guarantees all
-        //     mask[vecStart..vecStart+vec-1] are false → use `other`.
-        //   - If true, we load the full vector and use per-element
-        //     `llvm.select` to handle the (rare) case where trailing
-        //     elements in the group are masked out.
+        // Group predicate: mask[vecStart]. The mask-alignment clamp makes
+        // every mask[vecStart..vecStart+vec-1] equal to it.
+        //   - If false, use `other`.
+        //   - If true, load the full vector. Each element's `llvm.select`
+        //     then reads a true bit.
         //
         // CFG:
         //   currentBlock: cond_br mask[vecStart] → loadBlock,
@@ -471,9 +436,8 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
           Value idx = createIndexAttrConstant(
               rewriter, loc, getTypeConverter()->getIndexType(), j);
           Value elem = b.extract_element(valueElemTy, loaded, idx);
-          // Per-element select: use loaded value if mask is true,
-          // else use `other`.  For the common case (all masks true),
-          // LLVM will fold these selects away.
+          // Per-element select on the element's own mask bit, which
+          // the clamp makes equal to the group predicate.
           Value sel = LLVM::SelectOp::create(rewriter, loc, valueElemTy,
                                              maskElems[vecStart + j], elem,
                                              otherVals[j]);
@@ -557,10 +521,10 @@ struct IMLoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 struct IMStoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
                              public IMLoadStoreConversionBase {
   IMStoreOpConversion(LLVMTypeConverter &converter,
-                      ModuleAxisInfoAnalysis &axisAnalysisPass,
+                      ModuleAxisInfoAnalysis &axisAnalysisPass, unsigned dqBits,
                       PatternBenefit benefit)
       : ConvertOpToLLVMPattern(converter, benefit),
-        IMLoadStoreConversionBase(axisAnalysisPass) {}
+        IMLoadStoreConversionBase(axisAnalysisPass, dqBits) {}
 
   LogicalResult
   matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
@@ -720,663 +684,6 @@ public:
 };
 
 // --------------------------------------------------------------------------
-// Reuse-as-layout: carry the residency descriptor INTO the artifact
-// --------------------------------------------------------------------------
-
-
-/// Emit the residency descriptor as module globals the PIM runtime reads at
-/// link time: @__pim_layout_count (i32, the entry count N) and
-/// @__pim_layout_table ([kRecWords*N x i32], each record laid out at kRecWords).
-///
-/// The address footprint is logical. A stride the pass could not fold to a
-/// number travels as a product of kernel argument indices, and the runtimes
-/// read only the extents.
-///
-/// Must run before the conversion below: `im.residency` is discardable and dies
-/// with the tt.load/tt.store ops that lowering replaces.
-static constexpr int kMaxAxes = 3;
-static constexpr int kAxisWords = 5;
-/// { operand_arg, bank_replicated, num_axes, is_store,
-///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg },
-///   then live_split and cell_fanout as TAIL words }.
-/// live_split is the factor a rank-collapsing reduce hid from the store's footprint,
-/// and it MULTIPLIES the occupancy the SIMDRAM runtime derives. It exceeds 1 where a
-/// kernel stores a reduce of a wider carried accumulator, as the reduction-factored
-/// matvec and DCC's RED partial kernels do, and emitDccAccGrf and emitDccReturnFrom key
-/// on it. Appended at the TAIL so PIM_LW_AXES_BASE and every existing index keep their
-/// values.
-/// bank_replicated is the compiler-derived receive count: 0 when the tensor is
-/// bank-partitioned, otherwise how many banks receive a copy, where 1 (a scalar splat,
-/// or a store with no lane axis) reads as every bank. is_store marks the OUTPUT, which
-/// nothing else identifies now that reuse_class no longer travels, and which the
-/// SIMDRAM occupancy charge needs specifically: only a store's footprint excludes the
-/// reduction axis.
-/* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
-   pim_layout_table.h. A half rebuild aborts loudly on the runtime's drift check. */
-static constexpr int kRecWords = 6 + kMaxAxes * kAxisWords;
-
-static void emitPimLayoutTable(ModuleOp mod) {
-  struct Entry {
-    // Not emitted. The layout_kind word it used to produce went 2026-09-10, but the
-    // merge rule below still needs to know whether a record carries a real
-    // classification or the catch-all, which is what the kind's zero meant.
-    bool concreteClass = false;
-    int32_t bankReplicated = -1;  // -1 = the pass said nothing
-    int32_t isStore = 0;
-    int32_t liveSplit = 1;
-    int32_t cellFanout = 1;
-    SmallVector<int32_t> axes; // kAxisWords per axis, at most kMaxAxes
-  };
-  llvm::MapVector<int64_t, Entry> byOperand;
-
-  mod.walk([&](Operation *op) {
-    Attribute raw = op->getDiscardableAttr("im.residency");
-    if (!raw)
-      return;
-    auto dict = dyn_cast<DictionaryAttr>(raw);
-    if (!dict)
-      return;
-    auto clsAttr = dict.getAs<StringAttr>("reuse_class");
-    auto oaAttr = dict.getAs<IntegerAttr>("operand_arg");
-    if (!clsAttr || !oaAttr)
-      return;
-    int64_t operandArg = oaAttr.getInt();
-    if (operandArg < 0)
-      return; // address did not resolve to a kernel pointer argument
-
-    Entry e;
-    e.isStore = isa<triton::StoreOp>(op) ? 1 : 0;
-    if (auto ls = dict.getAs<IntegerAttr>("live_split"))
-      e.liveSplit = (int32_t)ls.getInt();
-    if (auto cf = dict.getAs<IntegerAttr>("cell_fanout"))
-      e.cellFanout = (int32_t)cf.getInt();
-    StringRef cls = clsAttr.getValue();
-    e.concreteClass = cls == "BroadcastReplicate" ||
-                      cls == "ReductionStridedMatrix" || cls == "ParallelSpread";
-    // 0 partitioned, >1 the number of banks that receive a copy.
-    if (auto br = dict.getAs<IntegerAttr>("bank_replicated"))
-      e.bankReplicated = (int32_t)br.getInt();
-    if (auto fp = dict.getAs<DenseI64ArrayAttr>("footprint")) {
-      ArrayRef<int64_t> v = fp.asArrayRef();
-      if (v.size() % kAxisWords == 0 &&
-          (int)(v.size() / kAxisWords) <= kMaxAxes)
-        for (int64_t x : v)
-          e.axes.push_back((int32_t)x);
-    }
-
-    // First wins, except a real class beats an earlier catch-all.
-    auto it = byOperand.find(operandArg);
-    if (it == byOperand.end())
-      byOperand.insert({operandArg, e});
-    else if (!it->second.concreteClass && e.concreteClass) {
-      // A wholesale replace must not drop what the earlier record knew.
-      e.isStore |= it->second.isStore;
-      if (it->second.liveSplit > e.liveSplit)
-        e.liveSplit = it->second.liveSplit;
-      if (it->second.cellFanout > e.cellFanout)
-        e.cellFanout = it->second.cellFanout;
-      it->second = e;
-    }
-    else if (it->second.bankReplicated < 0 && e.bankReplicated >= 0)
-      it->second.bankReplicated = e.bankReplicated;
-    // Sticky, unlike the rest: an RMW pointer arg is loaded AND stored, and
-    // first-wins would drop the store bit whichever order the walk saw them in.
-    if (e.isStore)
-      byOperand[operandArg].isStore = 1;
-    // MAX, not first-wins: two stores can reach one output (CO-fused conv) and the
-    // row has to hold the widest of them. Never sum -- they share the accumulator.
-    if (e.liveSplit > byOperand[operandArg].liveSplit)
-      byOperand[operandArg].liveSplit = e.liveSplit;
-    if (e.cellFanout > byOperand[operandArg].cellFanout)
-      byOperand[operandArg].cellFanout = e.cellFanout;
-  });
-
-  if (byOperand.empty())
-    return;
-
-  SmallVector<int32_t> flat;
-  flat.reserve(byOperand.size() * kRecWords);
-  for (const auto &kv : byOperand) {
-    flat.push_back((int32_t)kv.first);
-    flat.push_back(kv.second.bankReplicated);
-    flat.push_back((int32_t)(kv.second.axes.size() / kAxisWords));
-    flat.push_back(kv.second.isStore);
-    flat.append(kv.second.axes.begin(), kv.second.axes.end());
-    flat.resize(flat.size() + (kMaxAxes * kAxisWords - kv.second.axes.size()),
-                0);
-    flat.push_back(kv.second.liveSplit); // TAIL word, after the axis padding
-    flat.push_back(kv.second.cellFanout); // second TAIL word
-  }
-
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-
-  auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-  auto init = DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat));
-  LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true,
-                         LLVM::Linkage::External, "__pim_layout_table", init);
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
-                         LLVM::Linkage::External, "__pim_layout_count",
-                         b.getI32IntegerAttr((int32_t)byOperand.size()));
-  // State the record width so the runtime can verify it rather than assume it.
-  // kRecWords here and PIM_LAYOUT_REC_WORDS in pim_layout_table.h live in separate
-  // submodules; if they drift, the runtime strides wrong and misreads every record
-  // past the first, silently. A comment asking them to agree is not a check.
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
-                         LLVM::Linkage::External, "__pim_layout_rec_words",
-                         b.getI32IntegerAttr((int32_t)kRecWords));
-
-  // The bus width this artifact's vector widths were chosen for. The runtime holds
-  // the same quantity as cfg_dq_bits and used to decide it independently, so a
-  // machine configured with a different bus silently priced vectors the compiler
-  // never emitted. Stating it lets the runtime say so.
-  int32_t dqBits = (int32_t)kImDqBits;
-  if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-    if (a.getInt() > 0)
-      dqBits = (int32_t)a.getInt();
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
-                         LLVM::Linkage::External, "__pim_dq_bits",
-                         b.getI32IntegerAttr(dqBits));
-
-  // Placement policy, 0 = the kernel said nothing. The dcc-parity runtime refuses anything
-  // but row-pack, and the default and optipim-parity runtimes refuse anything but
-  // interleaved at DQ alignment.
-  auto emitPolicy = [&](const char *attr, const char *sym) {
-    int32_t v = 0;
-    if (auto a = mod->getAttrOfType<IntegerAttr>(attr))
-      v = (int32_t)a.getInt();
-    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true,
-                           LLVM::Linkage::External, sym, b.getI32IntegerAttr(v));
-  };
-  emitPolicy("im.persistent", "__pim_persistent");
-  emitPolicy("im.layout_scheme", "__pim_layout_scheme");
-  emitPolicy("im.placement_align", "__pim_placement_align");
-  // Cells one lane keeps live across a reduction, the widest loop-carried accumulator.
-  // 0 when no store drains one, which is every elementwise kernel.
-  emitPolicy("im.acc_cells_per_lane", "__pim_acc_cells_per_lane");
-  // Entries per lane of the widest strip im-load-cluster jammed in a storing loop, 0 none.
-  emitPolicy("im.map_strip_entries", "__pim_map_strip_entries");
-
-  // The lane count the kernel was compiled for. The runtime divides the SIMDRAM
-  // occupancy by its configured bank count and the harness replays num_banks lanes;
-  // three copies of one number, none checked against another until this travelled.
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_lanes",
-                         b.getI32IntegerAttr((int32_t)ttg::TritonGPUDialect::getThreadsPerWarp(mod)));
-}
-
-// DCC's tile MAC per tensor, [operand_arg, reads per MAC] pairs, only when the module
-// asked for it (im-dcc-tile-mac). Absent otherwise, so the default artifact is unchanged.
-static void emitDccTileMac(ModuleOp mod) {
-  if (!mod->hasAttr("im.dcc_tile_mac"))
-    return;
-  llvm::MapVector<int64_t, int32_t> byArg;
-  mod.walk([&](triton::LoadOp ld) {
-    auto stamp = ld->getAttrOfType<DenseI64ArrayAttr>("im.dcc-tile-mac");
-    auto res = dyn_cast_or_null<DictionaryAttr>(ld->getDiscardableAttr("im.residency"));
-    auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
-    if (stamp && arg && arg.getInt() >= 0)
-      byArg[arg.getInt()] = (int32_t)stamp.asArrayRef()[0];
-  });
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  if (!byArg.empty()) {
-    SmallVector<int32_t> flat;
-    for (const auto &kv : byArg) {
-      flat.push_back((int32_t)kv.first);
-      flat.push_back(kv.second);
-    }
-    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
-                           "__pim_dcc_tile_mac",
-                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
-  }
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_dcc_tile_mac_count",
-                         b.getI32IntegerAttr((int32_t)byArg.size()));
-  // DCC's MAC addressing (im.dcc_mac_addressing): [operand_arg, head stride, reduce
-  // stride, reduce extent] per tensor, the geometry their generator addresses a tile by.
-  if (!mod->hasAttr("im.dcc_mac_addressing"))
-    return;
-  llvm::MapVector<int64_t, SmallVector<int32_t>> geo;
-  mod.walk([&](triton::LoadOp ld) {
-    auto g = ld->getAttrOfType<DenseI64ArrayAttr>("im.dcc-mac-addr");
-    auto res = dyn_cast_or_null<DictionaryAttr>(ld->getDiscardableAttr("im.residency"));
-    auto arg = res ? res.getAs<IntegerAttr>("operand_arg") : IntegerAttr();
-    if (g && arg && arg.getInt() >= 0)
-      geo[arg.getInt()] = {(int32_t)g.asArrayRef()[0], (int32_t)g.asArrayRef()[1],
-                           (int32_t)g.asArrayRef()[2]};
-  });
-  SmallVector<int32_t> flat;
-  for (const auto &kv : geo) {
-    flat.push_back((int32_t)kv.first);
-    flat.append(kv.second.begin(), kv.second.end());
-  }
-  if (!flat.empty()) {
-    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
-                           "__pim_dcc_mac_addr",
-                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
-  }
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_dcc_mac_addr_count", b.getI32IntegerAttr((int32_t)geo.size()));
-}
-
-// DCC's accumulator convention per stored tensor and its GRF_A operand election, derived
-// from the residency stamps, only when the module asked for it (im.dcc_acc_grf). A map, or
-// a store folded across a column's SIMD lanes, is DCC's result-register path: no reset,
-// one write-back per PCU pair. Any other store is an accumulator, reset and written back
-// in every lane. GRF_A holds a partitioned input whose loaded values each feed several
-// cells of the lane, when another partitioned input feeds one.
-static LogicalResult emitDccAccGrf(ModuleOp mod) {
-  if (!mod->hasAttr("im.dcc_acc_grf"))
-    return success();
-  auto accAttr = mod->getAttrOfType<IntegerAttr>("im.acc_cells_per_lane");
-  int64_t accCells = accAttr ? accAttr.getInt() : 0;
-  auto field = [](Operation *op, StringRef name, int64_t dflt) {
-    auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
-    auto v = res ? res.getAs<IntegerAttr>(name) : IntegerAttr();
-    return v ? v.getInt() : dflt;
-  };
-  // A store of a reduce im-lane-fold marked folds a column's lanes too. A slice shorter than
-  // its loop step leaves no loop, so live_split, which reads a carried accumulator, misses it.
-  auto foldsColumn = [](Value v) {
-    for (int hops = 0; v && hops < 8; ++hops) {
-      Operation *def = v.getDefiningOp();
-      if (!def)
-        return false;
-      if (isa<triton::ReduceOp>(def))
-        return def->hasAttr("im.lane-fold");
-      if (def->getNumOperands() != 1)
-        return false;
-      v = def->getOperand(0);
-    }
-    return false;
-  };
-  // A map's value is elementwise arithmetic on this iteration's loads: no reduction and no
-  // value carried across a loop. Its store is the result path even beside a reduction, as
-  // the z = y + b a fused VA -> RED writes before it reads z back.
-  auto isMap = [](Value v) {
-    SmallVector<Value> work{v};
-    llvm::DenseSet<Value> seen;
-    while (!work.empty()) {
-      Value x = work.pop_back_val();
-      if (!seen.insert(x).second)
-        continue;
-      Operation *def = x.getDefiningOp();
-      if (!def)
-        return false;
-      if (isa<triton::LoadOp>(def))
-        continue;
-      if (isa<triton::ReduceOp>(def))
-        return false;
-      for (Value o : def->getOperands())
-        work.push_back(o);
-    }
-    return true;
-  };
-  llvm::MapVector<int64_t, std::pair<int32_t, int32_t>> acc;
-  // A map's store beside a reduction, which the runtime cannot tell from the module.
-  llvm::SetVector<int64_t> maps;
-  bool conflict = false;
-  mod.walk([&](triton::StoreOp st) {
-    int64_t arg = field(st, "operand_arg", -1);
-    if (arg < 0)
-      return;
-    bool map = accCells > 0 && isMap(st.getValue());
-    if (map)
-      maps.insert(arg);
-    bool result = accCells == 0 || field(st, "live_split", 1) > 1 ||
-                  foldsColumn(st.getValue()) || map;
-    std::pair<int32_t, int32_t> c = result ? std::make_pair(0, 2) : std::make_pair(1, 1);
-    auto it = acc.find(arg);
-    if (it != acc.end() && it->second != c)
-      conflict = true;
-    acc[arg] = c;
-  });
-  // Per argument: every load partitioned, and the most cells one value feeds.
-  llvm::MapVector<int64_t, std::pair<bool, int64_t>> loads;
-  mod.walk([&](triton::LoadOp ld) {
-    int64_t arg = field(ld, "operand_arg", -1);
-    if (arg < 0)
-      return;
-    auto &e = loads.insert({arg, {true, INT64_MAX}}).first->second;
-    e.first &= field(ld, "bank_replicated", -1) == 0;
-    e.second = std::min(e.second, field(ld, "cell_fanout", 1));
-  });
-  bool streamed = llvm::any_of(loads, [](auto &kv) {
-    return kv.second.first && kv.second.second == 1;
-  });
-  SmallVector<int32_t> grf;
-  for (auto &kv : loads)
-    if (streamed && kv.second.first && kv.second.second > 1)
-      grf.push_back((int32_t)kv.first);
-  if (conflict)
-    return mod.emitError() << "im.dcc_acc_grf: one argument is stored both as a map result "
-                              "and as an accumulator, which no single DCC convention covers";
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  auto table = [&](StringRef name, ArrayRef<int32_t> flat) {
-    if (flat.empty())
-      return;
-    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External, name,
-                           DenseElementsAttr::get(dataTy, flat));
-  };
-  auto scalar = [&](StringRef name, int32_t v) {
-    LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External, name,
-                           b.getI32IntegerAttr(v));
-  };
-  SmallVector<int32_t> flat;
-  for (auto &kv : acc) {
-    flat.push_back((int32_t)kv.first);
-    flat.push_back(kv.second.first);
-    flat.push_back(kv.second.second);
-  }
-  table("__pim_dcc_acc", flat);
-  scalar("__pim_dcc_acc_count", (int32_t)acc.size());
-  table("__pim_dcc_grf_a", grf);
-  scalar("__pim_dcc_grf_a_count", (int32_t)grf.size());
-  SmallVector<int32_t> flatMaps(maps.begin(), maps.end());
-  table("__pim_dcc_map", flatMaps);
-  scalar("__pim_dcc_map_count", (int32_t)flatMaps.size());
-  scalar("__pim_dcc_decided", 1);
-  return success();
-}
-
-// The arguments whose loads feed `v`. This runs after scf-to-cf, so a loop's carried
-// value is a block argument fed by its predecessors' branch operands.
-static void loadArgsFeeding(Value v, llvm::SetVector<int64_t> &args,
-                            llvm::function_ref<int64_t(Operation *)> argOf) {
-  SmallVector<Value> work{v};
-  llvm::DenseSet<Value> seen;
-  while (!work.empty()) {
-    Value x = work.pop_back_val();
-    if (!seen.insert(x).second)
-      continue;
-    if (auto ba = dyn_cast<BlockArgument>(x)) {
-      Block *blk = ba.getOwner();
-      for (Block *pred : blk->getPredecessors())
-        if (auto br = dyn_cast<BranchOpInterface>(pred->getTerminator()))
-          for (unsigned s = 0; s < br->getNumSuccessors(); ++s)
-            if (br->getSuccessor(s) == blk)
-              if (Value in = br.getSuccessorOperands(s)[ba.getArgNumber()])
-                work.push_back(in);
-      continue;
-    }
-    Operation *def = x.getDefiningOp();
-    if (auto ld = dyn_cast<triton::LoadOp>(def)) {
-      if (int64_t a = argOf(ld); a >= 0)
-        args.insert(a);
-      continue;
-    }
-    for (Value o : def->getOperands())
-      work.push_back(o);
-  }
-}
-
-// DCC's return stage sized from the input (im.dcc_return_from_input): a store of partials
-// folded across a column's lanes, whose value is fed by the loads of one other argument,
-// returns as many columns per bank as that input spans, as their RED does. [store_arg,
-// source_arg] pairs. Partials fed by two arguments, VA -> RED summing y + b, are not stated,
-// and a reduction of z read back after the kernel stored it is.
-static void emitDccReturnFrom(ModuleOp mod) {
-  if (!mod->hasAttr("im.dcc_return_from_input"))
-    return;
-  auto field = [](Operation *op, StringRef name, int64_t dflt) {
-    auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
-    auto v = res ? res.getAs<IntegerAttr>(name) : IntegerAttr();
-    return v ? v.getInt() : dflt;
-  };
-  SmallVector<int32_t> flat;
-  mod.walk([&](triton::StoreOp st) {
-    int64_t arg = field(st, "operand_arg", -1);
-    if (arg < 0 || field(st, "live_split", 1) <= 1)
-      return;
-    llvm::SetVector<int64_t> fed;
-    loadArgsFeeding(st.getValue(), fed,
-                    [&](Operation *op) { return field(op, "operand_arg", -1); });
-    fed.remove(arg);
-    if (fed.size() != 1)
-      return;
-    flat.push_back((int32_t)arg);
-    flat.push_back((int32_t)fed.front());
-  });
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  if (!flat.empty()) {
-    auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-    auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-    LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
-                           "__pim_dcc_return_from",
-                           DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
-  }
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_dcc_return_from_count",
-                         b.getI32IntegerAttr((int32_t)(flat.size() / 2)));
-}
-
-// OptiPIM's codegen_new conventions for the kernel's one contraction (im.optipim_conv):
-// the role their tensor index fixes for each operand, Inputs1 written over the bus,
-// Inputs2/Filters bank-read, Outputs read back, and the product's elements per lane,
-// which only the harness records, as compiler_cells. Their roles are positional, so ours
-// are too: the product's first factor is the input and its second the weight.
-static LogicalResult emitOptiPimConv(ModuleOp mod) {
-  if (!mod->hasAttr("im.optipim_conv"))
-    return success();
-  auto argOf = [](Operation *op, Value ptr) -> int64_t {
-    if (auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency")))
-      if (auto a = res.getAs<IntegerAttr>("operand_arg"); a && a.getInt() >= 0)
-        return a.getInt();
-    for (Value p = ptr;;) {
-      if (auto ba = dyn_cast<BlockArgument>(p))
-        return isa<triton::FuncOp>(ba.getOwner()->getParentOp()) ? ba.getArgNumber() : -1;
-      Operation *d = p.getDefiningOp();
-      if (!d)
-        return -1;
-      if (auto a = dyn_cast<triton::AddPtrOp>(d))
-        p = a.getPtr();
-      else if (isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp,
-                   triton::ReshapeOp, triton::gpu::ConvertLayoutOp>(d))
-        p = d->getOperand(0);
-      else
-        return -1;
-    }
-  };
-  auto loadOf = [](Value v) -> triton::LoadOp {
-    while (Operation *d = v.getDefiningOp()) {
-      if (auto ld = dyn_cast<triton::LoadOp>(d))
-        return ld;
-      if (!isa<triton::BroadcastOp, triton::ExpandDimsOp, triton::ReshapeOp,
-               triton::gpu::ConvertLayoutOp, arith::ExtFOp, arith::TruncFOp>(d))
-        return {};
-      v = d->getOperand(0);
-    }
-    return {};
-  };
-  SmallVector<std::pair<triton::ReduceOp, arith::MulFOp>> found;
-  mod.walk([&](triton::ReduceOp red) {
-    if (red.getNumOperands() != 1)
-      return;
-    Value src = red.getOperands()[0];
-    while (auto cvt = src.getDefiningOp<triton::gpu::ConvertLayoutOp>())
-      src = cvt.getSrc();
-    bool adds = false;
-    red.getCombineOp().walk([&](Operation *op) {
-      adds |= isa<arith::AddFOp>(op);
-    });
-    if (auto mul = src.getDefiningOp<arith::MulFOp>(); mul && adds)
-      found.push_back({red, mul});
-  });
-  if (found.size() != 1)
-    return mod.emitError() << "im.optipim_conv needs exactly one contraction, a sum over a "
-                              "product, and this kernel has " << found.size();
-  auto [red, mul] = found.front();
-  triton::LoadOp in = loadOf(mul.getLhs()), wt = loadOf(mul.getRhs());
-  int64_t inArg = in ? argOf(in, in.getPtr()) : -1;
-  int64_t wtArg = wt ? argOf(wt, wt.getPtr()) : -1;
-  int64_t outArg = -1;
-  SmallVector<Value> work{red.getResult()[0]};
-  llvm::SmallPtrSet<Operation *, 16> seen;
-  while (!work.empty()) {
-    Value v = work.pop_back_val();
-    for (Operation *u : v.getUsers()) {
-      if (!seen.insert(u).second)
-        continue;
-      if (auto st = dyn_cast<triton::StoreOp>(u)) {
-        if (st.getValue() == v)
-          outArg = argOf(st, st.getPtr());
-        continue;
-      }
-      if (u->getNumResults() == 1 && isa<RankedTensorType>(u->getResult(0).getType()))
-        work.push_back(u->getResult(0));
-    }
-  }
-  if (inArg < 0 || wtArg < 0 || outArg < 0 || inArg == wtArg)
-    return mod.emitError() << "im.optipim_conv cannot name the contraction's operands: "
-                           << "input arg " << inArg << ", weight arg " << wtArg
-                           << ", output arg " << outArg;
-  // Iteration points per lane: the product's elements in one lane, less those a padding
-  // mask switches off. A conjunct `make_range < constant` on a dimension the lane holds
-  // whole bounds that dimension; masks on lane dimensions only idle whole lanes.
-  auto prodTy = cast<RankedTensorType>(mul.getType());
-  auto blocked = dyn_cast<triton::gpu::BlockedEncodingAttr>(prodTy.getEncoding());
-  if (!blocked)
-    return mod.emitError() << "im.optipim_conv needs a blocked product layout";
-  SmallVector<int64_t> active(blocked.getSizePerThread().begin(),
-                              blocked.getSizePerThread().end());
-  auto tpw = blocked.getThreadsPerWarp();
-  LogicalResult counted = success();
-  auto bound = [&](triton::LoadOp ld) {
-    Value mask = ld.getMask();
-    auto ldTy = dyn_cast<RankedTensorType>(ld.getType());
-    if (!mask || !ldTy)
-      return;
-    if (ldTy.getRank() != prodTy.getRank()) {
-      counted = ld.emitError() << "im.optipim_conv counts a masked operand only when it is "
-                                  "loaded at the product's rank";
-      return;
-    }
-    for (auto t : triton::im::contraction::maskTerms(mask, ldTy.getRank())) {
-      if (t.opaque || t.constant)
-        continue; // a constant conjunct, or a block argument it cannot see into
-      if (t.dim >= 0 && tpw[t.dim] != 1)
-        continue; // on a lane axis: idles whole lanes, counts nothing in one
-      if (t.dim < 0 || !t.pure || !t.bound ||
-          t.cmp.getPredicate() != arith::CmpIPredicate::slt) {
-        counted = ld.emitError() << "im.optipim_conv cannot count a mask term on a "
-                                    "dimension the lane holds whole; write it as "
-                                    "`range < extent` on that dimension";
-        return;
-      }
-      active[t.dim] = std::min<int64_t>(active[t.dim], std::max<int64_t>(*t.bound, 0));
-    }
-  };
-  bound(in);
-  bound(wt);
-  if (failed(counted))
-    return failure();
-  int64_t cells64 = 1;
-  for (int64_t v : active)
-    cells64 *= v;
-  int32_t cells = (int32_t)cells64;
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  Location loc = mod.getLoc();
-  Type i32 = b.getI32Type();
-  SmallVector<int32_t> flat{(int32_t)inArg, 1, (int32_t)wtArg, 2, (int32_t)outArg, 3};
-  auto arrTy = LLVM::LLVMArrayType::get(i32, flat.size());
-  auto dataTy = RankedTensorType::get({(int64_t)flat.size()}, i32);
-  LLVM::GlobalOp::create(b, loc, arrTy, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_role",
-                         DenseElementsAttr::get(dataTy, ArrayRef<int32_t>(flat)));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_role_count", b.getI32IntegerAttr(3));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_cells", b.getI32IntegerAttr(cells));
-  LLVM::GlobalOp::create(b, loc, i32, /*isConstant=*/true, LLVM::Linkage::External,
-                         "__pim_opt_decided", b.getI32IntegerAttr(1));
-  return success();
-}
-
-// Banks are lanes, and a bank cannot read another bank's registers, so the target's shuffles
-// return their input (TargetInfo.cpp). Anything that would move a value between lanes then
-// lowers to a wrong value with no error: a reduce with banks on its axis adds each lane to
-// itself once per lane bit, and a conversion that moves data across lanes keeps the lane's
-// own value. A partitioned tensor whose layout copies it across lanes is two banks reading
-// or writing one element. Each is refused here, on the layouts the lowering will use.
-static LogicalResult refuseCrossBank(ModuleOp mod) {
-  MLIRContext *ctx = mod.getContext();
-  auto lane = StringAttr::get(ctx, "lane"), warp = StringAttr::get(ctx, "warp");
-  bool bad = false;
-  auto banksOn = [&](const triton::LinearLayout &ll, unsigned axis) {
-    int64_t n = 1;
-    for (StringAttr dim : {lane, warp})
-      if (ll.hasInDim(dim))
-        for (const auto &basis : ll.getBases().lookup(dim))
-          if (basis[axis] != 0)
-            n *= 2;
-    return n;
-  };
-  mod.walk([&](Operation *op) {
-    if (auto red = dyn_cast<triton::ReduceOp>(op)) {
-      auto ty = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
-      if (!ty || !ty.getEncoding())
-        return;
-      if (int64_t n = banksOn(triton::gpu::toLinearLayout(ty), red.getAxis()); n > 1) {
-        red.emitError() << "this reduce runs over axis " << red.getAxis() << ", which the "
-                        << "bank placement spreads over " << n << " banks, and a bank cannot "
-                        << "read another bank's data. Reduce within a bank and combine the "
-                        << "partials in a second kernel.";
-        bad = true;
-      }
-    } else if (auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
-      auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
-      auto dstTy = dyn_cast<RankedTensorType>(cvt.getType());
-      if (!srcTy || !dstTy || !srcTy.getEncoding() || !dstTy.getEncoding())
-        return;
-      triton::LinearLayout c = minimalCvtLayout(srcTy, dstTy);
-      if (c.hasInDim(lane) || c.hasInDim(warp)) {
-        cvt.emitError() << "this layout conversion moves values between banks, which no "
-                        << "bank can do. The lane placement upstream of it is not one the "
-                        << "target can run.";
-        bad = true;
-      }
-    } else if (isa<triton::LoadOp, triton::StoreOp>(op)) {
-      auto res = dyn_cast_or_null<DictionaryAttr>(op->getDiscardableAttr("im.residency"));
-      auto br = res ? res.getAs<IntegerAttr>("bank_replicated") : IntegerAttr();
-      Value v = isa<triton::LoadOp>(op) ? op->getResult(0) : op->getOperand(1);
-      auto ty = dyn_cast<RankedTensorType>(v.getType());
-      if (!br || br.getInt() != 0 || !ty || !ty.getEncoding())
-        return;
-      triton::LinearLayout ll = triton::gpu::toLinearLayout(ty);
-      if (!ll.hasInDim(lane))
-        return;
-      for (const auto &basis : ll.getBases().lookup(lane))
-        if (llvm::all_of(basis, [](int32_t x) { return x == 0; })) {
-          op->emitError() << "this tensor is partitioned across banks, but its layout puts "
-                          << "the same elements in two banks.";
-          bad = true;
-          return;
-        }
-    }
-  });
-  return failure(bad);
-}
-
-// --------------------------------------------------------------------------
 // Pass implementation
 // --------------------------------------------------------------------------
 
@@ -1389,16 +696,8 @@ struct ConvertTritonIMToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    if (failed(refuseCrossBank(mod)))
-      return signalPassFailure();
-
     // Before conversion: it drops the discardable im.residency attrs.
-    emitPimLayoutTable(mod);
-    emitDccTileMac(mod);
-    if (failed(emitDccAccGrf(mod)))
-      return signalPassFailure();
-    emitDccReturnFrom(mod);
-    if (failed(emitOptiPimConv(mod)))
+    if (failed(triton::im::emitArtifact(mod)))
       return signalPassFailure();
 
     triton::im::TargetInfo targetInfo;
@@ -1453,18 +752,12 @@ struct ConvertTritonIMToLLVM
 
     triton::populateElementwiseOpToLLVMPatterns(
         typeConverter, patterns, axisInfoAnalysis, targetInfo, benefit);
-    // FLOAT ARITHMETIC. The shared populate above registers the integer ops
-    // (AddI/MulI/SubI/DivSI...) and some float ops (MaxNumF/MinNumF/RemF/UIToFP)
-    // but NOT AddF/SubF/MulF/DivF/NegF or the float width casts. Every vendor
-    // backend adds those itself (see nvidia ElementwiseOpToLLVM.cpp:814-830).
-    // Without them arith.mulf falls through to the benefit-1
-    // populateArithToLLVMConversionPatterns fallback below, which converts the
-    // tensor to a per-thread struct and emits ONE llvm.fmul on the whole struct,
-    // which the LLVM verifier rejects:
-    //   'llvm.fmul' op operand #0 must be floating point ... but got
-    //   '!llvm.struct<(f16, f16, ... x128)>'
-    // arith.muli never hit this because ElementwiseOpConversion catches it first
-    // at benefit 10. That asymmetry is why int32 kernels worked and fp16 did not.
+    // Float arithmetic. The shared populate above registers the integer ops
+    // and some float ops (MaxNumF/MinNumF/RemF/UIToFP) but not
+    // AddF/SubF/MulF/DivF/NegF or the float width casts, which every vendor
+    // backend adds itself. Without them a float op falls through to the
+    // benefit-1 populateArithToLLVMConversionPatterns fallback below, which
+    // emits one op on the whole per-thread struct and fails the LLVM verifier.
 #define IM_POPULATE_FP_OP(SRC_OP, DST_OP)                                      \
   patterns.add<mlir::triton::gpu::ElementwiseOpConversion<SRC_OP, DST_OP>>(    \
       typeConverter, axisInfoAnalysis, benefit)
@@ -1507,8 +800,11 @@ struct ConvertTritonIMToLLVM
     // IM-specific: lower tt.load / tt.store → vectorized LLVM ops.
     // Vector width is derived from AxisInfo dataflow analysis on the
     // pointer operand, matching the NVIDIA/AMD backends.
-    patterns.add<IMLoadOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-    patterns.add<IMStoreOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+    unsigned dqBits = (unsigned)triton::im::moduleDqBits(mod);
+    patterns.add<IMLoadOpConversion>(typeConverter, axisInfoAnalysis, dqBits,
+                                     benefit);
+    patterns.add<IMStoreOpConversion>(typeConverter, axisInfoAnalysis, dqBits,
+                                      benefit);
     // IM-specific: erase ttg.barrier (IM has no shared memory and
     // num_warps == 1, so cross-warp barriers are no-ops). Higher
     // priority than the shared-pattern BarrierOpConversion (which

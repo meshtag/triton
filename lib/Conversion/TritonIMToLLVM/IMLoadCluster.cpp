@@ -23,6 +23,8 @@
  * persistent kernel's tile loop is never touched, because im-tile-boundary marks one
  * dispatch per iteration of it.
  */
+#include "IMArtifact.h"
+#include "IMContraction.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -47,6 +49,7 @@ namespace im {
 } // namespace mlir
 
 using namespace mlir;
+using mlir::triton::im::contraction::baseArg;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
@@ -55,36 +58,6 @@ constexpr llvm::StringLiteral kGateAttr = "im.cluster_loads";
 /// Marks the body's own ops while this pass runs. Clones copy it and the index arithmetic
 /// the unroll adds has none, so that arithmetic is placed only as a dependency or last.
 constexpr llvm::StringLiteral kBodyAttr = "im.load-cluster.body";
-
-/// The kernel argument a pointer is derived from, or null.
-static Value baseArg(Value p) {
-  while (true) {
-    if (auto ba = dyn_cast<BlockArgument>(p))
-      return isa<triton::FuncOp>(ba.getOwner()->getParentOp()) ? p : Value();
-    Operation *d = p.getDefiningOp();
-    if (!d)
-      return {};
-    if (auto a = dyn_cast<triton::AddPtrOp>(d)) {
-      p = a.getPtr();
-      continue;
-    }
-    if (isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp,
-            triton::ReshapeOp, ttg::ConvertLayoutOp>(d)) {
-      p = d->getOperand(0);
-      continue;
-    }
-    return {};
-  }
-}
-
-static std::optional<int64_t> tripCount(scf::ForOp f) {
-  auto lb = getConstantIntValue(f.getLowerBound());
-  auto ub = getConstantIntValue(f.getUpperBound());
-  auto st = getConstantIntValue(f.getStep());
-  if (!lb || !ub || !st || *st <= 0 || *ub <= *lb)
-    return std::nullopt;
-  return (*ub - *lb + *st - 1) / *st;
-}
 
 /// Register-file entries one lane needs to hold a load's result, -1 if unknown.
 static int64_t entriesPerLane(triton::LoadOp ld, int64_t dqBits) {
@@ -227,9 +200,7 @@ struct IMLoadClusterPass
     if (!a || a.getInt() < 2 || !mod->hasAttr("im.noalias_args"))
       return;
     int64_t cap = a.getInt();
-    int64_t dqBits = 256;
-    if (auto q = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-      dqBits = q.getInt();
+    int64_t dqBits = triton::im::moduleDqBits(mod);
     bool persistent = mod->hasAttr("im.persistent");
     SmallVector<std::pair<scf::ForOp, int64_t>> loops;
     mod.walk([&](scf::ForOp f) {
@@ -243,7 +214,7 @@ struct IMLoadClusterPass
     MLIRContext *ctx = mod.getContext();
     int64_t strip = 0;
     for (auto [f, widest] : loops) {
-      auto trip = tripCount(f);
+      auto trip = triton::im::contraction::constTripCount(f);
       if (!trip)
         continue;
       int64_t g = std::min(cap / widest, *trip);

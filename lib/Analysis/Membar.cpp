@@ -117,9 +117,8 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
   // blockList with the entry virtual blocks in the function. Then, each
   // iteration scans until a terminator or region branch operation is found.
   // An external declaration has no body to analyze, and `getBlocks().front()`
-  // below would read off the end of an empty list. Reached as soon as a module
-  // carries a runtime-function declaration when this runs, which the IM backend
-  // does for its trace hooks (2026-09-10).
+  // below would read off the end of an empty list. The IM backend declares its
+  // trace hooks as such functions.
   if (funcOp.getBlocks().empty())
     return;
 

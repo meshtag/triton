@@ -39,10 +39,9 @@ class LoopInvariantCodeMotionPass
   /// and stops. `unknown` is set when it meets a pointer whose provenance it
   /// cannot name, such as a loop-carried block argument.
   ///
-  /// TRAP: `unknown` is a separate flag rather than a sentinel value in the set.
-  /// The obvious sentinel, ~0u, is DenseMapInfo<unsigned>'s EMPTY KEY, so
-  /// `DenseSet<unsigned>::contains(~0u)` reports it present in an empty set and
-  /// every query answers "unknown". That cost a build cycle to find.
+  /// `unknown` is a flag rather than a sentinel in the set, because the obvious
+  /// sentinel, ~0u, is DenseMapInfo<unsigned>'s empty key, which
+  /// `DenseSet<unsigned>::contains` reports present in an empty set.
   static void collectPtrArgs(Value v, DenseSet<unsigned> &out, bool &unknown,
                              DenseSet<Value> &seen, unsigned depth = 0) {
     if (depth > 64 || !isPtrLike(v.getType()) || !seen.insert(v).second)
@@ -75,13 +74,10 @@ class LoopInvariantCodeMotionPass
 
   /// True when no write inside the loop can touch what `load` reads.
   ///
-  /// WHY THIS EXISTS. The original guard asks whether the WHOLE loop is
-  /// read-only, so one store anywhere in the body pins every load inside it,
-  /// however unrelated. That is what stops a persistent matmul from hoisting its
-  /// invariant operand out of the tile loop: the loop stores the output tile, so
-  /// nothing moves, and the operand is re-read once per tile. Measured on
-  /// 128x3072x768: 4,718,592 operand writes against 1,179,648 for the gridded
-  /// form, four times worse, exactly the tile count per instance.
+  /// The upstream guard asks whether the whole loop is read-only, so one store
+  /// anywhere in the body pins every load inside it, however unrelated. A
+  /// persistent matmul's tile loop stores the output tile, so under that guard
+  /// its invariant operand is re-read once per tile.
   ///
   /// The narrower question is whether any store in the loop aliases THIS load.
   /// Here that is decidable: both sides resolve back to a kernel pointer

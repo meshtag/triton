@@ -3,6 +3,10 @@
 
 include "mlir/Pass/PassBase.td"
 
+// Names. A lane is one Triton thread (threads_per_warp = num_banks) and, on the device, one
+// of the paper's bank-PE pairs. Option and runtime names keep the word bank for a lane, as in
+// num_banks and __pim_get_bank_id().
+
 // Conversion pass: lowers TritonGPU IR → LLVM IR for In-Memory (IM)
 // processing targets such as HBM-PIM.  No GPU-specific constructs
 // (shared memory, warps, barriers) are emitted; the resulting LLVM IR
@@ -18,7 +22,9 @@ def ConvertTritonIMToLLVM
     memory, control-flow, SPMD, etc.) with an IM-specific TargetInfo
     that models bank-level SIMD parallelism: each PIM bank is one
     Triton "thread" (threads_per_warp = numBanks).  The bank index is
-    obtained at runtime via the extern function __pim_get_bank_id().
+    obtained at runtime via the extern function __pim_get_bank_id(). Before
+    converting, it states the tables the trace runtimes read as module globals
+    (IMArtifact.cpp).
   }];
 
   let dependentDialects = ["mlir::arith::ArithDialect",
@@ -59,7 +65,9 @@ def IMOperandResidencyLayout
     across the lanes, with an im.residency dictionary. Its fields include the reuse
     class, how many banks receive a copy (bank_replicated), the kernel argument read
     and the footprint of one program instance. im.schedule can override
-    bank_replicated.
+    bank_replicated. Under im.optipim_conv, im.optipim_roles and
+    im.optipim_hold_input it also stamps OptiPIM's conventions on the module as
+    im.opt_<x>, which the lowering states as globals.
   }];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
@@ -72,7 +80,7 @@ def IMTileBoundary : Pass<"im-tile-boundary", "mlir::ModuleOp"> {
   let summary = "Call __pim_tile_boundary() at each tile-loop back edge";
   let description = [{
     Only runs when the module carries `im.persistent`. Inserts a call to the
-    runtime's `__pim_tile_boundary()` at the end of the OUTERMOST `scf.for` body
+    runtime's `__pim_tile_boundary()` at the top of the OUTERMOST `scf.for` body
     in every function.
 
     Why it is needed. The trace runtime folds the N bank replays of one all-bank
@@ -159,10 +167,11 @@ def IMOptiPimMac : Pass<"im-optipim-mac", "mlir::ModuleOp"> {
     Only runs when the module carries `im.optipim_mac`. Their PE takes one word of
     `im.dq_bits` per MAC, n values of 16 bits, and has one register and no accumulator, so a
     lane runs ceil(cells / n) MACs per contraction, its cells being the product's elements
-    its operand masks leave on, lane terms included. Under `im.optipim_vertical`, their SIMDRAM,
-    a word is `im.dq_bits` bitlines each holding one value 16 rows tall. A loop of `__pim_opt_mac(j)` calls goes where the contraction
-    executes. The per-lane counts, the arranged slot of MAC j in step t and t as an affine
-    map of the program ids and the tile index are stated as globals.
+    its operand masks leave on, lane terms included. Under `im.optipim_vertical`, their
+    SIMDRAM, a word is `im.dq_bits` bitlines each holding one value 16 rows tall. A loop of
+    `__pim_opt_mac(j)` calls goes where the contraction executes. The per-lane counts, the
+    arranged slot of MAC j in step t and t as an affine map of the program ids and the tile
+    index are stamped on the module as im.opt_<x>, which the lowering states as globals.
   }];
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
                            "mlir::gpu::GPUDialect", "mlir::LLVM::LLVMDialect",

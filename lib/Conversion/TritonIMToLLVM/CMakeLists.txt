@@ -1,4 +1,5 @@
 add_triton_library(TritonIMToLLVM
+    IMArtifact.cpp
     IMOperandResidencyLayout.cpp
     IMLaneFold.cpp
     IMLoadCluster.cpp

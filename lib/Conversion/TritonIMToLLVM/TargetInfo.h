@@ -5,18 +5,16 @@
 
 namespace mlir::triton::im {
 
-/// TargetInfo for In-Memory (IM) processing architectures (e.g. HBM-PIM).
+/// TargetInfo for In-Memory (IM) processing architectures, HBM-PIM and SIMDRAM.
 ///
-/// HBM-PIM executes the same instruction across multiple PIM banks in a
-/// SIMD-like fashion.  Each bank is modeled as one Triton "thread"
-/// (threads_per_warp = numBanks, num_warps = 1).  Banks share no memory
-/// and need no barriers — they are lock-step.
+/// Each lane, one Triton thread (threads_per_warp = num_banks, num_warps = 1),
+/// is one of the paper's bank-PE pairs. The lanes run in lockstep and share no
+/// memory, so they need no barriers.
 ///
 /// The flat global address space (addrspace 0) is used throughout.
 class TargetInfo : public mlir::triton::TargetInfoBase {
-  /* Bank count deliberately absent: the lowering never branches on it. Banks
-     reach the backend as ttg.threads-per-warp and reach the runtime as
-     @__pim_lanes. A numBanks member here was write-only for a year. */
+  // No bank count, since the lowering never branches on it. Banks reach the
+  // backend as ttg.threads-per-warp and the runtime as @__pim_lanes.
   bool supportMaximumMinimum() const override;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;

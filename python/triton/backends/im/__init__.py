@@ -5,11 +5,12 @@ def IMTarget(arch: str = "hbm-pim", num_banks: int = 16) -> GPUTarget:
     """Create a compile target for the In-Memory (IM) backend.
 
     Args:
-        arch: Architecture identifier.  ``"hbm-pim"`` is the only one. SIMDRAM
-              kernels compile with it too, and the harness states that
-              machine's column width as the ``im_dq_bits`` option.
-        num_banks: Number of PIM lanes that execute in SIMD lock-step. The
-              harnesses always pass it (pass_ablation defaults to 32).
+        arch: Architecture identifier.  ``"hbm-pim"`` is the only one, and
+              SIMDRAM kernels compile for it too. The two devices differ only
+              in the column width the harness states as ``im_dq_bits``.
+        num_banks: Number of lanes, the paper's bank-PE pairs, that execute
+              in SIMD lock-step. The harnesses always pass it (pipeline
+              defaults to 32).
 
     Set ``TRITON_IM_DEBUG=1`` to dump the IR after every pass-pipeline stage
     (TTIR, TTGIR, LLIR) to ``im_debug/`` in the current working directory.

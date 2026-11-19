@@ -38,28 +38,14 @@ namespace {
 
 namespace ttg = mlir::triton::gpu;
 
-/// The order with the stated bank axis moved to the front. buildIMEncoding uses it only
-/// to tell whether that axis moves the lanes, since the explicit placement keeps the
-/// memory order. An axis below 0 or past the rank, or a rank-1 tensor, keeps the order.
-static SmallVector<unsigned> orderForBankAxis(ArrayRef<unsigned> curOrder,
-                                              int rank, int bankAxis) {
-  SmallVector<unsigned> order(curOrder.begin(), curOrder.end());
-  if (bankAxis < 0 || bankAxis >= rank || rank < 2)
-    return order;
-  // Fastest dim is order[0]. Move the requested axis there, keep the rest.
-  order.erase(std::find(order.begin(), order.end(), (unsigned)bankAxis));
-  order.insert(order.begin(), (unsigned)bankAxis);
-  return order;
-}
-
 /// Which axis of THIS tensor carries the banks: its first dim whose extent equals the
 /// output's extent along the chosen axis. -1 when the tile cannot host the banks, which
-/// runOnOperation reports once, or when the tensor has no such dim, and that tensor keeps
+/// chooseBankAxis reports once, or when the tensor has no such dim, and that tensor keeps
 /// its layout as the replicated operand.
 static int laneAxisFor(ArrayRef<int64_t> shape, int rank, int64_t bankExtent,
                        int threadsPerWarp) {
   if (bankExtent < threadsPerWarp)
-    return -1; // the tile cannot host the banks at all; the caller reports it once
+    return -1; // the tile cannot host the banks at all, which chooseBankAxis reports
   // The chosen dim is named by the OUTPUT's extent along it, because an index means
   // different things to [M,K], [K,N] and [M,K,N]. A tensor without that extent does not
   // carry the dim: it is the replicated operand and keeps whatever layout it had, which
@@ -137,8 +123,8 @@ static Attribute buildIMEncoding(RankedTensorType tensorType,
 
   SmallVector<unsigned> oldTPW(blocked.getThreadsPerWarp());
   SmallVector<unsigned> oldWPC(blocked.getWarpsPerCTA());
-  SmallVector<unsigned> order =
-      orderForBankAxis(blocked.getOrder(), rank, bankAxis);
+  // The memory order, which says which dim is contiguous, never where the banks are.
+  SmallVector<unsigned> order(blocked.getOrder());
   auto cgaLayout = blocked.getCGALayout();
 
   // Compute new sizePerThread: each bank (lane) owns a consecutive chunk.
@@ -151,10 +137,11 @@ static Attribute buildIMEncoding(RankedTensorType tensorType,
     newSizePerThread[d] = spt;
   }
 
-  // If nothing changed, skip. The order counts as a change: a bank-axis flip can
-  // leave sizePerThread identical while moving every lane to the other axis.
-  if (SmallVector<unsigned>(blocked.getSizePerThread()) == newSizePerThread &&
-      SmallVector<unsigned>(blocked.getOrder()) == order)
+  // If nothing changed, skip. A stated bank axis that is not the fastest dim counts as a
+  // change, since moving every lane there can leave sizePerThread as it was.
+  bool movesLanes = bankAxis >= 0 && bankAxis < rank && rank >= 2 &&
+                    order.front() != (unsigned)bankAxis;
+  if (SmallVector<unsigned>(blocked.getSizePerThread()) == newSizePerThread && !movesLanes)
     return {};
 
   if (bankAxis < 0 || rank < 2)
@@ -162,24 +149,13 @@ static Attribute buildIMEncoding(RankedTensorType tensorType,
                                          newSizePerThread, order, numWarps,
                                          threadsPerWarp, cgaLayout);
 
-  // Explicit per-dim lane placement. The shape-driven overload above distributes
-  // the lane count itself and always lands on the contiguous axis, so `order`
-  // alone never moves the banks -- flipping it left threadsPerWarp at [1,32] on
-  // every tile tried. This builder states the placement outright.
-  //
-  // It used to clamp the lane count to the pinned axis, which handed the verifier an
-  // 8-lane layout whenever that axis was short (measured on every matmul10 shape,
-  // both axes, 2026-09-13). A short axis means the CHOICE is wrong, not the layout,
-  // so say so here where the choice was made.
+  // Explicit per-dim lane placement. The shape-driven overload above distributes the lane
+  // count itself and always lands on the contiguous axis, so this states the placement
+  // outright. An axis too short for the banks is refused where the choice is made
+  // (chooseBankAxis), since the choice is what is wrong, not the layout.
   int laneAxis = laneAxisFor(shape, rank, bankExtent, threadsPerWarp);
   if (laneAxis < 0)
     return {}; // does not carry the chosen dim, or the tile cannot host the banks
-  // KEEP THE MEMORY ORDER. `order` states which dim is contiguous, not where the banks
-  // are, and the lane placement below says that outright. Moving the bank axis to the
-  // front declared a row-major tensor column-major and broke the index machinery in the
-  // shared lowering. The original flip existed only because the shape-driven overload
-  // had no other way to move the lanes.
-  order = SmallVector<unsigned>(blocked.getOrder());
   SmallVector<unsigned> tpw(rank, 1), wpc(rank, 1), spt(rank, 1);
   tpw[laneAxis] = (unsigned)threadsPerWarp;
   wpc[order.front() == (unsigned)laneAxis ? (rank - 1) : 0] = numWarps;
@@ -188,6 +164,221 @@ static Attribute buildIMEncoding(RankedTensorType tensorType,
                                                               (tpw[d] * wpc[d]))));
   return ttg::BlockedEncodingAttr::get(tensorType.getContext(), spt, tpw, wpc,
                                        order, cgaLayout);
+}
+
+/// Where the banks go: lane counts per tensor axis (`split`), or one output axis that carries
+/// them all (`axis`, -1 to keep the upstream layout) with the output's extent along it.
+struct BankChoice {
+  SmallVector<int64_t> split;
+  int axis = -1;
+  int64_t extent = 0;
+};
+
+/// The placement the module states or derives. Refuses a placement that puts banks on a
+/// reduced axis, since a bank cannot read another bank's data, and an axis the output tile
+/// is too short to hold the banks on.
+static FailureOr<BankChoice> chooseBankAxis(ModuleOp mod, int threadsPerWarp) {
+  BankChoice c;
+  // Per-axis lane counts. Product must be the bank count: every bank still gets
+  // exactly one lane, the split only says which axes they spread over.
+  if (auto a = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_split")) {
+    c.split.assign(a.asArrayRef().begin(), a.asArrayRef().end());
+    int64_t prod = 1;
+    for (int64_t v : c.split) {
+      if (v < 1)
+        return mod.emitError() << "im.bank_split entries must be >= 1";
+      prod *= v;
+    }
+    if (prod != threadsPerWarp)
+      return mod.emitError() << "im.bank_split product is " << prod
+                             << " but this kernel has " << threadsPerWarp
+                             << " banks. Banks-as-threads gives each bank "
+                             << "exactly one lane, so the split must account for all of them.";
+    if (mod->hasAttr("im.bank_axis"))
+      return mod.emitError() << "im.bank_split and im.bank_axis both set; the split already "
+                             << "says where every lane goes. Drop im.bank_axis.";
+  }
+
+  // Which axis carries the banks, stated by the im_bank_axis compile option. Absent
+  // keeps the upstream choice.
+  bool userPinnedBankAxis = false;
+  if (auto a = mod->getAttrOfType<IntegerAttr>("im.bank_axis")) {
+    userPinnedBankAxis = true;
+    c.axis = (int)a.getInt();
+    if (c.axis < 0)
+      return mod.emitError() << "im.bank_axis must be a non-negative tensor axis";
+  }
+  // A bank cannot exchange data with another bank, so a tt.reduce whose axis carries lanes
+  // needs a reduction across banks that the hardware cannot perform. Triton's default layout
+  // can put lanes on both axes of a 2-D tile, so the reduce axis is found here and kept free
+  // of lanes.
+  int reduceAxis = -1, reduceRank = 0;
+  int storeRankForReduce = 2;
+  mod.walk([&](triton::StoreOp st) {
+    if (auto tt = dyn_cast<RankedTensorType>(st.getValue().getType()))
+      storeRankForReduce = tt.getRank();
+  });
+  bool reduceAmbiguous = false;
+  mod.walk([&](triton::ReduceOp red) {
+    if (reduceAmbiguous || red.getOperands().empty())
+      return;
+    auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+    if (!opnd || opnd.getRank() < 2)
+      return;
+    int axis = (int)red.getAxis();
+    if (axis < 0 || axis >= opnd.getRank())
+      return;
+    if (reduceAxis >= 0 && reduceAxis != axis)
+      reduceAmbiguous = true;
+    else {
+      reduceAxis = axis;
+      reduceRank = opnd.getRank();
+    }
+  });
+
+  // A split over an axis something reduces IS the cross-bank reduction. Refuse it
+  // here, naming the fix, rather than asserting in Casting.h three passes later.
+  if (!c.split.empty() && !reduceAmbiguous && reduceAxis >= 0 &&
+      reduceRank == (int)c.split.size() && c.split[reduceAxis] > 1)
+    return mod.emitError()
+           << "im.bank_split puts " << c.split[reduceAxis] << " banks on axis "
+           << reduceAxis << ", which a tt.reduce in this kernel reduces over. A bank "
+           << "cannot read another bank's data, so that reduction cannot be expressed. "
+           << "Split the kernel: write the partial sums out, and reduce them in a second "
+           << "kernel whose lanes sit on a different axis.";
+
+  if (userPinnedBankAxis) {
+    // THE USER'S CHOICE WINS, but a choice that cannot lower must say so here
+    // rather than through an assertion 3 passes later. This is the same
+    // silent-failure class the im.schedule validator exists to prevent.
+    // The two indices are compared only when they live in the same space. The bank axis
+    // numbers the output's axes, and a rank-3 reduce numbers [M,K,N], so when the ranks
+    // differ the reduced dim is gone from the output and cannot be chosen.
+    if (!reduceAmbiguous && reduceAxis >= 0 && reduceRank == storeRankForReduce &&
+        c.axis == reduceAxis)
+      return mod.emitError()
+             << "im.bank_axis=" << c.axis << " is the reduction axis of a tt.reduce "
+             << "in this kernel. Banks-as-threads puts one lane per bank, so that "
+             << "would require a cross-bank reduction, which PIM hardware cannot do "
+             << "and the lowering cannot express. Use axis "
+             << (1 - reduceAxis) << ", or drop im.bank_axis and let the pass derive it.";
+  } else if (!reduceAmbiguous && reduceAxis >= 0 && reduceRank == 2) {
+    // Two reduces that disagree would make deriving a guess, so they keep the
+    // upstream choice. Otherwise banks go on the non-reduced axis (rank 2 only).
+    c.axis = 1 - reduceAxis;
+  }
+
+  // Nothing stated and no rank-2 reduce decided: banks on the output's outermost axis
+  // when every store can hold them, so the contiguous axis stays inside a lane and its
+  // loads vectorize. Other tensors take the lanes on the first dim of that extent, so
+  // the rule declines when that dim is a higher-rank reduce's axis. Opt-in, since every
+  // other path keeps the upstream layout.
+  if (c.axis < 0 && c.split.empty() && !reduceAmbiguous &&
+      mod->hasAttr("im.derive_bank_axis")) {
+    bool any = false, all = true;
+    int64_t extent = 0;
+    mod.walk([&](triton::StoreOp st) {
+      auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
+      if (!tt || tt.getRank() < 2)
+        return;
+      any = true;
+      extent = tt.getShape()[0];
+      all &= tt.getShape()[0] >= threadsPerWarp;
+    });
+    bool hitsReduce = false;
+    mod.walk([&](triton::ReduceOp red) {
+      auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
+      if (!opnd || opnd.getRank() < 3)
+        return;
+      auto shp = opnd.getShape();
+      for (int d = 0; d < opnd.getRank(); ++d)
+        if (shp[d] == extent) {
+          hitsReduce |= d == (int)red.getAxis();
+          break;
+        }
+    });
+    if (any && all && !hitsReduce)
+      c.axis = 0;
+  }
+
+  // The choice is an index into the output's dims. Its extent there names the lane dim
+  // of every other tensor (laneAxisFor), because one index means the row dim in [M,K]
+  // and the reduction in [K,N].
+  triton::StoreOp anchorStore;
+  mod.walk([&](triton::StoreOp st) {
+    auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
+    if (!tt)
+      return;
+    anchorStore = st;
+    if (c.axis >= 0 && c.axis < tt.getRank())
+      c.extent = tt.getShape()[c.axis];
+  });
+  if (c.axis >= 0 && c.extent > 0 && c.extent < threadsPerWarp)
+    // The one genuinely illegal case, reported where the choice was made rather than
+    // by the verifier three passes later. The tile, not the layout, is what is wrong.
+    return anchorStore->emitError()
+           << "im.bank_axis=" << c.axis << " selects an output dimension of extent "
+           << c.extent << ", below the " << threadsPerWarp << " banks. That axis cannot "
+           << "carry the banks whatever layout is built; size the tile so it reaches the "
+           << "bank count, or choose the other axis.";
+  return c;
+}
+
+/// Rebuilds every distinct blocked encoding in the module for `c`, the encodings of every
+/// value and block argument at once. A bank-axis flip is a whole-kernel substitution: a
+/// tensor left on its old encoding, such as a loop-carried accumulator or a slice of the
+/// rank-3 product, would need a lane transpose to meet the new one, which on PIM is
+/// cross-bank data movement.
+static void substituteEncodings(ModuleOp mod, const BankChoice &c, int threadsPerWarp,
+                                int numWarps) {
+  llvm::MapVector<Attribute, Attribute> encSubst;
+  auto note = [&](Type ty) {
+    auto tt = dyn_cast<RankedTensorType>(ty);
+    if (!tt || tt.getRank() < 2)
+      return;
+    auto be = dyn_cast_or_null<ttg::BlockedEncodingAttr>(tt.getEncoding());
+    if (!be || encSubst.count(be))
+      return;
+    auto rebuilt = dyn_cast_or_null<ttg::BlockedEncodingAttr>(
+        buildIMEncoding(tt, threadsPerWarp, numWarps, c.axis, c.extent, c.split));
+    if (rebuilt && rebuilt != be)
+      encSubst.insert({be, rebuilt});
+  };
+  mod.walk([&](Operation *op) {
+    for (Value v : op->getOperands())
+      note(v.getType());
+    for (Value v : op->getResults())
+      note(v.getType());
+    for (Region &r : op->getRegions())
+      for (Block &b : r)
+        for (BlockArgument a : b.getArguments())
+          note(a.getType());
+  });
+  if (encSubst.empty())
+    return;
+  AttrTypeReplacer replacer;
+  replacer.addReplacement(
+      [&](ttg::BlockedEncodingAttr a) -> std::optional<Attribute> {
+        auto it = encSubst.find(a);
+        if (it != encSubst.end())
+          return it->second;
+        return std::nullopt;
+      });
+  replacer.recursivelyReplaceElementsIn(mod, /*replaceAttrs=*/true,
+                                        /*replaceLocs=*/false,
+                                        /*replaceTypes=*/true);
+  // A dense constant carries its own shaped type. The replacer rewrites the
+  // result type but leaves the attribute's, so the two disagree and the
+  // verifier rejects it. Rebuild the attribute against the result.
+  mod.walk([&](arith::ConstantOp k) {
+    auto rt = dyn_cast<RankedTensorType>(k.getType());
+    auto de = dyn_cast<DenseElementsAttr>(k.getValue());
+    if (!rt || !de || de.getType() == rt)
+      return;
+    if (!de.isSplat())
+      return; // non-splat would need element reordering, not just retyping
+    k.setValueAttr(DenseElementsAttr::get(rt, de.getSplatValue<Attribute>()));
+  });
 }
 
 // -----------------------------------------------------------------------
@@ -200,247 +391,15 @@ struct RewriteIMLayoutPass
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-
-    // Read module-level attributes.
     int threadsPerWarp =
         ttg::TritonGPUDialect::getThreadsPerWarp(mod); // = num_banks
     int numWarps = ttg::lookupNumWarps(mod.getOperation());
 
-    // Per-axis lane counts. Product must be the bank count: every bank still gets
-    // exactly one lane, the split only says which axes they spread over.
-    SmallVector<int64_t> bankSplit;
-    if (auto a = mod->getAttrOfType<DenseI64ArrayAttr>("im.bank_split")) {
-      bankSplit.assign(a.asArrayRef().begin(), a.asArrayRef().end());
-      int64_t prod = 1;
-      for (int64_t v : bankSplit) {
-        if (v < 1) {
-          mod.emitError() << "im.bank_split entries must be >= 1";
-          return signalPassFailure();
-        }
-        prod *= v;
-      }
-      if (prod != threadsPerWarp) {
-        mod.emitError() << "im.bank_split product is " << prod << " but this kernel has "
-                        << threadsPerWarp << " banks. Banks-as-threads gives each bank "
-                        << "exactly one lane, so the split must account for all of them.";
-        return signalPassFailure();
-      }
-      if (mod->hasAttr("im.bank_axis")) {
-        mod.emitError() << "im.bank_split and im.bank_axis both set; the split already "
-                        << "says where every lane goes. Drop im.bank_axis.";
-        return signalPassFailure();
-      }
-    }
-
-    // Which axis carries the banks, stated by the im_bank_axis compile option. Absent
-    // keeps the upstream choice.
-    int bankAxis = -1;
-    bool userPinnedBankAxis = false;
-    if (auto a = mod->getAttrOfType<IntegerAttr>("im.bank_axis")) {
-      userPinnedBankAxis = true;
-      bankAxis = (int)a.getInt();
-      if (bankAxis < 0) {
-        mod.emitError() << "im.bank_axis must be a non-negative tensor axis";
-        return signalPassFailure();
-      }
-    }
-    // REDUCE AXIS. Banks-as-threads means one lane per bank, and a PIM bank cannot
-    // exchange data with another bank. So a tt.reduce whose axis carries lanes would
-    // need a cross-lane reduction the hardware cannot perform, and the lowering does
-    // not fail cleanly: it asserts with "dyn_cast on a non-existent value"
-    // (Casting.h:656).
-    //
-    // Triton's default layout happily splits lanes across both axes. A blocked
-    // matvec, tile (BLOCK, PACK_K), gets threadsPerWarp=[4,8], putting 8 lanes on the
-    // reduction, which is why matvec_kpacked_kernel and make_2d_tiled_matvec_config
-    // never compiled. A comment in the harness asserted this pass already handled it;
-    // it did not. Written 2026-09-09.
-    int reduceAxis = -1, reduceRank = 0;
-    int storeRankForReduce = 2;
-    mod.walk([&](triton::StoreOp st) {
-      if (auto tt = dyn_cast<RankedTensorType>(st.getValue().getType()))
-        storeRankForReduce = tt.getRank();
-    });
-    bool reduceAmbiguous = false;
-    mod.walk([&](triton::ReduceOp red) {
-      if (reduceAmbiguous || red.getOperands().empty())
-        return;
-      auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
-      if (!opnd || opnd.getRank() < 2)
-        return;
-      int axis = (int)red.getAxis();
-      if (axis < 0 || axis >= opnd.getRank())
-        return;
-      if (reduceAxis >= 0 && reduceAxis != axis)
-        reduceAmbiguous = true;
-      else {
-        reduceAxis = axis;
-        reduceRank = opnd.getRank();
-      }
-    });
-
-    // A split over an axis something reduces IS the cross-bank reduction. Refuse it
-    // here, naming the fix, rather than asserting in Casting.h three passes later.
-    if (!bankSplit.empty() && !reduceAmbiguous && reduceAxis >= 0 &&
-        reduceRank == (int)bankSplit.size() && bankSplit[reduceAxis] > 1) {
-      mod.emitError()
-          << "im.bank_split puts " << bankSplit[reduceAxis] << " banks on axis "
-          << reduceAxis << ", which a tt.reduce in this kernel reduces over. A bank "
-          << "cannot read another bank's data, so that reduction cannot be expressed. "
-          << "Split the kernel: write the partial sums out, and reduce them in a second "
-          << "kernel whose lanes sit on a different axis.";
+    FailureOr<BankChoice> choice = chooseBankAxis(mod, threadsPerWarp);
+    if (failed(choice))
       return signalPassFailure();
-    }
-
-    if (userPinnedBankAxis) {
-      // THE USER'S CHOICE WINS, but a choice that cannot lower must say so here
-      // rather than through an assertion 3 passes later. This is the same
-      // silent-failure class the im.schedule validator exists to prevent.
-      // ONLY when the two indices live in the same space. bankAxis numbers the OUTPUT's
-      // axes; a rank-3 reduce numbers [M,K,N], so its axis 1 is K while the output's is N.
-      // Comparing them refused the correct default on every k-packed matmul. When the
-      // ranks differ the constraint is satisfied anyway, because the reduced dim is gone
-      // from the output and cannot be chosen.
-      if (!reduceAmbiguous && reduceAxis >= 0 && reduceRank == storeRankForReduce &&
-          bankAxis == reduceAxis) {
-        mod.emitError()
-            << "im.bank_axis=" << bankAxis << " is the reduction axis of a tt.reduce "
-            << "in this kernel. Banks-as-threads puts one lane per bank, so that "
-            << "would require a cross-bank reduction, which PIM hardware cannot do "
-            << "and the lowering cannot express. Use axis "
-            << (1 - reduceAxis) << ", or drop im.bank_axis and let the pass derive it.";
-        return signalPassFailure();
-      }
-    } else if (!reduceAmbiguous && reduceAxis >= 0 && reduceRank == 2) {
-      // Two reduces that disagree would make deriving a guess, so they keep the
-      // upstream choice. Otherwise banks go on the non-reduced axis (rank 2 only).
-      bankAxis = 1 - reduceAxis;
-    }
-
-    // Nothing stated and no rank-2 reduce decided: banks on the output's outermost axis
-    // when every store can hold them, so the contiguous axis stays inside a lane and its
-    // loads vectorize. Other tensors take the lanes on the first dim of that extent, so
-    // the rule declines when that dim is a higher-rank reduce's axis. Opt-in, because
-    // every other path was measured on the upstream layout.
-    if (bankAxis < 0 && bankSplit.empty() && !reduceAmbiguous &&
-        mod->hasAttr("im.derive_bank_axis")) {
-      bool any = false, all = true;
-      int64_t extent = 0;
-      mod.walk([&](triton::StoreOp st) {
-        auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
-        if (!tt || tt.getRank() < 2)
-          return;
-        any = true;
-        extent = tt.getShape()[0];
-        all &= tt.getShape()[0] >= threadsPerWarp;
-      });
-      bool hitsReduce = false;
-      mod.walk([&](triton::ReduceOp red) {
-        auto opnd = dyn_cast<RankedTensorType>(red.getOperands()[0].getType());
-        if (!opnd || opnd.getRank() < 3)
-          return;
-        auto shp = opnd.getShape();
-        for (int d = 0; d < opnd.getRank(); ++d)
-          if (shp[d] == extent) {
-            hitsReduce |= d == (int)red.getAxis();
-            break;
-          }
-      });
-      if (any && all && !hitsReduce)
-        bankAxis = 0;
-    }
-
-    // The choice is an index into the output's dims. Its extent there names the lane dim
-    // of every other tensor (laneAxisFor), because one index means the row dim in [M,K]
-    // and the reduction in [K,N].
-    int64_t bankExtent = 0;
-    triton::StoreOp anchorStore;
-    mod.walk([&](triton::StoreOp st) {
-      auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
-      if (!tt)
-        return;
-      anchorStore = st;
-      if (bankAxis >= 0 && bankAxis < tt.getRank())
-        bankExtent = tt.getShape()[bankAxis];
-    });
-    if (bankAxis >= 0 && bankExtent > 0 && bankExtent < threadsPerWarp) {
-      // The one genuinely illegal case, reported where the choice was made rather than
-      // by the verifier three passes later. The tile, not the layout, is what is wrong.
-      anchorStore->emitError()
-          << "im.bank_axis=" << bankAxis << " selects an output dimension of extent "
-          << bankExtent << ", below the " << threadsPerWarp << " banks. That axis cannot "
-          << "carry the banks whatever layout is built; size the tile so it reaches the "
-          << "bank count, or choose the other axis.";
-      return signalPassFailure();
-    }
-
-    // A bank-axis flip is a WHOLE-KERNEL substitution, not a per-op rewrite.
-    // Rewriting only the memory-op pointers leaves the loop-carried accumulator
-    // on the old encoding, and reconciling the two needs a lane transpose. On a
-    // GPU that materialises through shared memory; on PIM it is cross-bank data
-    // movement, which the hardware cannot do and the lowering asserts on.
-    if (bankAxis >= 0 || !bankSplit.empty()) {
-      // EVERY distinct encoding, not the first. The operand tiles are ttg.slice views of
-      // the rank-3 layout, so a kernel carries several, and replacing one left the module
-      // with lanes on N in [BM,BN] and on M in its slices at once. That mix asserts in
-      // Casting.h rather than failing, which is how it read as "bank axis is blocked".
-      // EVERY tensor, not only the ones behind a memory-access pointer. The rank-3
-      // product in a k-packed matmul is an arithmetic value, so a pointer-only walk left
-      // it on the old encoding while the store pointer moved. The reduce then produced
-      // the accumulator as a slice of the UNCONVERTED layout, giving two layouts for one
-      // [BM,BN] tile that disagreed about which dim holds the banks, and the lowering
-      // asked for a conversion between them that does not exist. Invisible while banks
-      // sat on N, because there the two already agreed.
-      llvm::MapVector<Attribute, Attribute> encSubst;
-      auto note = [&](Type ty) {
-        auto tt = dyn_cast<RankedTensorType>(ty);
-        if (!tt || tt.getRank() < 2)
-          return;
-        auto be = dyn_cast_or_null<ttg::BlockedEncodingAttr>(tt.getEncoding());
-        if (!be || encSubst.count(be))
-          return;
-        auto rebuilt = dyn_cast_or_null<ttg::BlockedEncodingAttr>(
-            buildIMEncoding(tt, threadsPerWarp, numWarps, bankAxis, bankExtent,
-                            bankSplit));
-        if (rebuilt && rebuilt != be)
-          encSubst.insert({be, rebuilt});
-      };
-      mod.walk([&](Operation *op) {
-        for (Value v : op->getOperands())
-          note(v.getType());
-        for (Value v : op->getResults())
-          note(v.getType());
-        for (Region &r : op->getRegions())
-          for (Block &b : r)
-            for (BlockArgument a : b.getArguments())
-              note(a.getType());
-      });
-      if (!encSubst.empty()) {
-        AttrTypeReplacer replacer;
-        replacer.addReplacement(
-            [&](ttg::BlockedEncodingAttr a) -> std::optional<Attribute> {
-              auto it = encSubst.find(a);
-              if (it != encSubst.end())
-                return it->second;
-              return std::nullopt;
-            });
-        replacer.recursivelyReplaceElementsIn(mod, /*replaceAttrs=*/true,
-                                              /*replaceLocs=*/false,
-                                              /*replaceTypes=*/true);
-        // A dense constant carries its own shaped type. The replacer rewrites the
-        // result type but leaves the attribute's, so the two disagree and the
-        // verifier rejects it. Rebuild the attribute against the result.
-        mod.walk([&](arith::ConstantOp c) {
-          auto rt = dyn_cast<RankedTensorType>(c.getType());
-          auto de = dyn_cast<DenseElementsAttr>(c.getValue());
-          if (!rt || !de || de.getType() == rt)
-            return;
-          if (!de.isSplat())
-            return; // non-splat would need element reordering, not just retyping
-          c.setValueAttr(DenseElementsAttr::get(rt, de.getSplatValue<Attribute>()));
-        });
-      }
-    }
+    if (choice->axis >= 0 || !choice->split.empty())
+      substituteEncodings(mod, *choice, threadsPerWarp, numWarps);
 
     // Walk all memory ops and compute the IM-optimal encoding.
     llvm::MapVector<Operation *, Attribute> layoutMap;
@@ -454,7 +413,7 @@ struct RewriteIMLayoutPass
         return;
 
       Attribute newEnc = buildIMEncoding(tensorType, threadsPerWarp, numWarps,
-                                         bankAxis, bankExtent, bankSplit);
+                                         choice->axis, choice->extent, choice->split);
       if (newEnc)
         layoutMap[op] = newEnc;
     });

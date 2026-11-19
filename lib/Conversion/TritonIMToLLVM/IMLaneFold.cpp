@@ -12,6 +12,7 @@
  * runtime defines `__pim_trace_fold`. Must run before scf-to-cf, like im-tile-boundary,
  * so a fold inside a loop is marked once per iteration.
  */
+#include "IMArtifact.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
@@ -41,25 +42,12 @@ constexpr llvm::StringLiteral kPriceAttr = "im.price_folds";
 /// runtime will be told.
 constexpr llvm::StringLiteral kMarkedAttr = "im.lane-fold";
 
-static LLVM::LLVMFuncOp getOrDeclareFoldFn(ModuleOp mod) {
-  if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(kFoldFn))
-    return fn;
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  auto i64 = IntegerType::get(mod.getContext(), 64);
-  auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()),
-                                          {i64, i64}, /*isVarArg=*/false);
-  return LLVM::LLVMFuncOp::create(b, mod.getLoc(), kFoldFn, fnTy);
-}
-
 struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     if (!mod->hasAttr(kPriceAttr))
       return;
-    int64_t dqBits = 256;
-    if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-      dqBits = a.getInt();
+    int64_t dqBits = triton::im::moduleDqBits(mod);
 
     struct Mark {
       triton::ReduceOp op;
@@ -109,7 +97,10 @@ struct IMLaneFoldPass : public triton::im::impl::IMLaneFoldBase<IMLaneFoldPass> 
     if (marks.empty())
       return;
 
-    LLVM::LLVMFuncOp fn = getOrDeclareFoldFn(mod);
+    auto i64 = IntegerType::get(mod.getContext(), 64);
+    LLVM::LLVMFuncOp fn = triton::im::getOrDeclareRuntimeFn(
+        mod, kFoldFn,
+        LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()), {i64, i64}));
     for (Mark &m : marks) {
       OpBuilder b(m.op);
       b.setInsertionPointAfter(m.op);

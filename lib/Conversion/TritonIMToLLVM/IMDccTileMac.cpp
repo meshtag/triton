@@ -15,6 +15,7 @@
  * addresses a MAC by, [head stride, reduce stride, reduce extent] in elements, read off the
  * load's pointer arithmetic, so the runtime can issue each tile at their address.
  */
+#include "IMArtifact.h"
 #include "IMContraction.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Pass/Pass.h"
@@ -101,20 +102,14 @@ struct IMDccTileMacPass : public triton::im::impl::IMDccTileMacBase<IMDccTileMac
     ModuleOp mod = getOperation();
     if (!mod->hasAttr(kGateAttr))
       return;
-    int64_t dqBits = 256;
-    if (auto a = mod->getAttrOfType<IntegerAttr>("im.dq_bits"))
-      dqBits = a.getInt();
+    int64_t dqBits = triton::im::moduleDqBits(mod);
 
     bool addressing = mod->hasAttr(kAddrGateAttr), refused = false;
     llvm::DenseMap<Operation *, SmallVector<int64_t>> geometry;
     llvm::DenseMap<Value, SmallVector<std::pair<triton::LoadOp, int64_t>>> picked;
     mod.walk([&](triton::ReduceOp red) {
-      if (red.getNumOperands() != 1)
-        return;
-      bool add = false;
-      red.getCombineOp().walk([&](arith::AddFOp) { add = true; });
-      auto mul = skipConvert(red.getOperands()[0]).getDefiningOp<arith::MulFOp>();
-      if (!add || !mul)
+      arith::MulFOp mul = sumOfProduct(red);
+      if (!mul)
         return;
       for (int side = 0; side < 2; ++side) {
         auto ld = skipConvert(mul->getOperand(side)).getDefiningOp<triton::LoadOp>();

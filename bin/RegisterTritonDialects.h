@@ -147,6 +147,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   // IM passes
   mlir::triton::im::registerConvertTritonIMToLLVMPass();
   mlir::triton::im::registerRewriteIMLayoutPass();
+  mlir::triton::im::registerIMOperandResidencyLayoutPass();
   mlir::triton::im::registerIMTileBoundaryPass();
   mlir::triton::im::registerIMLaneFoldPass();
   mlir::triton::im::registerIMReluOpcodePass();

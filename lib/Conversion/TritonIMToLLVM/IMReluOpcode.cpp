@@ -17,6 +17,7 @@
  * Runs only when the module carries `im.dcc_relu_opcode`, because only the dcc-parity
  * runtime defines `__pim_trace_op`. Must run before scf-to-cf.
  */
+#include "IMArtifact.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
@@ -96,17 +97,6 @@ static bool storesRegRelu(triton::StoreOp st) {
   return x && !(x.getDefiningOp<triton::LoadOp>() && feedsReluOnly(x));
 }
 
-static LLVM::LLVMFuncOp getOrDeclareOpFn(ModuleOp mod) {
-  if (auto fn = mod.lookupSymbol<LLVM::LLVMFuncOp>(kOpFn))
-    return fn;
-  OpBuilder b(mod.getBodyRegion());
-  b.setInsertionPointToStart(mod.getBody());
-  auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()),
-                                          {IntegerType::get(mod.getContext(), 32)},
-                                          /*isVarArg=*/false);
-  return LLVM::LLVMFuncOp::create(b, mod.getLoc(), kOpFn, fnTy);
-}
-
 struct IMReluOpcodePass
     : public triton::im::impl::IMReluOpcodeBase<IMReluOpcodePass> {
   void runOnOperation() override {
@@ -125,7 +115,10 @@ struct IMReluOpcodePass
     });
     if (loads.empty() && stores.empty())
       return;
-    LLVM::LLVMFuncOp fn = getOrDeclareOpFn(mod);
+    LLVM::LLVMFuncOp fn = triton::im::getOrDeclareRuntimeFn(
+        mod, kOpFn,
+        LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(mod.getContext()),
+                                    {IntegerType::get(mod.getContext(), 32)}));
     auto call = [&](OpBuilder &b, Location loc, int32_t op) {
       Value v = arith::ConstantIntOp::create(b, loc, op, 32);
       LLVM::CallOp::create(b, loc, TypeRange{}, SymbolRefAttr::get(fn), ValueRange{v});

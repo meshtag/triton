@@ -1,7 +1,7 @@
 """
 IR post-processing for running an IM kernel's LLIR on the host.
 
-pass_ablation compiles the stripped module against a trace runtime. Banks are
+pipeline compiles the stripped module against a trace runtime. Banks are
 lanes of ``threads_per_warp = num_banks`` in BlockedEncodingAttr, each lane
 names itself through ``__pim_get_bank_id()``, and within a lane the
 ``sizePerThread`` elements become unrolled scalar ops.
