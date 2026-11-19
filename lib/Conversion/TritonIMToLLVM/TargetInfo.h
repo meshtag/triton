@@ -15,8 +15,8 @@ namespace mlir::triton::im {
 /// The flat global address space (addrspace 0) is used throughout.
 class TargetInfo : public mlir::triton::TargetInfoBase {
   /* Bank count deliberately absent: the lowering never branches on it. Banks
-     reach the backend as ttg.threads-per-warp and reach the runtime through
-     @__pim_layout_table. A numBanks member here was write-only for a year. */
+     reach the backend as ttg.threads-per-warp and reach the runtime as
+     @__pim_lanes. A numBanks member here was write-only for a year. */
   bool supportMaximumMinimum() const override;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;

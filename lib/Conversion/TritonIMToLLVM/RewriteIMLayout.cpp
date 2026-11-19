@@ -38,15 +38,9 @@ namespace {
 
 namespace ttg = mlir::triton::gpu;
 
-/// Which tensor axis carries the banks.
-///
-/// `order` decides it: the BlockedEncodingAttr::get overload below fills lanes along
-/// the fastest dim first, so order=[1,0] puts all threadsPerWarp banks on axis 1.
-/// That choice bounds operand amortisation, because every bank re-reads the operand
-/// and the emitted traffic measures MACs*banks/BLOCK[bankAxis]. With banks on N, a
-/// shape with small N can never amortise however the tile is picked.
-///
-/// -1 keeps whatever convert-triton-to-tritongpu chose.
+/// The order with the stated bank axis moved to the front. buildIMEncoding uses it only
+/// to tell whether that axis moves the lanes, since the explicit placement keeps the
+/// memory order. An axis below 0 or past the rank, or a rank-1 tensor, keeps the order.
 static SmallVector<unsigned> orderForBankAxis(ArrayRef<unsigned> curOrder,
                                               int rank, int bankAxis) {
   SmallVector<unsigned> order(curOrder.begin(), curOrder.end());
@@ -58,18 +52,10 @@ static SmallVector<unsigned> orderForBankAxis(ArrayRef<unsigned> curOrder,
   return order;
 }
 
-/// Which axis of THIS tensor carries the banks, given the choice stated on the output.
-///
-/// The choice cannot be a shared index. This kernel family loads A as [M,K], B as [K,N]
-/// and forms [M,K,N], so index 0 is the output's row dim in one tensor and the reduction
-/// in another. It is stated on the output's rank and mapped here by position: the output's
-/// first dim maps to this tensor's first, its last to this tensor's last.
-///
-/// A tensor that does not carry the chosen dim is the REPLICATED operand, and it still
-/// needs all its lanes somewhere. It gets its longest axis that can hold them, which is
-/// what the shape-driven default already did for the replicated operand and is why the
-/// existing layouts are valid. Returning -1 means no axis can, and the caller refuses
-/// rather than emitting an under-filled layout for the verifier to reject three passes on.
+/// Which axis of THIS tensor carries the banks: its first dim whose extent equals the
+/// output's extent along the chosen axis. -1 when the tile cannot host the banks, which
+/// runOnOperation reports once, or when the tensor has no such dim, and that tensor keeps
+/// its layout as the replicated operand.
 static int laneAxisFor(ArrayRef<int64_t> shape, int rank, int64_t bankExtent,
                        int threadsPerWarp) {
   if (bankExtent < threadsPerWarp)
@@ -364,17 +350,15 @@ struct RewriteIMLayoutPass
         bankAxis = 0;
     }
 
-    // The choice is stated on the OUTPUT's rank, so every other tensor's placement is
-    // mapped from it by position. Without this anchor the same index means the row dim
-    // in [M,K] and the reduction in [K,N].
-    int storeRank = 2;
+    // The choice is an index into the output's dims. Its extent there names the lane dim
+    // of every other tensor (laneAxisFor), because one index means the row dim in [M,K]
+    // and the reduction in [K,N].
     int64_t bankExtent = 0;
     triton::StoreOp anchorStore;
     mod.walk([&](triton::StoreOp st) {
       auto tt = dyn_cast<RankedTensorType>(st.getValue().getType());
       if (!tt)
         return;
-      storeRank = tt.getRank();
       anchorStore = st;
       if (bankAxis >= 0 && bankAxis < tt.getRank())
         bankExtent = tt.getShape()[bankAxis];

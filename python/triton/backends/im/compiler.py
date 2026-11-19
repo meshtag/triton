@@ -113,8 +113,8 @@ class IMOptions:
     # a step of its own. Off by default: other paths were measured with the prologue apart.
     im_tile_prologue_first: bool = False
     # Where each tensor starts. "dq" packs tensors into shared rows on different banks,
-    # and "row-pack" gives each lane its exact share of one column space (honoured by the
-    # dcc-parity runtime).
+    # and "row-pack" gives each lane its exact share of one column space. The dcc-parity
+    # runtime takes only "row-pack", and the default and optipim-parity runtimes only "dq".
     im_placement_align: str = "dq"
     # Bits one column command moves, which is what a vector access is sized against.
     # Differs by target: HBM-PIM moves prefetch*dq = 256, SIMDRAM's column is a
@@ -152,8 +152,8 @@ class IMOptions:
     # for the dcc-parity runtime's RET bit.
     im_dcc_return_from_input: bool = False
     # OptiPIM's codegen_new conventions for the kernel's one contraction: the operand roles
-    # their tensor index fixes and the iteration points per lane per step, written into
-    # the artifact for the optipim-parity runtime's PIM_OPT_NATIVE replay.
+    # their tensor index fixes, written into the artifact as __pim_opt_role, which
+    # check_roles verifies and the optipim-parity runtime's counters read back.
     im_optipim_conv: bool = False
     # Residency by place in that contraction (im-operand-residency-layout): the first
     # factor is delivered to the PE, the second is resident in the bank and the stored sum

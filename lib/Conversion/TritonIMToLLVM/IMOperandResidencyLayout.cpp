@@ -878,9 +878,6 @@ static LogicalResult checkSchedule(DictionaryAttr d, Location loc,
     if (!s)
       return emitError(loc) << where << ": '" << e.getName().strref()
                             << "' is not a forcible schedule field";
-    // Checked here, not at the call site, so both entry points get it. The first
-    // version checked this only on the module path and the per-op path accepted
-    // a field that cannot do anything, which is this codebase's oldest bug shape.
     if (!s->travels)
       return emitError(loc) << where << ": '" << e.getName().strref()
                             << "' is classified but not carried into the "
@@ -1335,8 +1332,8 @@ struct IMOperandResidencyLayoutPass
           fn && funcsWithReduction.contains(fn.getOperation());
 
       // A scalar load splatted across the lanes is a bank-broadcast: the value
-      // is identical across all banks for a given access, exactly what per-BG
-      // replication models, independent of pid/reduction dependence.
+      // is identical across all banks for a given access, whatever its pid or
+      // reduction dependence.
       StringRef cls;
       if (scalarSplat)
         cls = "BroadcastReplicate";
@@ -1378,10 +1375,10 @@ struct IMOperandResidencyLayoutPass
           b.getNamedAttr("operand_arg", b.getI64IntegerAttr(operandArg)));
       // Address footprint of one program instance, flattened five words per
       // axis as [extent, stride factor, arg, arg, arg] with -1 padding. A
-      // stride the pass cannot fold to a number is left as a product of kernel
-      // argument indices for the runtime to resolve, which is how conv's
-      // CI*R*S weight pitch survives. Absent when the address is not affine in
-      // the ranges and the reduction IV.
+      // stride the pass cannot fold to a number travels as a product of kernel
+      // argument indices, as conv's CI*R*S weight pitch does, and the runtimes
+      // read only the extents. Absent when the address is not affine in the
+      // ranges and the reduction IV.
       SmallVector<FpAxis> fp;
       if (operandFootprint(ptr, redFor, fp) && !fp.empty()) {
         SmallVector<int64_t> flat;
@@ -1397,8 +1394,9 @@ struct IMOperandResidencyLayoutPass
             b.getNamedAttr("footprint", b.getDenseI64ArrayAttr(flat)));
       }
 
-      // The reduce-collapse factor, stamped on stores only. 1 means the stored value
-      // IS the accumulator, which is every kernel here but the split-K matvec.
+      // The reduce-collapse factor, stamped on stores only when it exceeds 1, which
+      // happens where the stored value is a reduce of a wider carried accumulator (the
+      // reduction-factored matvec, DCC's RED partials).
       if (auto st = dyn_cast<triton::StoreOp>(op)) {
         int64_t ls = liveSplitFactor(st);
         if (ls > 1)

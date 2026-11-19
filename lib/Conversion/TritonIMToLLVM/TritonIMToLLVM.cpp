@@ -9,10 +9,12 @@
 ///
 /// ---------- Vectorization strategy ----------
 ///
-/// Each PIM bank owns `sizePerThread` consecutive elements (set by the
-/// RewriteIMLayout pass).  When those elements are contiguous in
-/// memory, we can load/store them as a single LLVM vector operation
-/// instead of N scalar operations.
+/// Each PIM bank owns `sizePerThread` consecutive elements, set by the
+/// IM encoding convert-triton-to-tritongpu emits and rebuilt by
+/// RewriteIMLayout when the module states or derives a bank axis or
+/// split.  When those elements are contiguous in memory, we can
+/// load/store them as a single LLVM vector operation instead of N
+/// scalar operations.
 ///
 /// Memory contiguity is determined by Triton's AxisInfo dataflow
 /// analysis — the same mechanism used by the NVIDIA and AMD backends.
@@ -199,8 +201,8 @@ static unsigned imDqBits(Value anchor) {
 ///   module states it (256 on HBM-PIM, so 16 FP16), kImDqBits otherwise.
 /// - `contiguity` is the number of consecutive elements accessed per
 ///   thread in the fastest-varying dimension, derived from Triton's
-///   AxisInfo dataflow analysis.  After RewriteIMLayout sets
-///   sizePerThread=[K], the contiguity for `pid*BLOCK + arange(0,BLOCK)`
+///   AxisInfo dataflow analysis.  With sizePerThread=[K] in the IM
+///   encoding, the contiguity for `pid*BLOCK + arange(0,BLOCK)`
 ///   patterns is exactly K.
 ///
 /// When a mask is present, the vector width is further clamped to the
@@ -726,11 +728,9 @@ public:
 /// link time: @__pim_layout_count (i32, the entry count N) and
 /// @__pim_layout_table ([kRecWords*N x i32], each record laid out at kRecWords).
 ///
-/// The address footprint is logical on purpose. How many register slots it
-/// needs depends on the bank/row/column interleaving, which only the runtime
-/// knows, so it converts. A stride the pass could not fold to a number is left
-/// as a product of kernel argument indices, resolved against the values the
-/// host pushes with pim_set_kernel_scalars().
+/// The address footprint is logical. A stride the pass could not fold to a
+/// number travels as a product of kernel argument indices, and the runtimes
+/// read only the extents.
 ///
 /// Must run before the conversion below: `im.residency` is discardable and dies
 /// with the tt.load/tt.store ops that lowering replaces.
@@ -740,15 +740,17 @@ static constexpr int kAxisWords = 5;
 ///   then kMaxAxes copies of { extent, stride factor, arg, arg, arg },
 ///   then live_split and cell_fanout as TAIL words }.
 /// live_split is the factor a rank-collapsing reduce hid from the store's footprint,
-/// and it MULTIPLIES the occupancy the runtime derives. 1 on every kernel whose stored
-/// value is its accumulator, which is all of them but the split-K matvec, so the field
-/// is the identity by arithmetic rather than by inspection. Appended at the TAIL so
-/// PIM_LW_AXES_BASE and every existing index keep their values.
-/// bank_replicated is the compiler-DERIVED role: 1 when every bank sees the same
-/// elements (the value must be delivered to each PE), 0 when the tensor is
-/// bank-partitioned. is_store marks the OUTPUT, which nothing else identifies now
-/// that reuse_class no longer travels, and which the SIMDRAM occupancy charge needs
-/// specifically: only a store's footprint excludes the reduction axis.
+/// and it MULTIPLIES the occupancy the SIMDRAM runtime derives. It exceeds 1 where a
+/// kernel stores a reduce of a wider carried accumulator, as the reduction-factored
+/// matvec and DCC's RED partial kernels do, and emitDccAccGrf and emitDccReturnFrom key
+/// on it. Appended at the TAIL so PIM_LW_AXES_BASE and every existing index keep their
+/// values.
+/// bank_replicated is the compiler-derived receive count: 0 when the tensor is
+/// bank-partitioned, otherwise how many banks receive a copy, where 1 (a scalar splat,
+/// or a store with no lane axis) reads as every bank. is_store marks the OUTPUT, which
+/// nothing else identifies now that reuse_class no longer travels, and which the
+/// SIMDRAM occupancy charge needs specifically: only a store's footprint excludes the
+/// reduction axis.
 /* MUST equal PIM_LAYOUT_REC_WORDS in the ramulator2 submodule's
    pim_layout_table.h. A half rebuild aborts loudly on the runtime's drift check. */
 static constexpr int kRecWords = 6 + kMaxAxes * kAxisWords;
@@ -879,8 +881,8 @@ static void emitPimLayoutTable(ModuleOp mod) {
                          LLVM::Linkage::External, "__pim_dq_bits",
                          b.getI32IntegerAttr(dqBits));
 
-  // Placement policy, 0 = the kernel said nothing. The dcc-parity runtime places row-pack
-  // when asked, and the default and optipim-parity runtimes refuse anything but
+  // Placement policy, 0 = the kernel said nothing. The dcc-parity runtime refuses anything
+  // but row-pack, and the default and optipim-parity runtimes refuse anything but
   // interleaved at DQ alignment.
   auto emitPolicy = [&](const char *attr, const char *sym) {
     int32_t v = 0;
@@ -1168,9 +1170,9 @@ static void emitDccReturnFrom(ModuleOp mod) {
 
 // OptiPIM's codegen_new conventions for the kernel's one contraction (im.optipim_conv):
 // the role their tensor index fixes for each operand, Inputs1 written over the bus,
-// Inputs2/Filters bank-read, Outputs read back, and the product's elements per lane, the
-// iteration points one step charges by position. Their roles are positional, so ours are
-// too: the product's first factor is the input and its second the weight.
+// Inputs2/Filters bank-read, Outputs read back, and the product's elements per lane,
+// which only the harness records, as compiler_cells. Their roles are positional, so ours
+// are too: the product's first factor is the input and its second the weight.
 static LogicalResult emitOptiPimConv(ModuleOp mod) {
   if (!mod->hasAttr("im.optipim_conv"))
     return success();
