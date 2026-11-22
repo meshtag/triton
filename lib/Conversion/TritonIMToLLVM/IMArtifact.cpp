@@ -188,6 +188,25 @@ static void emitPimLayoutTable(ModuleOp mod) {
 }
 
 // --------------------------------------------------------------------------
+// Anaheim's placement, for the anaheim runtime
+// --------------------------------------------------------------------------
+
+/// The PolyGroup of each pointer argument, as im_polygroups states it, so the anaheim
+/// runtime places by the compiler's decision. Absent unless the option is set.
+static void emitAnaheimPolyGroups(ModuleOp mod) {
+  auto groups = mod->getAttrOfType<DenseI64ArrayAttr>("im.polygroups");
+  if (!groups)
+    return;
+  SmallVector<int32_t> flat;
+  for (int64_t g : groups.asArrayRef())
+    flat.push_back((int32_t)g);
+  OpBuilder b = OpBuilder::atBlockBegin(mod.getBody());
+  Location loc = mod.getLoc();
+  emitI32Table(b, loc, "__anaheim_polygroups", flat);
+  emitI32(b, loc, "__anaheim_polygroup_count", (int32_t)flat.size());
+}
+
+// --------------------------------------------------------------------------
 // DCC's conventions, for the dcc-parity runtime
 // --------------------------------------------------------------------------
 
@@ -596,6 +615,7 @@ LogicalResult mlir::triton::im::emitArtifact(ModuleOp mod) {
   // LLVM IR lists them in the reverse of this order.
   emitOptiPimStatements(mod);
   emitPimLayoutTable(mod);
+  emitAnaheimPolyGroups(mod);
   emitDccTileMac(mod);
   if (failed(emitDccAccGrf(mod)))
     return failure();

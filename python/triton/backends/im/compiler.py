@@ -170,6 +170,12 @@ class IMOptions:
     # Active lanes per tensor axis where their mapping leaves lanes of im_bank_split idle, as
     # "1,3,4,3,1"; the runtime gives the active lanes banks 0..S-1, their codegen's PU order.
     im_bank_active: str = ""
+    # Anaheim's column-partitioned placement (HPCA'25, Sec. VI-B): the PolyGroup of each
+    # pointer argument in signature order, e.g. "0,0,1,1,2,-1". Tensors of one PolyGroup
+    # share rows in column groups of their own, and -1 marks a constant the PIM decoder
+    # broadcasts, which no bank holds. Written into the artifact as __anaheim_polygroups
+    # with placement scheme 3, which only the anaheim runtime takes.
+    im_polygroups: str = ""
 
     def __post_init__(self):
         bad = set(self.skip_passes) - {"triton-licm"}
@@ -199,6 +205,12 @@ class IMOptions:
                 f"expected one of {sorted(_ALIGNS)}")
         if self.im_dq_bits and int(self.im_dq_bits) < 1:
             raise ValueError(f"im_dq_bits={self.im_dq_bits!r}; must be positive")
+        if self.im_polygroups:
+            groups = _ints(self.im_polygroups)
+            if not groups or min(groups) < -1:
+                raise ValueError(f"im_polygroups={self.im_polygroups!r}; want one PolyGroup "
+                                 "number per pointer argument, >= 0 or -1 for a broadcast "
+                                 "constant, e.g. \"0,0,1,-1\"")
         if self.im_bank_split:
             parts = _ints(self.im_bank_split)
             if not parts or any(v < 1 for v in parts):
@@ -234,9 +246,13 @@ def _stamp_module(mod, options: IMOptions) -> None:
         stamp("im.optipim_memo", array(_memo(options.im_optipim_memo)))
     if options.im_bank_active:
         stamp("im.bank_active", array(_ints(options.im_bank_active)))
-    # Interleaved, the only placement anything compiles for, is still stated so that a runtime
-    # can refuse a kernel placed for another.
-    stamp("im.layout_scheme", "2 : i64")
+    # The placement is stated so that a runtime can refuse a kernel placed for another:
+    # 2 interleaved, 3 Anaheim's column partitioning with its PolyGroups.
+    if options.im_polygroups:
+        stamp("im.layout_scheme", "3 : i64")
+        stamp("im.polygroups", array(_ints(options.im_polygroups)))
+    else:
+        stamp("im.layout_scheme", "2 : i64")
     stamp("im.placement_align", f"{_ALIGNS[options.im_placement_align]} : i64")
     if options.im_dq_bits:
         stamp("im.dq_bits", f"{int(options.im_dq_bits)} : i64")
