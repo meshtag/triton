@@ -154,6 +154,11 @@ class IMOptions:
     # Unroll and jam a loop, its loads grouped by tensor (im-load-cluster), in strips that
     # fit this many register-file entries per lane. 0 leaves loop bodies as written.
     im_cluster_loads: int = 0
+    # The caller passes distinct buffers to the pointer arguments, which licenses moving a
+    # load past a store to another argument (im.noalias_args), as im_persistent and
+    # im_cluster_loads also do. Stated on its own, it lets an ablation keep the licence
+    # while it switches those passes off.
+    im_noalias_args: bool = False
     # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
     # issues one command per tile, their ISA's pricing, a convention of the DCC path.
     im_dcc_tile_mac: bool = False
@@ -345,7 +350,7 @@ class IMBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         skip = set(options.skip_passes)
 
-        if options.im_persistent or options.im_cluster_loads:
+        if options.im_persistent or options.im_cluster_loads or options.im_noalias_args:
             # Set before this stage's passes, since triton-licm runs here and is the only
             # pass in the pipeline that hoists loads.
             #
