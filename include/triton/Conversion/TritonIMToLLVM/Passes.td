@@ -134,6 +134,49 @@ def IMReluOpcode : Pass<"im-relu-opcode", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::arith::ArithDialect", "mlir::LLVM::LLVMDialect"];
 }
 
+// Scalar replacement on Triton IR (IMScalarReplacement.cpp).
+def IMRegisterPromotion : Pass<"im-register-promotion", "mlir::ModuleOp"> {
+  let summary = "Keep a loop's loads and stores of one invariant address in a register";
+  let description = [{
+    A loop whose body loads a loop-invariant address before storing it, and touches
+    nothing that may overlap that address otherwise, carries the value in an iter_arg
+    instead: one load before the loop, one store after it. Different kernel arguments
+    may overlap unless the module carries `im.noalias_args`.
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::triton::TritonDialect"];
+}
+
+def IMStoreForwarding : Pass<"im-store-forwarding", "mlir::ModuleOp"> {
+  let summary = "Give a load the value a store in the same block just wrote there";
+  let description = [{
+    A load of an address that a store earlier in the same block wrote, with no store
+    or opaque op between that may overlap it, takes the stored value. Different kernel
+    arguments may overlap unless the module carries `im.noalias_args`.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
+def IMDeadStores : Pass<"im-dead-stores", "mlir::ModuleOp"> {
+  let summary = "Remove a store that a later store in the same block overwrites";
+  let description = [{
+    A store to an address that a later store in the same block writes again, with no
+    load or opaque op between that may read it, is removed. Different kernel arguments
+    may overlap unless the module carries `im.noalias_args`.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
+def IMStoreSinking : Pass<"im-store-sinking", "mlir::ModuleOp"> {
+  let summary = "Move each store down its block so the block's stores issue together";
+  let description = [{
+    A store moves down its block, the last first, until an op that may read or write
+    its address, another store or the terminator, so stores keep their order and a
+    row of inputs stays open while they wait. Different kernel arguments may overlap
+    unless the module carries `im.noalias_args`.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
 // Groups a loop's loads by tensor, n unrolled iterations at a time.
 def IMLoadCluster : Pass<"im-load-cluster", "mlir::ModuleOp"> {
   let summary = "Unroll and jam a loop, grouping each strip's loads by argument";

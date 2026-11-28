@@ -147,6 +147,12 @@ void init_triton_passes_convert(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_im_load_cluster", triton::im::createIMLoadClusterPass);
   ADD_PASS_WRAPPER_0("add_im_dcc_tile_mac", triton::im::createIMDccTileMacPass);
   ADD_PASS_WRAPPER_0("add_im_optipim_mac", triton::im::createIMOptiPimMacPass);
+  ADD_PASS_WRAPPER_0("add_im_register_promotion",
+                     triton::im::createIMRegisterPromotionPass);
+  ADD_PASS_WRAPPER_0("add_im_store_forwarding",
+                     triton::im::createIMStoreForwardingPass);
+  ADD_PASS_WRAPPER_0("add_im_dead_stores", triton::im::createIMDeadStoresPass);
+  ADD_PASS_WRAPPER_0("add_im_store_sinking", triton::im::createIMStoreSinkingPass);
   ADD_PASS_WRAPPER_0("add_im_operand_residency_layout",
                      triton::im::createIMOperandResidencyLayoutPass);
 }

@@ -69,7 +69,8 @@ _NEEDS = {
 _ALIGNS = {"dq": 1, "row-pack": 3}
 
 # The passes skip_passes takes.
-_SKIPPABLE = frozenset({"triton-licm", "cse"})
+_SKIPPABLE = frozenset({"triton-licm", "cse", "register-promotion", "store-forwarding",
+                        "dead-stores", "store-sinking"})
 
 
 def _add_cse(pm, skip) -> None:
@@ -103,8 +104,9 @@ class IMOptions:
     # HBM-PIM and SIMDRAM kernels both compile for this arch, and differ in im_dq_bits.
     arch: str = "hbm-pim"
     # Passes an ablation can skip, and __post_init__ refuses any other name: "triton-licm",
-    # and "cse", which is MLIR's CSE and Triton's loop-aware CSE at every stage. A harness
-    # that skips "cse" must also drop LLVM's early-cse and gvn, which redo it.
+    # "cse", which is MLIR's CSE and Triton's loop-aware CSE at every stage, and the four of
+    # im_scalar_replacement. A harness that skips "cse" must also drop LLVM's early-cse and
+    # gvn, which redo it.
     skip_passes: tuple[str, ...] = ()
     # User schedule for im-operand-residency-layout, as MLIR dictionary text
     # keyed by kernel operand index, e.g. '{arg1 = {bank_replicated = true}}'.
@@ -159,6 +161,12 @@ class IMOptions:
     # im_cluster_loads also do. Stated on its own, it lets an ablation keep the licence
     # while it switches those passes off.
     im_noalias_args: bool = False
+    # Scalar replacement on Triton IR, ahead of CSE: im-register-promotion keeps a loop's
+    # accumulator of one invariant address in a register, im-store-forwarding gives a load
+    # the value just stored there, im-dead-stores removes a store a later one overwrites, and
+    # im-store-sinking moves a block's stores together. Off unless a harness asks, so the
+    # published pipelines stay as they were measured.
+    im_scalar_replacement: bool = False
     # DCC's tile MAC (im-dcc-tile-mac): a contraction whose per-lane tile is one of theirs
     # issues one command per tile, their ISA's pricing, a convention of the DCC path.
     im_dcc_tile_mac: bool = False
@@ -371,6 +379,18 @@ class IMBackend(BaseBackend):
         passes.common.add_inliner(pm)
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
+        if options.im_scalar_replacement:
+            # Promotion leaves a load after the store before the loop, which forwarding
+            # resolves, and forwarding leaves stores a later one overwrites.
+            if "register-promotion" not in skip:
+                passes.convert.add_im_register_promotion(pm)
+            if "store-forwarding" not in skip:
+                passes.convert.add_im_store_forwarding(pm)
+            if "dead-stores" not in skip:
+                passes.convert.add_im_dead_stores(pm)
+            if "store-sinking" not in skip:
+                passes.convert.add_im_store_sinking(pm)
+            passes.common.add_canonicalizer(pm)
         # triton-combine is left out of this stage. Its CombineBroadcastMulReducePattern
         # folds reduce_add(broadcast(a)*broadcast(b)) into tt.dot, which IM cannot lower.
         passes.ttir.add_reorder_broadcast(pm)

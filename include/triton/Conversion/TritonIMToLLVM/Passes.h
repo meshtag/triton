@@ -25,6 +25,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createIMReluOpcodePass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMLoadClusterPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMDccTileMacPass();
 std::unique_ptr<OperationPass<ModuleOp>> createIMOptiPimMacPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMRegisterPromotionPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMStoreForwardingPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMDeadStoresPass();
+std::unique_ptr<OperationPass<ModuleOp>> createIMStoreSinkingPass();
 
 #define GEN_PASS_REGISTRATION
 #include "triton/Conversion/TritonIMToLLVM/Passes.h.inc"

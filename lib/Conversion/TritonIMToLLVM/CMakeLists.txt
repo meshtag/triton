@@ -6,6 +6,7 @@ add_triton_library(TritonIMToLLVM
     IMDccTileMac.cpp
     IMOptiPimMac.cpp
     IMReluOpcode.cpp
+    IMScalarReplacement.cpp
     IMTileBoundary.cpp
     RewriteIMLayout.cpp
     TargetInfo.cpp
