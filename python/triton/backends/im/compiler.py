@@ -32,6 +32,18 @@ def _ints(text) -> list[int]:
     return [int(v) for v in str(text).split(",") if v != ""]
 
 
+def _polygroups(text) -> list[tuple[int, int]]:
+    """im_polygroups as (PolyGroup, split) per pointer argument. "g" puts the tensor in
+    PolyGroup g with split 0, and "g:n" gives each n stacked polynomials of it a PolyGroup of
+    their own, g, g + 1 and on."""
+    out = []
+    for item in str(text).split(","):
+        if item != "":
+            group, _, split = item.partition(":")
+            out.append((int(group), int(split) if split else 0))
+    return out
+
+
 def _memo(text) -> list[int]:
     """im_optipim_memo's "bound:weight,..." pairs as one list, empty when an item is not an
     integer."""
@@ -55,6 +67,16 @@ _NEEDS = {
 
 # The numbers the runtimes read as __pim_placement_align.
 _ALIGNS = {"dq": 1, "row-pack": 3}
+
+# The passes skip_passes takes.
+_SKIPPABLE = frozenset({"triton-licm", "cse"})
+
+
+def _add_cse(pm, skip) -> None:
+    """MLIR's CSE, unless the ablation skips it."""
+    if "cse" not in skip:
+        passes.common.add_cse(pm)
+
 
 # Options stamped on the module as `1 : i64` when set, each im_x as im.x.
 _FLAGS = ("im_persistent", "im_tile_prologue_first", "im_price_folds", "im_derive_bank_axis",
@@ -80,7 +102,9 @@ class IMOptions:
     instrumentation_mode: str = ""
     # HBM-PIM and SIMDRAM kernels both compile for this arch, and differ in im_dq_bits.
     arch: str = "hbm-pim"
-    # Only "triton-licm" can be skipped, so __post_init__ refuses any other name.
+    # Passes an ablation can skip, and __post_init__ refuses any other name: "triton-licm",
+    # and "cse", which is MLIR's CSE and Triton's loop-aware CSE at every stage. A harness
+    # that skips "cse" must also drop LLVM's early-cse and gvn, which redo it.
     skip_passes: tuple[str, ...] = ()
     # User schedule for im-operand-residency-layout, as MLIR dictionary text
     # keyed by kernel operand index, e.g. '{arg1 = {bank_replicated = true}}'.
@@ -173,14 +197,17 @@ class IMOptions:
     # Anaheim's column-partitioned placement (HPCA'25, Sec. VI-B): the PolyGroup of each
     # pointer argument in signature order, e.g. "0,0,1,1,2,-1". Tensors of one PolyGroup
     # share rows in column groups of their own, and -1 marks a constant the PIM decoder
-    # broadcasts, which no bank holds. Written into the artifact as __anaheim_polygroups
-    # with placement scheme 3, which only the anaheim runtime takes.
+    # broadcasts, which no bank holds. "g:n" splits a stacked tensor, each n of its
+    # polynomials in a PolyGroup of their own from g on, as a loop over rotations needs for
+    # each rotation's keys. Written into the artifact as __anaheim_polygroups and
+    # __anaheim_polygroup_split with placement scheme 3, which only the anaheim runtime takes.
     im_polygroups: str = ""
 
     def __post_init__(self):
-        bad = set(self.skip_passes) - {"triton-licm"}
+        bad = set(self.skip_passes) - _SKIPPABLE
         if bad:
-            raise ValueError(f"skip_passes={sorted(bad)!r}: only 'triton-licm' can be skipped")
+            raise ValueError(f"skip_passes={sorted(bad)!r}: only {sorted(_SKIPPABLE)} can be "
+                             "skipped")
         for option, (need, does) in _NEEDS.items():
             if getattr(self, option) and not getattr(self, need):
                 raise ValueError(f"{option} {does}, set {need} too")
@@ -206,11 +233,15 @@ class IMOptions:
         if self.im_dq_bits and int(self.im_dq_bits) < 1:
             raise ValueError(f"im_dq_bits={self.im_dq_bits!r}; must be positive")
         if self.im_polygroups:
-            groups = _ints(self.im_polygroups)
-            if not groups or min(groups) < -1:
+            try:
+                groups = _polygroups(self.im_polygroups)
+            except ValueError:
+                groups = []
+            if (not groups or any(g < -1 or n < 0 or (n and g < 0) for g, n in groups)):
                 raise ValueError(f"im_polygroups={self.im_polygroups!r}; want one PolyGroup "
                                  "number per pointer argument, >= 0 or -1 for a broadcast "
-                                 "constant, e.g. \"0,0,1,-1\"")
+                                 "constant, or g:n for n polynomials per PolyGroup from g on, "
+                                 "e.g. \"0,0,1:8,-1\"")
         if self.im_bank_split:
             parts = _ints(self.im_bank_split)
             if not parts or any(v < 1 for v in parts):
@@ -249,8 +280,11 @@ def _stamp_module(mod, options: IMOptions) -> None:
     # The placement is stated so that a runtime can refuse a kernel placed for another:
     # 2 interleaved, 3 Anaheim's column partitioning with its PolyGroups.
     if options.im_polygroups:
+        groups = _polygroups(options.im_polygroups)
         stamp("im.layout_scheme", "3 : i64")
-        stamp("im.polygroups", array(_ints(options.im_polygroups)))
+        stamp("im.polygroups", array([g for g, _ in groups]))
+        if any(n for _, n in groups):
+            stamp("im.polygroup_split", array([n for _, n in groups]))
     else:
         stamp("im.layout_scheme", "2 : i64")
     stamp("im.placement_align", f"{_ALIGNS[options.im_placement_align]} : i64")
@@ -335,14 +369,16 @@ class IMBackend(BaseBackend):
         # triton-combine is left out of this stage. Its CombineBroadcastMulReducePattern
         # folds reduce_add(broadcast(a)*broadcast(b)) into tt.dot, which IM cannot lower.
         passes.ttir.add_reorder_broadcast(pm)
-        passes.common.add_cse(pm)
+        _add_cse(pm, skip)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         if "triton-licm" not in skip:
             passes.ttir.add_triton_licm(pm)
-            passes.ttir.add_loop_aware_cse(pm)
+            # Loop-aware CSE runs MLIR's CSE inside it, so "cse" skips it too.
+            if "cse" not in skip:
+                passes.ttir.add_loop_aware_cse(pm)
             passes.common.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
+            _add_cse(pm, skip)
         pm.run(mod, "make_ttir")
 
         _stamp_module(mod, options)
@@ -353,6 +389,7 @@ class IMBackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
+        skip = set(options.skip_passes)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(
@@ -368,10 +405,10 @@ class IMBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
+        _add_cse(pm, skip)
         passes.common.add_licm(pm)
         passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
+        _add_cse(pm, skip)
         pm.run(mod, "make_ttgir")
 
         if _im_debug():
@@ -400,7 +437,7 @@ class IMBackend(BaseBackend):
         passes.convert.add_arith_to_llvmir(pm)
         passes.convert.add_cf_to_llvmir(pm)
         passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
+        _add_cse(pm, set(options.skip_passes))
         pm.run(mod, "make_llir")
 
         if _im_debug():

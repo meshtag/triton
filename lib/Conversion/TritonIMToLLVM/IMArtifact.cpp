@@ -192,7 +192,10 @@ static void emitPimLayoutTable(ModuleOp mod) {
 // --------------------------------------------------------------------------
 
 /// The PolyGroup of each pointer argument, as im_polygroups states it, so the anaheim
-/// runtime places by the compiler's decision. Absent unless the option is set.
+/// runtime places by the compiler's decision, and the polynomials per PolyGroup of a split
+/// tensor (im.polygroup_split, 0 unsplit). Both tables are emitted whenever the option is
+/// set: a library that left one to the runtime's weak default could have dyld bind it to
+/// another kernel's table loaded in the same process. Absent unless the option is set.
 static void emitAnaheimPolyGroups(ModuleOp mod) {
   auto groups = mod->getAttrOfType<DenseI64ArrayAttr>("im.polygroups");
   if (!groups)
@@ -200,10 +203,17 @@ static void emitAnaheimPolyGroups(ModuleOp mod) {
   SmallVector<int32_t> flat;
   for (int64_t g : groups.asArrayRef())
     flat.push_back((int32_t)g);
+  SmallVector<int32_t> splitFlat(flat.size(), 0);
+  if (auto split = mod->getAttrOfType<DenseI64ArrayAttr>("im.polygroup_split"))
+    for (auto [i, n] : llvm::enumerate(split.asArrayRef()))
+      if (i < splitFlat.size())
+        splitFlat[i] = (int32_t)n;
   OpBuilder b = OpBuilder::atBlockBegin(mod.getBody());
   Location loc = mod.getLoc();
   emitI32Table(b, loc, "__anaheim_polygroups", flat);
   emitI32(b, loc, "__anaheim_polygroup_count", (int32_t)flat.size());
+  emitI32Table(b, loc, "__anaheim_polygroup_split", splitFlat);
+  emitI32(b, loc, "__anaheim_polygroup_split_count", (int32_t)splitFlat.size());
 }
 
 // --------------------------------------------------------------------------
